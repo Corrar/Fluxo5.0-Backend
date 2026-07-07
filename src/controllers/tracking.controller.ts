@@ -2,7 +2,10 @@ import { Request, Response } from 'express';
 import axios from 'axios';
 import { pool } from '../db';
 
-const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
+const WONCA_API_KEY = process.env.WONCA_API_KEY;
+if (!WONCA_API_KEY) {
+    console.error('[Tracking] ⚠️ WONCA_API_KEY ausente no ambiente — a rota de rastreio (Wonca) ficará indisponível até a variável ser configurada.');
+}
 const API_LIMIT = 1000;
 
 // =======================================================
@@ -16,6 +19,12 @@ export const trackPackage = async (req: Request, res: Response) => {
 
     if (!code) {
         return res.status(400).json({ error: 'Código de rastreio é obrigatório.' });
+    }
+
+    // A rota não roda sem a chave da Wonca (env WONCA_API_KEY) — falha clara em vez de 401 silencioso da API.
+    if (!WONCA_API_KEY) {
+        console.error('[Tracking] Requisição bloqueada: WONCA_API_KEY não configurada no ambiente.');
+        return res.status(503).json({ error: 'Serviço de rastreio indisponível (não configurado).' });
     }
 
     try {
