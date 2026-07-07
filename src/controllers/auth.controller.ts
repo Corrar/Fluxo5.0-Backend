@@ -6,7 +6,8 @@ import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 
 // Define a chave secreta do JWT (Use variáveis de ambiente em produção)
-const JWT_SECRET = process.env.JWT_SECRET || 'sua-chave-secreta';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) { throw new Error('JWT_SECRET ausente no ambiente — abortando boot por segurança'); }
 
 /**
  * Função para gerenciar o Login do usuário

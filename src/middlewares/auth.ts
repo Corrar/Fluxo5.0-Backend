@@ -2,7 +2,8 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db'; // Necessário para a consulta de permissões
 
-const JWT_SECRET = process.env.JWT_SECRET || 'sua-chave-secreta';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) { throw new Error('JWT_SECRET ausente no ambiente — abortando boot por segurança'); }
 
 // 1. CRIAMOS UMA INTERFACE PARA O REQUEST
 // Isto ensina ao TypeScript que o nosso 'req' pode conter um 'user' decodificado
