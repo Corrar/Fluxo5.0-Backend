@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    /* Configurações Básicas */
+    "target": "es2016",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    
+    /* Pastas */
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    /* Regras de Tipagem (O segredo para não dar erro no Render) */
+    "strict": true,
+    "noImplicitAny": false,           /* <--- ADICIONE ISSO: Permite variáveis sem tipo definido */
+    "verbatimModuleSyntax": false,
+    "skipLibCheck": true              /* Ignora erros dentro das bibliotecas node_modules */
+  },
+  "ts-node": {
+    "esm": false
+  },
+  "include": ["src/**/*"]
+}

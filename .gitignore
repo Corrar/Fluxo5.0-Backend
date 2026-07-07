@@ -1,0 +1,30 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependências (Pesado demais, a Vercel instala sozinha)
+node_modules
+dist
+dist-ssr
+*.local
+
+# Configurações do Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs
+*.njsproj
+*.sln
+*.sw?
+
+# Variáveis de Ambiente (Segurança!)
+.env
+.env.*
+!.env.example
