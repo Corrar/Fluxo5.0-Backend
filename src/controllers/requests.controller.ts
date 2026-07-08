@@ -19,11 +19,13 @@ export const getRequests = async (req: Request, res: Response) => {
       )
       SELECT r.*,
           cs.op_code,
+          cl.name AS client_name,
           json_build_object('name', p.name, 'sector', p.sector) as requester,
           COALESCE(ri_agg.items, '[]'::json) as request_items
       FROM FilteredRequests r
       LEFT JOIN profiles p ON r.requester_id = p.id
       LEFT JOIN client_services cs ON r.client_service_id = cs.id
+      LEFT JOIN clients cl ON cl.id = cs.client_id
       LEFT JOIN (
           SELECT ri.request_id, json_agg(
               json_build_object(
@@ -308,7 +310,7 @@ export const createRequest = async (req: Request, res: Response) => {
 export const updateRequestStatus = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
-  const { status, rejection_reason, adjusted_items } = req.body;
+  const { status, rejection_reason, adjusted_items, conference_notes } = req.body;
 
   try {
     const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
@@ -437,6 +439,18 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
       // A baixa física fica no 'entregue' (consume); conferir não reserva/libera/baixa nada.
       else if (status === 'conferido') {
         // sem operação de estoque — apenas o UPDATE de status abaixo.
+      }
+
+      // Justificativa de CONFERÊNCIA por item — SÓ no 'conferido'. Campo próprio (conference_note),
+      // separado de observation: nunca sobrescreve a nota do solicitante. O request_id no WHERE
+      // impede gravar em item de outra solicitação. Grava sempre o .trim(); notas vazias são ignoradas.
+      if (status === 'conferido' && Array.isArray(conference_notes)) {
+        for (const cn of conference_notes) {
+          if (!cn || cn.id == null) continue;
+          const note = typeof cn.note === 'string' ? cn.note.trim() : '';
+          if (note === '') continue;
+          await client.query('UPDATE request_items SET conference_note = $1 WHERE id = $2 AND request_id = $3', [note, cn.id, id]);
+        }
       }
 
       await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, status === 'rejeitado' ? rejection_reason.trim() : (rejection_reason || null), id]);
