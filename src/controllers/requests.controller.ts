@@ -314,6 +314,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') return res.status(403).json({ error: 'Sem permissão.' });
 
+    // Whitelist de status de DESTINO ('aberto' é o estado inicial do createRequest, nunca um destino aqui).
+    const STATUS_VALIDOS = ['aprovado', 'conferido', 'entregue', 'rejeitado', 'devolvido'];
+    if (!STATUS_VALIDOS.includes(status)) return res.status(400).json({ error: 'Status inválido.' });
+
     // Motivo da recusa é OBRIGATÓRIO na rejeição — valida ANTES da transação/estoque.
     if (status === 'rejeitado') {
       if (!rejection_reason || typeof rejection_reason !== 'string' || rejection_reason.trim() === '') {
@@ -327,6 +331,22 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
       const currentRes = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [id]);
       if (!currentRes.rows[0]?.status) throw new Error("Solicitação não encontrada");
       const currentStatus = currentRes.rows[0].status;
+
+      // Validação de TRANSIÇÃO: bloqueia pulos de estado (ex.: aberto→entregue). Roda APÓS o FOR UPDATE
+      // (verdade travada) e ANTES de qualquer toque em estoque (adjusted_items/consume/release/receive).
+      // Lança sentinela → o catch converte em HTTP 400. NÃO usar `res` aqui: dentro da transação isso
+      // comitaria e depois colidiria com o res.json de sucesso ("headers already sent").
+      const TRANSICOES: Record<string, string[]> = {
+        aberto:    ['aprovado', 'rejeitado'],
+        aprovado:  ['conferido', 'rejeitado'],
+        conferido: ['entregue', 'rejeitado'],
+        entregue:  ['devolvido'],
+        rejeitado: [],
+        devolvido: [],
+      };
+      if (!TRANSICOES[currentStatus] || !TRANSICOES[currentStatus].includes(status)) {
+        throw new Error(`TRANSICAO_INVALIDA:${currentStatus}:${status}`);
+      }
 
       // Se houve ajuste manual das quantidades pelo almoxarife antes da entrega
       if (adjusted_items && Array.isArray(adjusted_items)) {
@@ -366,8 +386,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
 
       const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1 ORDER BY ri.product_id', [id]);
 
-      // Status: Entregue -> consume (baixa físico + libera a reserva correspondente)
-      if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
+      // Status: Entregue -> consume (baixa físico + libera a reserva correspondente).
+      // Entrega vem SÓ depois de 'conferido' (a transição já bloqueia aberto/aprovado→entregue); mantemos
+      // 'aprovado' no guard por defesa/coerência, mas na prática só 'conferido' chega aqui.
+      if (status === 'entregue' && (currentStatus === 'aprovado' || currentStatus === 'conferido')) {
         for (const item of itemsRes.rows) {
           if (item.product_id && !item.is_3d) { // Só baixa físico se NÃO FOR 3D
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
@@ -381,8 +403,8 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
           }
         }
       }
-      // Status: Rejeitado -> release (devolve a reserva)
-      else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
+      // Status: Rejeitado -> release (devolve a reserva). Pode vir de aberto/aprovado/conferido.
+      else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado' || currentStatus === 'conferido')) {
         for (const item of itemsRes.rows) {
           if (item.product_id && !item.is_3d) { // Só devolve reserva se NÃO FOR 3D
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
@@ -411,6 +433,11 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
           }
         }
       }
+      // Status: Conferido -> NO-OP de estoque INTENCIONAL (passagem aprovado→entregue).
+      // A baixa física fica no 'entregue' (consume); conferir não reserva/libera/baixa nada.
+      else if (status === 'conferido') {
+        // sem operação de estoque — apenas o UPDATE de status abaixo.
+      }
 
       await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, status === 'rejeitado' ? rejection_reason.trim() : (rejection_reason || null), id]);
 
@@ -433,6 +460,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (typeof error?.message === 'string' && error.message.startsWith('TRANSICAO_INVALIDA:')) {
+      const [, de, para] = error.message.split(':');
+      return res.status(400).json({ error: `Transição inválida: ${de} → ${para}.` });
+    }
     res.status(500).json({ error: error.message || 'Erro ao atualizar status' });
   }
 };
