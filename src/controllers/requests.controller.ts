@@ -314,6 +314,13 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') return res.status(403).json({ error: 'Sem permissão.' });
 
+    // Motivo da recusa é OBRIGATÓRIO na rejeição — valida ANTES da transação/estoque.
+    if (status === 'rejeitado') {
+      if (!rejection_reason || typeof rejection_reason !== 'string' || rejection_reason.trim() === '') {
+        return res.status(400).json({ error: 'Motivo da recusa é obrigatório.' });
+      }
+    }
+
     const { changedProducts } = await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
 
@@ -405,10 +412,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
         }
       }
 
-      await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, rejection_reason || null, id]);
+      await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, status === 'rejeitado' ? rejection_reason.trim() : (rejection_reason || null), id]);
 
       const logAction = status === 'entregue' ? 'ENTREGAR_SOLICITACAO' : status === 'rejeitado' ? 'REJEITAR_SOLICITACAO' : status === 'devolvido' ? 'DEVOLVER_SOLICITACAO' : 'ATUALIZAR_STATUS_SOLICITACAO';
-      await createLog(userId, logAction, { id_solicitacao: id, novo_status: status, motivo: rejection_reason || 'N/A' }, getClientIp(req), client);
+      await createLog(userId, logAction, { id_solicitacao: id, novo_status: status, motivo: status === 'rejeitado' ? rejection_reason.trim() : (rejection_reason || 'N/A') }, getClientIp(req), client);
 
       const changedProducts = itemsRes.rows.map((item: any) => item.product_id).filter((pid: any) => pid);
       return { changedProducts };
