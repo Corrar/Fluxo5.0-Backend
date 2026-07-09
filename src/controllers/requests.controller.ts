@@ -9,6 +9,11 @@ import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
+// Unidades que aceitam quantidade fracionada (metro, litro, quilo). Qualquer outra → inteiro
+// (default seguro para unidades novas/desconhecidas). Espelha DECIMAL_UNITS do front (conferencia.jsx).
+const DECIMAL_UNITS = new Set(['M', 'MT', 'L', 'KG']);
+const isDecimalUnit = (un: unknown): boolean => DECIMAL_UNITS.has(String(un ?? '').trim().toUpperCase());
+
 export const getRequests = async (req: Request, res: Response) => {
   try {
     const query = `
@@ -355,30 +360,54 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
       // Se houve ajuste manual das quantidades pelo almoxarife antes da entrega
       if (adjusted_items && Array.isArray(adjusted_items)) {
         for (const adj of adjusted_items) {
-          const itemCheck = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE id = $1', [adj.id]);
+          const itemCheck = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.unit FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.id = $1', [adj.id]);
 
           if (itemCheck.rows.length > 0) {
             const item = itemCheck.rows[0];
+
+            // DEFESA DE INTEGRIDADE: quantity_delivered AJUSTA RESERVA de estoque. O front limita na UX,
+            // mas o backend é a fonte da verdade. Inválido → sentinela VALIDACAO_QTD → HTTP 400 (não grava
+            // nem toca em estoque). Regras: número >= 0, <= pedido, inteiro se unidade não-decimal, <= 2 casas.
+            const requested = parseFloat(item.quantity_requested);
+            const rawQd = String(adj.quantity_delivered ?? '').trim().replace(',', '.');
+            const newReserved = parseFloat(rawQd);
+            const decimalCount = rawQd.includes('.') ? rawQd.split('.')[1].length : 0;
+            if (!Number.isFinite(newReserved) || newReserved < 0) {
+              throw new Error(`VALIDACAO_QTD:Quantidade conferida inválida no item ${adj.id}.`);
+            }
+            if (newReserved > requested) {
+              throw new Error(`VALIDACAO_QTD:Quantidade conferida (${newReserved}) não pode passar do pedido (${requested}).`);
+            }
+            if (!isDecimalUnit(item.unit) && !Number.isInteger(newReserved)) {
+              throw new Error(`VALIDACAO_QTD:A unidade "${String(item.unit ?? '').trim()}" não aceita casas decimais.`);
+            }
+            if (decimalCount > 2) {
+              throw new Error(`VALIDACAO_QTD:Máximo de 2 casas decimais no item ${adj.id}.`);
+            }
+
             const oldReserved = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-            const newReserved = parseFloat(adj.quantity_delivered);
 
             await client.query('UPDATE request_items SET quantity_delivered = $1 WHERE id = $2', [newReserved, adj.id]);
 
-            if (item.product_id && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
+            if (item.product_id && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado' || currentStatus === 'conferido')) {
               // Só ajusta se já existia reserva (preserva o comportamento do 2.0).
               const snap = await StockService.read(client, item.product_id, warehouseId, POOLED_OP_ID);
               if (snap && snap.reserved > 0) {
                 const delta = newReserved - oldReserved;
+                // Namespace de op_key por FASE: o ajuste na conferência ('conf:') não pode colidir com o
+                // op_key do ajuste no aceite (aberto/aprovado). Sem isso, reusar o mesmo valor-alvo (ex.: 0)
+                // faria o dedup do stock_ledger engolir a liberação da conferência (NO-OP silencioso).
+                const phase = currentStatus === 'conferido' ? 'conf:' : '';
                 if (delta > 0) {
                   await StockService.reserve(client, item.product_id, warehouseId, POOLED_OP_ID, delta, {
                     refType: 'request', refId: id, userId,
-                    opKey: `request:${id}:item:${adj.id}:adjreserve:${newReserved}`,
+                    opKey: `request:${id}:item:${adj.id}:${phase}adjreserve:${newReserved}`,
                     reason: 'Ajuste de quantidade (aumenta reserva)',
                   });
                 } else if (delta < 0) {
                   await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, -delta, {
                     refType: 'request', refId: id, userId,
-                    opKey: `request:${id}:item:${adj.id}:adjrelease:${newReserved}`,
+                    opKey: `request:${id}:item:${adj.id}:${phase}adjrelease:${newReserved}`,
                     reason: 'Ajuste de quantidade (reduz reserva)',
                   });
                 }
@@ -476,6 +505,9 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (typeof error?.message === 'string' && error.message.startsWith('VALIDACAO_QTD:')) {
+      return res.status(400).json({ error: error.message.slice('VALIDACAO_QTD:'.length) });
+    }
     if (typeof error?.message === 'string' && error.message.startsWith('TRANSICAO_INVALIDA:')) {
       const [, de, para] = error.message.split(':');
       return res.status(400).json({ error: `Transição inválida: ${de} → ${para}.` });
