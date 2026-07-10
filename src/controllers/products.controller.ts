@@ -91,6 +91,14 @@ export const createProduct = async (req: Request, res: Response) => {
      return res.status(400).json({ error: 'O código SKU é obrigatório e não pode estar vazio.' });
   }
 
+  // 🛡️ VALIDAÇÃO DE FORMATO: C.SS.NNNN (1º dígito de 1 a 9). Defesa de servidor:
+  // o front tem máscara, mas a API pode ser chamada direto — o formato é garantido aqui também.
+  const SKU_REGEX = /^[1-9]\.\d{2}\.\d{4}$/;
+  if (!SKU_REGEX.test(sku)) {
+     client.release();
+     return res.status(400).json({ error: 'Formato de SKU inválido. Use C.SS.NNNN (ex.: 3.08.0114), com o primeiro dígito de 1 a 9.' });
+  }
+
   try {
     await client.query('BEGIN');
     
@@ -120,8 +128,9 @@ export const createProduct = async (req: Request, res: Response) => {
     );
     const newProduct = productRes.rows[0];
 
-    // 🟢 INSERE STOCK A ZERO. Removido o insert na tabela de logs (xml_logs).
-    await client.query(`INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) VALUES ($1, 0, 0) ON CONFLICT (product_id) DO NOTHING`, [newProduct.id]);
+    // Sem INSERT em stock: saldo é LAZY (a linha nasce no 1º receive via StockService, com warehouse_id correto).
+    // O produto lê 0 no GET mesmo sem linha (LEFT JOIN stock + COALESCE 0). O INSERT direto quebrava pós-migração 004:
+    // warehouse_id NOT NULL sem default + ON CONFLICT (product_id) sem índice correspondente → ROLLBACK → 400 em toda criação.
     
     await createLog(userId, 'CRIAR_PRODUTO', { sku, name }, getClientIp(req), client);
     await client.query('COMMIT');
@@ -151,6 +160,11 @@ export const updateProduct = async (req: Request, res: Response) => {
 
     // 🛡️ PROTEÇÃO 2: Evitar erro de duplicação do banco de dados na Edição
     if (sku) {
+      // 🛡️ VALIDAÇÃO DE FORMATO: mesmo regex do createProduct (C.SS.NNNN, 1º dígito de 1 a 9).
+      const SKU_REGEX = /^[1-9]\.\d{2}\.\d{4}$/;
+      if (!SKU_REGEX.test(sku)) {
+        throw new Error('Formato de SKU inválido. Use C.SS.NNNN (ex.: 3.08.0114), com o primeiro dígito de 1 a 9.');
+      }
       const skuCheck = await client.query('SELECT id, name FROM products WHERE sku = $1 AND id != $2', [sku, id]);
       if (skuCheck.rows.length > 0) {
         throw new Error(`Conflito! O código SKU "${sku}" já está a ser utilizado pelo produto: "${skuCheck.rows[0].name}".`);

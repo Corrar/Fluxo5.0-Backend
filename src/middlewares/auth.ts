@@ -101,15 +101,6 @@ export const requirePermission = (requiredAction: string) => {
         }
       });
 
-      // ==========================================
-      // 🛠️ RAIO-X: VERIFICAÇÃO NO TERMINAL
-      // ==========================================
-      console.log(`\n--- TENTATIVA DE ACESSO ---`);
-      console.log(`👤 Utilizador ID: ${userId} | Cargo: ${safeRole}`);
-      console.log(`🔑 Permissão Exigida: '${requiredAction}'`);
-      console.log(`📋 Permissões Encontradas no Banco:`, userPermissions);
-      console.log(`---------------------------\n`);
-
       // 4. Verificação de Segurança (limpa a ação exigida também para garantir correspondência exata)
       if (userPermissions.includes(requiredAction.trim())) {
         return next(); // Tem permissão! Continua para o Controller.
