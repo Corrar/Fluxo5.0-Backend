@@ -397,7 +397,7 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
                 // Namespace de op_key por FASE: o ajuste na conferência ('conf:') não pode colidir com o
                 // op_key do ajuste no aceite (aberto/aprovado). Sem isso, reusar o mesmo valor-alvo (ex.: 0)
                 // faria o dedup do stock_ledger engolir a liberação da conferência (NO-OP silencioso).
-                const phase = currentStatus === 'conferido' ? 'conf:' : '';
+                const phase = status === 'conferido' ? 'conf:' : '';
                 if (delta > 0) {
                   await StockService.reserve(client, item.product_id, warehouseId, POOLED_OP_ID, delta, {
                     refType: 'request', refId: id, userId,
