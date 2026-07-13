@@ -365,50 +365,91 @@ export const registerReturn = async (req: Request, res: Response) => {
 // =========================================================================
 
 export const registerEntries = async (req: Request, res: Response) => {
-  const { entries } = req.body;
+  const { nf_number, entries } = req.body;
+  // Contrato 5.0: nf_number e type no CABEÇALHO do body. Fallback ao legado (type por item)
+  // enquanto o front não migra (Etapa 2).
+  const type = req.body.type ?? entries?.[0]?.type;
   const userId = (req as any).user.id;
 
   if (!entries || !Array.isArray(entries) || entries.length === 0) {
     return res.status(400).json({ error: 'Nenhuma entrada fornecida.' });
   }
 
+  // Entrada por NF exige número rastreável. Reaproveitamento (type != 'NFe') dispensa por ora.
+  const isNFe = type === 'NFe';
+  const nf = typeof nf_number === 'string' ? nf_number.trim() : '';
+  if (isNFe && !nf) {
+    return res.status(400).json({ error: 'Número da NF é obrigatório para entrada por NFe.' });
+  }
+
+  // Agrupa por product_id somando a quantidade -> 1 receive por produto. Coerente com o op_key
+  // por NF (mesmo produto na mesma NF = uma única chave; sem isto, a 2ª linha do produto seria
+  // descartada como duplicata idempotente e a quantidade se perderia).
+  const byProduct = new Map<string, number>();
+  for (const entry of entries) {
+    const product_id = entry?.product_id;
+    const qty = Number(entry?.quantity);
+    if (!product_id) {
+      return res.status(400).json({ error: 'Item inválido, falta Produto.' });
+    }
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return res.status(400).json({ error: 'Quantidade inválida: informe um número maior que zero.' });
+    }
+    byProduct.set(product_id, (byProduct.get(product_id) ?? 0) + qty);
+  }
+
   try {
     await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
 
-      // 1. Log de cabeçalho na xml_logs (para o Reports.tsx conseguir ler)
-      const typeLabel = entries[0]?.type === 'REAPROVEITAMENTO' ? '♻️ Reaproveitamento' : '📦 Entrada NFe';
+      // Bloqueia reenvio de NF já cadastrada (só NFe com número). O op_key já protege o SALDO;
+      // este check protege a UX — avisa o usuário em vez de silenciosamente não fazer nada.
+      // Padrão do controller: throw + conversão pra 400 no catch. NÃO usar `return res.status()`
+      // aqui: o return dentro do withTransaction NÃO faz rollback (comita) e ainda cairia no
+      // res.status(201) lá embaixo -> "headers already sent". O throw faz o ROLLBACK correto.
+      if (isNFe && nf) {
+        const jaExiste = await client.query(
+          'SELECT id FROM xml_logs WHERE nf_number = $1 LIMIT 1',
+          [nf]
+        );
+        if (jaExiste.rows.length > 0) {
+          throw new Error('NF_DUPLICADA'); // rollback pelo withTransaction -> nada é gravado
+        }
+      }
+
+      // 1. Log de cabeçalho na xml_logs (para o Reports.tsx conseguir ler) — agora com nf_number.
+      const typeLabel = type === 'REAPROVEITAMENTO' ? '♻️ Reaproveitamento' : '📦 Entrada NFe';
 
       const logRes = await client.query(
-        "INSERT INTO xml_logs (file_name, success, total_items) VALUES ($1, $2, $3) RETURNING id",
-        [`${typeLabel} - ${new Date().toLocaleString('pt-BR')}`, true, entries.length]
+        "INSERT INTO xml_logs (file_name, success, total_items, nf_number) VALUES ($1, $2, $3, $4) RETURNING id",
+        [`${typeLabel} - ${new Date().toLocaleString('pt-BR')}`, true, byProduct.size, nf || null]
       );
 
       const logId = logRes.rows[0].id;
 
-      for (const entry of entries) {
-        const { product_id, quantity } = entry;
-
-        if (!product_id || !quantity) {
-          throw new Error("Item inválido, falta Produto ou Quantidade.");
-        }
-
-        // 2. Entrada física pelo motor (cria a linha LAZY se não existir).
-        // Insere o item primeiro para termos o id (op_key idempotente por item).
-        const itemRes = await client.query(
-          "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3) RETURNING id",
+      for (const [product_id, quantity] of byProduct) {
+        // Item de detalhe: 1 linha por produto agregado (casa 1:1 com o receive/razão).
+        await client.query(
+          "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)",
           [logId, product_id, quantity]
         );
-        const xmlItemId = itemRes.rows[0].id;
 
-        await StockService.receive(client, product_id, warehouseId, POOLED_OP_ID, Number(quantity), {
+        // 2. Entrada física pelo motor (cria a linha LAZY se não existir).
+        // op_key idempotente POR NF (não mais por UUID de linha) -> reenvio da MESMA NF não duplica saldo.
+        // Sem NF (reaproveitamento): chave estável por log+produto (logId é único -> não colide entre entradas).
+        const opKey = nf
+          ? `entry:nf:${nf}:product:${product_id}:receive`
+          : `entry:reuse:${logId}:product:${product_id}:receive`;
+
+        await StockService.receive(client, product_id, warehouseId, POOLED_OP_ID, quantity, {
           refType: 'entry', refId: String(logId), userId,
-          opKey: `entry:${logId}:item:${xmlItemId}:receive`,
-          reason: `Entrada de estoque (${entries[0]?.type || 'NFe'})`,
+          opKey,
+          nfNumber: nf || null,
+          reason: `Entrada de estoque (${type || 'NFe'})`,
         });
       }
 
-      await createLog(userId, 'STOCK_ENTRY', { type: entries[0]?.type, totalItems: entries.length }, getClientIp(req), client);
+      await createLog(userId, 'STOCK_ENTRY', { type, nf_number: nf || null, totalItems: byProduct.size }, getClientIp(req), client);
     });
 
     // Notificações Push (mesmo evento do 2.0)
@@ -423,6 +464,7 @@ export const registerEntries = async (req: Request, res: Response) => {
     res.status(201).json({ success: true, message: 'Entradas registadas com sucesso.' });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (error.message === 'NF_DUPLICADA') return res.status(400).json({ error: 'Esta NF-e já foi cadastrada.' });
     res.status(500).json({ error: error.message || 'Erro interno ao registar as entradas.' });
   }
 };

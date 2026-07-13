@@ -44,6 +44,7 @@ export interface StockRefs {
   userId?: string | null;
   reason?: string | null;
   opKey?: string | null;
+  nfNumber?: string | null; // número da NF (entrada rastreável) -> gravado em stock_ledger.nf_number
 }
 
 export interface StockSnapshot {
@@ -128,11 +129,12 @@ async function persist(
   await client.query(
     `INSERT INTO stock_ledger
        (product_id, warehouse_id, op_id, kind, delta_on_hand, delta_reserved, on_hand_after, reserved_after,
-        op_key, ref_type, ref_id, user_id, reason)
-     VALUES ($1,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        op_key, ref_type, ref_id, user_id, reason, nf_number)
+     VALUES ($1,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
     [
       productId, warehouseId, opId, kind, deltas.dOnHand, deltas.dReserved, next.onHand, next.reserved,
       refs.opKey ?? null, refs.refType ?? null, refs.refId ?? null, refs.userId ?? null, refs.reason ?? null,
+      refs.nfNumber ?? null,
     ],
   );
   return snapshot(productId, warehouseId, opId, next.onHand, next.reserved);

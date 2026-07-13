@@ -1,7 +1,7 @@
 // src/routes/stock.routes.ts
 
 import { Router } from 'express';
-import { authenticate } from '../middlewares/auth';
+import { authenticate, requirePermission } from '../middlewares/auth';
 import { 
   getStock, 
   getStockReservations, 
@@ -61,7 +61,7 @@ router.post('/manual-withdrawal', manualWithdrawal);
  * @description Registra entradas de lote vindas dos novos painéis (NFe, Reaproveitamentos).
  * @body { entries: Array<{ product_id: string, quantity: number, type: string, observation?: string }> }
  */
-router.post('/entries', registerEntries); // O Endpoint novo que fica no lugar da entrada manual
+router.post('/entries', requirePermission('entradas:add'), registerEntries); // O Endpoint novo que fica no lugar da entrada manual
 
 // =========================================================================
 // ROTAS DE DEVOLUÇÕES (OP)
