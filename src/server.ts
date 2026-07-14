@@ -7,6 +7,7 @@ import { createServer } from 'http';
 import { globalLimiter } from './middlewares/rateLimiters';
 import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
+import { warmup } from './db';
 
 // --- Rotas (Routers) ---
 import authRouter from './routes/auth.routes';
@@ -175,4 +176,7 @@ const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
     console.log(`🚀 Fluxo Royale 2.1 Enterprise Online na porta ${PORT}`);
     console.log(`🛡️ Arquitetura Modular Ativa | Proteções RBAC e ACID Injetadas`);
+    // Warm-up assíncrono: acorda o compute Neon antes do 1º usuário (não bloqueia o listen,
+    // não derruba o boot se falhar). Loga db_warmup_ok/db_warmup_fail com o tempo do wake.
+    void warmup();
 });

@@ -1,7 +1,7 @@
 // src/controllers/products.controller.ts
 
 import { Request, Response } from 'express';
-import { pool } from '../db'; 
+import { pool, query } from '../db';
 import { getClientIp } from '../utils/ip';
 import { createLog } from '../utils/logger';
 
@@ -39,7 +39,7 @@ const sanitizeTags = (tagsData: any): { is3D: boolean, parsed: string[] } => {
 
 export const getProducts = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await query(`
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.tags, p.unit_price, p.sales_price, p.min_stock, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0), 'quantity_reserved', COALESCE(s.quantity_reserved, 0)) as stock
@@ -60,7 +60,7 @@ export const getProducts = async (req: Request, res: Response) => {
 
 export const getLowStockProducts = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await query(`
       SELECT p.id, p.sku, p.name, p.unit, p.min_stock, p.purchase_status, p.purchase_note, p.delivery_forecast, COALESCE(s.quantity_on_hand, 0) as quantity, COALESCE(s.quantity_reserved, 0) as quantity_reserved, s.critical_since, (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) as disponivel,
         (SELECT COALESCE(SUM(ri.quantity_requested), 0) FROM request_items ri JOIN requests r ON ri.request_id = r.id WHERE ri.product_id = p.id AND r.status IN ('aberto', 'aprovado')) as demanda_reprimida
       FROM products p LEFT JOIN stock s ON p.id = s.product_id
@@ -255,11 +255,11 @@ export const reactivateProduct = async (req: Request, res: Response) => {
 
 export const getInactiveProducts = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await query(`
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.unit_price, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0)) as stock
-      FROM products p LEFT JOIN stock s ON p.id = s.product_id 
+      FROM products p LEFT JOIN stock s ON p.id = s.product_id
       WHERE p.active = false ORDER BY p.name ASC
     `);
     
