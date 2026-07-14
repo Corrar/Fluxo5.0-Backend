@@ -371,6 +371,11 @@ export const registerEntries = async (req: Request, res: Response) => {
   const type = req.body.type ?? entries?.[0]?.type;
   const userId = (req as any).user.id;
 
+  // Idempotência do reaproveitamento: âncora estável vinda do cliente (retry/refresh/duplo-clique).
+  // Só string; header repetido (array) ou vazio → tratado como AUSENTE (fallback ao logId).
+  const rawIdem = req.headers['x-idempotency-key'];
+  const idemKey = typeof rawIdem === 'string' && rawIdem.trim() ? rawIdem.trim() : null;
+
   if (!entries || !Array.isArray(entries) || entries.length === 0) {
     return res.status(400).json({ error: 'Nenhuma entrada fornecida.' });
   }
@@ -437,9 +442,11 @@ export const registerEntries = async (req: Request, res: Response) => {
         // 2. Entrada física pelo motor (cria a linha LAZY se não existir).
         // op_key idempotente POR NF (não mais por UUID de linha) -> reenvio da MESMA NF não duplica saldo.
         // Sem NF (reaproveitamento): chave estável por log+produto (logId é único -> não colide entre entradas).
+        // NF: inalterado (âncora = nf_number). Reuse: âncora = x-idempotency-key se presente;
+        // senão, fallback ao logId (comportamento atual — sem dedupe entre requests distintos).
         const opKey = nf
           ? `entry:nf:${nf}:product:${product_id}:receive`
-          : `entry:reuse:${logId}:product:${product_id}:receive`;
+          : `entry:reuse:${idemKey ?? logId}:product:${product_id}:receive`;
 
         await StockService.receive(client, product_id, warehouseId, POOLED_OP_ID, quantity, {
           refType: 'entry', refId: String(logId), userId,
@@ -465,6 +472,17 @@ export const registerEntries = async (req: Request, res: Response) => {
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
     if (error.message === 'NF_DUPLICADA') return res.status(400).json({ error: 'Esta NF-e já foi cadastrada.' });
+    // Concorrência do reaproveitamento: 2 POSTs paralelos com a MESMA x-idempotency-key.
+    // O 1º comitou o saldo; o 2º passou o SELECT-dedupe antes do commit e bateu no índice único do
+    // op_key (23505). O withTransaction já fez ROLLBACK -> a 2ª transação NÃO gravou nada em duplicidade,
+    // o saldo persistido é o do 1º POST. Trata SOMENTE a nossa constraint como idempotente; qualquer
+    // outro 23505 (constraint diferente) RE-LANÇA para não mascarar bug real.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      const opKeyConflict = /\(op_key\)=\(([^)]*)\)/.exec(error?.detail ?? '')?.[1] ?? null;
+      console.warn(JSON.stringify({ event: 'reuse_idempotent_conflict', op_key: opKeyConflict }));
+      // Resposta idempotente: mesmo shape/status do sucesso normal do reuse (o crédito do 1º POST vale).
+      return res.status(201).json({ success: true, message: 'Entradas registadas com sucesso.' });
+    }
     res.status(500).json({ error: error.message || 'Erro interno ao registar as entradas.' });
   }
 };
