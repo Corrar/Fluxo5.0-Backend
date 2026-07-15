@@ -1,8 +1,10 @@
 import { Request, Response } from 'express';
-import { pool } from '../db';
+import { pool, withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { StockService, StockError } from '../services/stock.service';
+import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
@@ -75,117 +77,167 @@ export const updateReplenishment = async (req: Request, res: Response) => {
 
 export const authorizeReplenishment = async (req: Request, res: Response) => {
   const { id } = req.params;
-  
-  // ADICIONADO: O backend agora "lê" o tracking_code que o Frontend envia
-  const { items, action, shipping_info, tracking_code } = req.body; 
-  
+  const { items, action, shipping_info, tracking_code } = req.body;
   const userId = (req as any).user.id;
-  const client = await pool.connect();
+
   try {
-    await client.query('BEGIN');
-    for (const item of items) {
-      const oldItem = await client.query('SELECT quantity, product_id, qty_requested FROM replenishment_items WHERE id = $1', [item.id]);
-      if (oldItem.rows.length > 0) {
+    await withTransaction(async (client) => {
+      // Trava a LINHA do replenishment ANTES do guard -> o guard de status fica consistente sob
+      // concorrência (2 authorize paralelos serializam neste FOR UPDATE). Padrão do updateStock.
+      const repRes = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
+      if (repRes.rows.length === 0) throw new Error('REP_NAO_ENCONTRADA');
+      const status = repRes.rows[0].status;
+
+      // GUARD DE STATUS (defesa em profundidade além do op_key idempotente): rejeita cedo e explícito.
+      if (action === 'entregar' && status === 'concluido') throw new Error('REP_JA_CONCLUIDA');
+      if ((action === 'reservar' || action === 'reverter') && status === 'cancelada') throw new Error('REP_CANCELADA');
+
+      const warehouseId = await resolveWarehouseId(client, userId);
+
+      for (const item of items) {
+        const oldItem = await client.query('SELECT quantity, product_id, qty_requested FROM replenishment_items WHERE id = $1', [item.id]);
+        if (oldItem.rows.length === 0) continue;
+
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
         const newQty = item.quantity !== undefined ? parseFloat(item.quantity) : oldQty;
-        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida.");
-
+        if (isNaN(newQty) || newQty < 0) throw new Error('Quantidade inválida.');
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
 
+        // op_key CONTENT-ADDRESSED por replenishment + item + AÇÃO + qty (igual updateStock embute o valor):
+        // re-run com a MESMA qty = no-op idempotente; mudar a qty = nova operação. A AÇÃO no key evita
+        // que reserve e deliver do mesmo item colidam.
         if (action === 'reservar') {
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
+          // reserve/release pelo motor (valida DISPONÍVEL sob FOR UPDATE + grava no ledger).
           if (diff > 0) {
-            const st = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
-            if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque insuficiente para o produto ID ${productId}`);
+            await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, diff, {
+              refType: 'replenishment', refId: id, userId,
+              opKey: `replenishment:${id}:item:${item.id}:reserve:${newQty}`,
+              reason: 'Reserva de reposição',
+            });
+          } else if (diff < 0) {
+            await StockService.release(client, productId, warehouseId, POOLED_OP_ID, -diff, {
+              refType: 'replenishment', refId: id, userId,
+              opKey: `replenishment:${id}:item:${item.id}:reserve:${newQty}`,
+              reason: 'Ajuste de reserva de reposição',
+            });
           }
-          if (diff !== 0) await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
         } else if (action === 'entregar') {
-          // --- INÍCIO DA ATUALIZAÇÃO ---
-          const stCheck = await client.query('SELECT quantity_on_hand, quantity_reserved FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
-          
-          if (parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < newQty) throw new Error(`Furo de Estoque! O saldo físico é menor que a quantidade a entregar no produto ID ${productId}.`);
-          
-          const diffDelivery = newQty - oldQty;
-          if (diffDelivery > 0) {
-              const available = parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) - parseFloat(stCheck.rows[0]?.quantity_reserved || 0);
-              if (available < diffDelivery) throw new Error(`Estoque disponível insuficiente para adicionar os itens extras na entrega do produto ID ${productId}.`);
-          }
-
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
-          await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand - $1, quantity_reserved = GREATEST(0, quantity_reserved - $2) WHERE product_id = $3`, [newQty, oldQty, productId]);
-          // --- FIM DA ATUALIZAÇÃO ---
+          // BAIXA FÍSICA pelo motor: consume faz on_hand -= newQty, libera min(newQty, reserved) e valida FURO.
+          // op_key `deliver:${newQty}` -> re-entregar com a mesma qty é no-op idempotente (fim da dupla baixa).
+          await StockService.consume(client, productId, warehouseId, POOLED_OP_ID, newQty, {
+            refType: 'replenishment', refId: id, userId,
+            opKey: `replenishment:${id}:item:${item.id}:deliver:${newQty}`,
+            reason: 'Entrega de reposição',
+          });
+          // Decisão (b): entregou MENOS que reservou -> zera a reserva remanescente do item (não deixa sobra
+          // pendurada). consume já liberou newQty; libera o resto (oldQty - newQty).
+          if (oldQty > newQty) {
+            await StockService.release(client, productId, warehouseId, POOLED_OP_ID, oldQty - newQty, {
+              refType: 'replenishment', refId: id, userId,
+              opKey: `replenishment:${id}:item:${item.id}:deliver:${newQty}:relrem`,
+              reason: 'Liberação de reserva remanescente (entrega parcial)',
+            });
+          }
         } else if (action === 'reverter') {
-          await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand + $1, quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [oldQty, productId]);
+          // Desfaz a entrega: devolve o físico (receive) e re-empenha (reserve). Ancorado em oldQty.
+          await StockService.receive(client, productId, warehouseId, POOLED_OP_ID, oldQty, {
+            refType: 'replenishment', refId: id, userId,
+            opKey: `replenishment:${id}:item:${item.id}:revert:${oldQty}`,
+            reason: 'Reversão de entrega de reposição',
+          });
+          if (oldQty > 0) {
+            await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, oldQty, {
+              refType: 'replenishment', refId: id, userId,
+              opKey: `replenishment:${id}:item:${item.id}:revert:${oldQty}:rereserve`,
+              reason: 'Re-empenho na reversão de reposição',
+            });
+          }
         }
       }
-    }
 
-    // LÓGICA DE STATUS, SHIPPING E RASTREIO ATUALIZADA
-    let newStatus = 'em_preparo'; 
-    let extraUpdate = ''; 
-    let extraParams: any[] = [newStatus, id];
-    
-    if (action === 'entregar') { 
-        newStatus = 'concluido'; 
-        extraParams[0] = newStatus; 
-        
-        if (shipping_info) { 
-            extraParams.push(shipping_info);
-            extraUpdate += `, shipping_info = $${extraParams.length}`; 
-        } 
-        
-        // ADICIONADO: Guardar o código de rastreio na Base de Dados
-        if (tracking_code) { 
-            extraParams.push(tracking_code);
-            extraUpdate += `, tracking_code = $${extraParams.length}`; 
-        }
-    } 
-    else if (action === 'reverter') { 
-        newStatus = 'pendente'; 
-        extraParams[0] = newStatus; 
-        // ADICIONADO: Se reverter, apagar os dados de envio e rastreio
-        extraUpdate = ', shipping_info = NULL, tracking_code = NULL'; 
-    }
+      // STATUS + SHIPPING/RASTREIO — INALTERADO (schema e lifecycle preservados 1:1).
+      let newStatus = 'em_preparo';
+      let extraUpdate = '';
+      let extraParams: any[] = [newStatus, id];
+      if (action === 'entregar') {
+        newStatus = 'concluido';
+        extraParams[0] = newStatus;
+        if (shipping_info) { extraParams.push(shipping_info); extraUpdate += `, shipping_info = $${extraParams.length}`; }
+        if (tracking_code) { extraParams.push(tracking_code); extraUpdate += `, tracking_code = $${extraParams.length}`; }
+      } else if (action === 'reverter') {
+        newStatus = 'pendente';
+        extraParams[0] = newStatus;
+        extraUpdate = ', shipping_info = NULL, tracking_code = NULL';
+      }
+      await client.query(`UPDATE replenishments SET status = $1 ${extraUpdate} WHERE id = $2`, extraParams);
 
-    await client.query(`UPDATE replenishments SET status = $1 ${extraUpdate} WHERE id = $2`, extraParams);
-    
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'AUTORIZAR_REPOSICAO', { id_reposicao: id, acao: action, codigo_rastreio: tracking_code || 'Não informado' }, getClientIp(req), client);
-    await client.query('COMMIT');
+      await createLog(userId, 'AUTORIZAR_REPOSICAO', { id_reposicao: id, acao: action, codigo_rastreio: tracking_code || 'Não informado' }, getClientIp(req), client);
+    });
+
     if ((req as any).io) { (req as any).io.emit('stock_updated'); }
     res.json({ success: true });
   } catch (error: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
+    // Furo de estoque / reserva insuficiente do motor -> 400 tratado com mensagem clara.
+    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (error.message === 'REP_NAO_ENCONTRADA') return res.status(404).json({ error: 'Reposição não encontrada.' });
+    if (error.message === 'REP_JA_CONCLUIDA') return res.status(400).json({ error: 'Reposição já concluída.' });
+    if (error.message === 'REP_CANCELADA') return res.status(400).json({ error: 'Reposição cancelada — ação não permitida.' });
+    // Rede de segurança de concorrência: 2 escritas paralelas com a MESMA op_key batem no índice único
+    // (uq_stock_ledger_opkey). O withTransaction fez ROLLBACK -> nada duplicou; resposta idempotente.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      const opKeyConflict = /\(op_key\)=\(([^)]*)\)/.exec(error?.detail ?? '')?.[1] ?? null;
+      console.warn(JSON.stringify({ event: 'replenishment_idempotent_conflict', op_key: opKeyConflict }));
+      return res.json({ success: true });
+    }
     res.status(400).json({ error: error.message });
-  } finally { client.release(); }
+  }
 };
 
 export const deleteReplenishment = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
-    if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
-    if (repCheck.rows[0].status === 'concluido' || repCheck.rows[0].status === 'cancelada') throw new Error('Não é possível inativar reposições concluídas ou já canceladas.');
+    await withTransaction(async (client) => {
+      const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
+      if (repCheck.rows.length === 0) throw new Error('REP_NAO_ENCONTRADA');
+      const status = repCheck.rows[0].status;
+      // GUARD (preservado): não cancela concluída nem já cancelada -> evita dupla liberação de reserva.
+      if (status === 'concluido' || status === 'cancelada') throw new Error('REP_NAO_CANCELAVEL');
 
-    if (repCheck.rows[0].status === 'em_preparo') {
-       const itemsRes = await client.query('SELECT product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);
-       for (const item of itemsRes.rows) {
-         if (item.quantity > 0) await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, quantity_reserved - $1) WHERE product_id = $2', [item.quantity, item.product_id]);
-       }
-    }
+      // Só há reserva a liberar se estava em_preparo (o 'reservar' é quem move p/ reserved).
+      if (status === 'em_preparo') {
+        const warehouseId = await resolveWarehouseId(client, userId);
+        const itemsRes = await client.query('SELECT id, product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);
+        for (const item of itemsRes.rows) {
+          const qty = parseFloat(item.quantity || 0);
+          if (qty > 0) {
+            // release pelo motor (nunca deixa reserva negativa + grava no ledger). op_key content-addressed
+            // com a AÇÃO 'cancel' -> não colide com reserve/deliver/revert do authorize do mesmo item.
+            await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
+              refType: 'replenishment', refId: id, userId,
+              opKey: `replenishment:${id}:item:${item.id}:cancel:release:${qty}`,
+              reason: 'Liberação de reserva ao cancelar reposição',
+            });
+          }
+        }
+      }
 
-    await client.query("UPDATE replenishments SET status = 'cancelada' WHERE id = $1", [id]);
-    
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'CANCELAR_REPOSICAO', { id_reposicao: id }, getClientIp(req), client);
-    await client.query('COMMIT');
+      await client.query("UPDATE replenishments SET status = 'cancelada' WHERE id = $1", [id]);
+      await createLog(userId, 'CANCELAR_REPOSICAO', { id_reposicao: id }, getClientIp(req), client);
+    });
     res.json({ success: true });
   } catch (error: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
+    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (error.message === 'REP_NAO_ENCONTRADA') return res.status(404).json({ error: 'Reposição não encontrada.' });
+    if (error.message === 'REP_NAO_CANCELAVEL') return res.status(400).json({ error: 'Não é possível inativar reposições concluídas ou já canceladas.' });
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      const opKeyConflict = /\(op_key\)=\(([^)]*)\)/.exec(error?.detail ?? '')?.[1] ?? null;
+      console.warn(JSON.stringify({ event: 'replenishment_idempotent_conflict', op_key: opKeyConflict }));
+      return res.json({ success: true });
+    }
     res.status(500).json({ error: 'Erro ao cancelar reposição' });
-  } finally { client.release(); }
+  }
 };
