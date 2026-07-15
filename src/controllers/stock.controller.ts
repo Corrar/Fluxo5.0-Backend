@@ -153,6 +153,13 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
   const { sector, items, op_code } = req.body;
   const userId = (req as any).user.id;
 
+  // Idempotência da SAÍDA (mesma disciplina do reaproveitamento/registerEntries): âncora estável
+  // vinda do cliente para retry/refresh/duplo-POST que CHEGA ao servidor. Saída duplicada = furo de
+  // estoque, então tratamos igual à entrada. Só string; header repetido (array) ou vazio → AUSENTE
+  // (fallback ao comportamento legado por separationId — Controle de Saída/Armazém não mandam header).
+  const rawIdem = req.headers['x-idempotency-key'];
+  const idemKey = typeof rawIdem === 'string' && rawIdem.trim() ? rawIdem.trim() : null;
+
   // =========================================================================
   // 🛡️ 0. VALIDAÇÃO DE SEGURANÇA DO SETOR
   // =========================================================================
@@ -230,21 +237,56 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
       );
       const separationId = sepRes.rows[0].id;
 
-      for (const item of items) {
-        if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
+      if (idemKey) {
+        // ── SAÍDA IDEMPOTENTE (header X-Idempotency-Key presente) ────────────────────────────────
+        // O op_key ancora no idemKey do CLIENTE (não no separationId, que é fresco a cada POST), então
+        // um retry/duplo-POST com a MESMA chave é deduplicado pelo motor via uq_stock_ledger_opkey.
+        // AGREGA por produto ANTES de consumir: sem isto, 2 itens do MESMO produto no mesmo lote gerariam
+        // a MESMA chave `withdrawal:${idemKey}:product:${pid}:consume` e o 2º consume viraria no-op
+        // idempotente (alreadyApplied) — perdendo a quantidade. Mesma solução do reaproveitamento (byProduct).
+        const byProduct = new Map<string, number>();
+        const obsByProduct = new Map<string, string | null>();
+        for (const item of items) {
+          if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
+          const pid = item.product_id as string;
+          byProduct.set(pid, (byProduct.get(pid) ?? 0) + Number(item.quantity));
+          if (!obsByProduct.has(pid)) obsByProduct.set(pid, item.observation || null);
+        }
 
-        const itemRes = await client.query(
-          'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4) RETURNING id',
-          [separationId, item.product_id, item.quantity, item.observation || null]
-        );
-        const itemId = itemRes.rows[0].id;
+        for (const [product_id, quantity] of byProduct) {
+          await client.query(
+            'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)',
+            [separationId, product_id, quantity, obsByProduct.get(product_id) ?? null]
+          );
 
-        // consume: baixa física + libera reserva correspondente (motor valida FURO_ESTOQUE).
-        await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, Number(item.quantity), {
-          refType: 'separation', refId: separationId, userId,
-          opKey: `separation:${separationId}:item:${itemId}:consume`,
-          reason: 'Saída manual de estoque',
-        });
+          // consume: baixa física + libera reserva (motor valida FURO_ESTOQUE).
+          // op_key ancorado no header + produto agregado -> reenvio da MESMA chave NÃO duplica saldo.
+          await StockService.consume(client, product_id, warehouseId, POOLED_OP_ID, quantity, {
+            refType: 'separation', refId: separationId, userId,
+            opKey: `withdrawal:${idemKey}:product:${product_id}:consume`,
+            reason: 'Saída manual de estoque',
+          });
+        }
+      } else {
+        // ── SAÍDA LEGADA (sem header) — comportamento INALTERADO ─────────────────────────────────
+        // Controle de Saída / Armazém ainda não enviam header: op_key por item do separationId fresco
+        // (sem dedupe entre requests distintos, exatamente como no 2.0). NÃO alterar sem migrar as telas.
+        for (const item of items) {
+          if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
+
+          const itemRes = await client.query(
+            'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4) RETURNING id',
+            [separationId, item.product_id, item.quantity, item.observation || null]
+          );
+          const itemId = itemRes.rows[0].id;
+
+          // consume: baixa física + libera reserva correspondente (motor valida FURO_ESTOQUE).
+          await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, Number(item.quantity), {
+            refType: 'separation', refId: separationId, userId,
+            opKey: `separation:${separationId}:item:${itemId}:consume`,
+            reason: 'Saída manual de estoque',
+          });
+        }
       }
 
       await createLog(userId, 'MANUAL_WITHDRAWAL', { separationId, sector }, getClientIp(req), client);
@@ -258,6 +300,18 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
     if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP já foi finalizada, verifique a OP correta" });
+
+    // Concorrência da saída idempotente: 2 POSTs paralelos com a MESMA x-idempotency-key. O 1º comitou
+    // a baixa; o 2º passou o alreadyApplied ANTES do commit e bateu no índice único do op_key (23505).
+    // O withTransaction já fez ROLLBACK -> a 2ª transação NÃO debitou em duplicidade (a separação e os
+    // itens dela também foram revertidos). Trata SOMENTE a nossa constraint como idempotente; qualquer
+    // outro 23505 (constraint diferente) RE-LANÇA para não mascarar bug real. Espelha o registerEntries.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      const opKeyConflict = /\(op_key\)=\(([^)]*)\)/.exec(error?.detail ?? '')?.[1] ?? null;
+      console.warn(JSON.stringify({ event: 'withdrawal_idempotent_conflict', op_key: opKeyConflict }));
+      // Resposta idempotente: mesmo shape/status do sucesso normal (a baixa do 1º POST vale).
+      return res.status(201).json({ success: true });
+    }
 
     res.status(500).json({ error: error.message });
   }

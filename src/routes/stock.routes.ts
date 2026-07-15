@@ -54,7 +54,7 @@ router.put('/:id', updateStock);
  * @description Registra a saída/retirada de produtos (subtrai do físico).
  * @body { sector: string, op_code?: string, items: Array<{ product_id: string, quantity: number }> }
  */
-router.post('/manual-withdrawal', manualWithdrawal);
+router.post('/manual-withdrawal', requirePermission('entradas:add'), manualWithdrawal);
 
 /**
  * @route POST /stock/entries
