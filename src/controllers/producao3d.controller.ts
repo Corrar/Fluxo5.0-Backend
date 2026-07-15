@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
-import { pool } from '../db';
+import { pool, withTransaction } from '../db';
+import { StockService, StockError } from '../services/stock.service';
+import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 // ==========================================
 // 1. CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -70,47 +72,71 @@ export const getDemands = async (req: Request, res: Response) => {
 export const updateDemandStatus = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { status } = req.body;
-  const client = await pool.connect();
-  
+  const userId = (req as any).user.id;
+
   try {
-    await client.query('BEGIN');
-    
-    await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
+    await withTransaction(async (client) => {
+      // GUARD DE RE-CONCLUSÃO: trava a LINHA da demanda ANTES de qualquer escrita -> consistente sob
+      // concorrência (2 conclusões paralelas serializam aqui). Padrão do replenishments (4479760).
+      const cur = await client.query('SELECT status, request_id, quantity, product_id FROM demands_3d WHERE id = $1 FOR UPDATE', [id]);
+      if (cur.rows.length === 0) throw new Error('DEMANDA_NAO_ENCONTRADA');
+      const atual = cur.rows[0].status;
+      if (status === 'Concluída' && atual === 'Concluída') throw new Error('DEMANDA_JA_CONCLUIDA');
+      if (status === 'Concluída' && atual === 'Cancelada') throw new Error('DEMANDA_CANCELADA');
 
-    if (status === 'Concluída') {
-        const demandRes = await client.query('SELECT request_id, quantity, product_id FROM demands_3d WHERE id = $1', [id]);
-        const demand = demandRes.rows[0];
+      // UPDATE do status movido pra DEPOIS do guard (antes rodava antes do check).
+      await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
 
-        if (demand.product_id) {
-            // 1. Entrada no estoque físico
-            await client.query(
-                `UPDATE stock 
-                 SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1,
-                     quantity_reserved = COALESCE(quantity_reserved, 0) + $1
-                 WHERE product_id = $2`,
-                [demand.quantity, demand.product_id]
-            );
+      if (status === 'Concluída') {
+        const quantity = Number(cur.rows[0].quantity);
+        const productId = cur.rows[0].product_id;
+        const requestId = cur.rows[0].request_id;
 
-            // 2. Regista no histórico de auditoria oficial do sistema
-            await client.query(
-                `INSERT INTO audit_logs (user_id, action, details) 
-                 VALUES ($1, $2, $3)`,
-                [(req as any).user.id, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: demand.product_id, quantity: demand.quantity, reason: 'Produção 3D Concluída' })]
-            );
+        if (productId) {
+          const warehouseId = await resolveWarehouseId(client, userId);
+          // 1. Peça impressa ENTRA no físico. receive PRIMEIRO (aumenta disponível + cria a linha LAZY se faltar).
+          //    op_key content-addressed: re-concluir com a mesma qty = no-op idempotente (fim da dupla entrada).
+          await StockService.receive(client, productId, warehouseId, POOLED_OP_ID, quantity, {
+            refType: 'demand_3d', refId: id, userId,
+            opKey: `demand:${id}:conclude:receive:${quantity}`,
+            reason: 'Produção 3D concluída (entrada no estoque)',
+          });
+          // 2. SEGURA a peça produzida p/ a request 'aprovado' que a aguarda (decisão A). reserve DEPOIS
+          //    (o receive já garantiu disponível). Sem isto, a peça viraria estoque livre -> furo na entrega.
+          await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, quantity, {
+            refType: 'demand_3d', refId: id, userId,
+            opKey: `demand:${id}:conclude:reserve:${quantity}`,
+            reason: 'Reserva da peça 3D produzida para a solicitação',
+          });
+
+          // Auditoria oficial (INALTERADA).
+          await client.query(
+            `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+            [userId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: productId, quantity, reason: 'Produção 3D Concluída' })]
+          );
         }
 
-        if (demand.request_id) {
-            await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1`, [demand.request_id]);
+        // INALTERADO: marca a solicitação vinculada como aprovada.
+        if (requestId) {
+          await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1`, [requestId]);
         }
-    }
-    
-    await client.query('COMMIT');
+      }
+    });
+
     res.json({ success: true });
-  } catch (error) {
-    await client.query('ROLLBACK');
+  } catch (error: any) {
+    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (error.message === 'DEMANDA_NAO_ENCONTRADA') return res.status(404).json({ error: 'Demanda não encontrada.' });
+    if (error.message === 'DEMANDA_JA_CONCLUIDA') return res.status(400).json({ error: 'Demanda já concluída.' });
+    if (error.message === 'DEMANDA_CANCELADA') return res.status(400).json({ error: 'Demanda cancelada.' });
+    // Rede de segurança de concorrência: 2 conclusões paralelas com a MESMA op_key batem no índice único.
+    // O withTransaction fez ROLLBACK -> nada duplicou; resposta idempotente (espelha o 4479760).
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      const opKeyConflict = /\(op_key\)=\(([^)]*)\)/.exec(error?.detail ?? '')?.[1] ?? null;
+      console.warn(JSON.stringify({ event: 'demand3d_idempotent_conflict', op_key: opKeyConflict }));
+      return res.json({ success: true });
+    }
     res.status(500).json({ error: 'Erro ao mover demanda no Kanban' });
-  } finally {
-    client.release();
   }
 };
 

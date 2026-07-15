@@ -9,7 +9,7 @@ import {
   createProduction, // <-- ADICIONADO: Importação da função de criar
   deleteProduction  // <-- ADICIONADO: Importação da função de apagar
 } from '../controllers/producao3d.controller';
-import { authenticate } from '../middlewares/auth';
+import { authenticate, requirePermission } from '../middlewares/auth';
 
 const router = Router();
 
@@ -37,7 +37,8 @@ router.put('/parts/:id', update3DPartDetails);
 router.get('/demands', getDemands);
 
 // Altera o status de uma demanda (ex: mover de 'Aceita' para 'Concluída')
-router.put('/demands/:id/status', updateDemandStatus);
+// Concluir escreve saldo (receive+reserve) -> mesma permissão do fluxo análogo (separations/replenishments authorize).
+router.put('/demands/:id/status', requirePermission('separacoes:edit'), updateDemandStatus);
 
 // ==========================================
 // 📊 HISTÓRICO E MÉTRICAS (Dashboard)
