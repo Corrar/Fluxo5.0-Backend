@@ -6,6 +6,20 @@ import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
+// Guard de status da separação. Erro TIPADO para o catch mapear HTTP sem cair no 500 genérico:
+// inexistente → 404; transição terminal sem sentido (entregue/cancelada) → 400.
+type SeparationGuardCode = 'SEPARACAO_NAO_ENCONTRADA' | 'SEPARACAO_JA_ENTREGUE' | 'SEPARACAO_CANCELADA';
+class SeparationGuardError extends Error {
+  constructor(
+    public readonly code: SeparationGuardCode,
+    message: string,
+    public readonly httpStatus: number,
+  ) {
+    super(message);
+    this.name = 'SeparationGuardError';
+  }
+}
+
 export const getSeparations = async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query(`
@@ -61,6 +75,21 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
       const warehouseId = await resolveWarehouseId(client, userId);
       const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
       if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Acesso negado.');
+
+      // 🔒 GUARD DE STATUS — trava a linha da separação (FOR UPDATE) e serializa autorizações
+      // concorrentes. Bloqueia só transições sem sentido: estados TERMINAIS (entregue/cancelada)
+      // e separação inexistente. 'pendente'/'em_separacao' (e demais não-terminais) seguem o fluxo.
+      const sepStatusRes = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+      if (sepStatusRes.rows.length === 0) {
+        throw new SeparationGuardError('SEPARACAO_NAO_ENCONTRADA', 'Separação não encontrada.', 404);
+      }
+      const currentStatus = sepStatusRes.rows[0].status;
+      if (currentStatus === 'entregue') {
+        throw new SeparationGuardError('SEPARACAO_JA_ENTREGUE', 'Separação já entregue.', 400);
+      }
+      if (currentStatus === 'cancelada') {
+        throw new SeparationGuardError('SEPARACAO_CANCELADA', 'Separação cancelada.', 400);
+      }
 
       for (const item of items) {
         const oldItem = await client.query('SELECT quantity, product_id FROM separation_items WHERE id = $1', [item.id]);
@@ -119,7 +148,25 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
     if ((req as any).io) (req as any).io.emit('separations_update');
     res.json({ success: true });
   } catch (error: any) {
-    res.status(400).json({ error: error.message });
+    // Idempotência sob concorrência: se dois 'entregar' escaparem do alreadyApplied() do razão,
+    // o segundo bate na unique parcial (uq_stock_ledger_opkey). O vencedor já aplicou a baixa —
+    // estado final correto → responde como SUCESSO (mesmo shape), sem duplicar movimento.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'separation_idempotent_conflict', id, action, detail: error?.detail ?? null }));
+      if ((req as any).io) (req as any).io.emit('separations_update');
+      return res.json({ success: true });
+    }
+    // Guards de status (inexistente / transição terminal sem sentido): erro do cliente, HTTP tipado.
+    if (error instanceof SeparationGuardError) {
+      return res.status(error.httpStatus).json({ error: error.message });
+    }
+    // Invariante de estoque (sem saldo, reserva/físico insuficiente, qtd inválida...): erro do cliente.
+    if (error instanceof StockError) {
+      return res.status(400).json({ error: error.message });
+    }
+    // Qualquer OUTRO: falha de servidor. Parar de mascarar como 400 (era o bug do blanket catch).
+    console.error(JSON.stringify({ event: 'separation_authorize_error', id, action, err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro interno ao autorizar separação.' });
   }
 };
 
