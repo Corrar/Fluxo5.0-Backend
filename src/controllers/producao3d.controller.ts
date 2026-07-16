@@ -161,89 +161,139 @@ export const getProductions = async (req: Request, res: Response) => {
   }
 };
 
+// Colunas de retorno padrão de uma produção (mesmo shape do getProductions/replay idempotente).
+const PRODUCTION_SELECT = `id, product_id as "partId", demand_id as "demandId", quantity,
+  total_minutes as "totalMinutes", filament_grams as "filamentGrams", date, operator_id as operator`;
+
 export const createProduction = async (req: Request, res: Response) => {
   const { partId, demandId, quantity, totalMinutes, filamentGrams, date } = req.body;
-  const operatorId = (req as any).user?.id || null; 
-  
-  const client = await pool.connect();
-  
+  const operatorId = (req as any).user?.id || null;
+  const qty = Number(quantity);
+
+  // X-Idempotency-Key (opcional): string não-vazia → âncora ESTÁVEL (idempotência cross-request).
+  // array (header repetido) / ausente / vazio → tratado como ausente.
+  const idemRaw = req.headers['x-idempotency-key'];
+  const idemKey = typeof idemRaw === 'string' && idemRaw.trim() ? idemRaw.trim() : null;
+  // op_key content-addressed. Com header, é conhecido ANTES do INSERT (permite o pré-check no razão).
+  const idemOpKey = idemKey ? `production:idem:${idemKey}:product:${partId}:receive:${qty}` : null;
+
   try {
-    await client.query('BEGIN'); // Inicia a transação
+    const result = await withTransaction(async (client) => {
+      const warehouseId = await resolveWarehouseId(client, operatorId);
 
-    // 1. REGISTAR A PRODUÇÃO
-    const prodRes = await client.query(`
-        INSERT INTO productions_3d 
-        (product_id, demand_id, quantity, operator_id, total_minutes, filament_grams, date)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, product_id as "partId", demand_id as "demandId", quantity, 
-                  total_minutes as "totalMinutes", filament_grams as "filamentGrams", 
-                  date, operator_id as operator
-    `, [partId, demandId || null, quantity, operatorId, totalMinutes, filamentGrams, date]);
-    
-    // 2. DAR ENTRADA NO ESTOQUE FÍSICO
-    await client.query(`
-        INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
-        VALUES ($1, $2, 0)
-        ON CONFLICT (product_id) 
-        DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2
-    `, [partId, quantity]);
+      // PRÉ-CHECK (só com header): se o razão já tem esta op_key, o crédito já foi dado num POST anterior.
+      // Devolve o registro existente SEM inserir outro em productions_3d (evita produção duplicada no
+      // histórico em RETRY SEQUENCIAL). O ledger guarda ref_id = id da produção original.
+      if (idemOpKey) {
+        const led = await client.query('SELECT ref_id FROM stock_ledger WHERE op_key = $1 LIMIT 1', [idemOpKey]);
+        if ((led.rowCount ?? 0) > 0) {
+          const prod = await client.query(`SELECT ${PRODUCTION_SELECT} FROM productions_3d WHERE id = $1`, [led.rows[0].ref_id]);
+          return prod.rows[0] ?? { success: true, idempotent: true };
+        }
+      }
 
-    // 3. REGISTAR O HISTÓRICO DE MOVIMENTAÇÃO (Tabela de Auditoria do seu Sistema)
-    const reason = demandId ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
-    await client.query(`
-        INSERT INTO audit_logs (user_id, action, details) 
-        VALUES ($1, $2, $3)
-    `, [operatorId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: partId, quantity, reason })]);
+      // 1. Registra a produção (id fresco). 2. Entra no físico via MOTOR (receive resolve warehouse +
+      //    cria a linha LAZY — mata o 42P10 e o warehouse_id faltante do INSERT cru antigo).
+      const prodRes = await client.query(
+        `INSERT INTO productions_3d (product_id, demand_id, quantity, operator_id, total_minutes, filament_grams, date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${PRODUCTION_SELECT}`,
+        [partId, demandId || null, qty, operatorId, totalMinutes, filamentGrams, date],
+      );
+      const prod = prodRes.rows[0];
 
-    await client.query('COMMIT'); // Guarda tudo!
-    res.status(201).json(prodRes.rows[0]);
-    
-  } catch (error) {
-    await client.query('ROLLBACK'); // Em caso de erro, cancela tudo
-    console.error('Erro ao criar produção e dar entrada no estoque:', error);
-    res.status(500).json({ error: 'Erro ao registar produção 3D' });
-  } finally {
-    client.release();
+      // Sem header: fallback content-addressed pelo id FRESCO — NÃO dá idempotência cross-request
+      // (cada POST = id novo = op_key nova = novo crédito). Documentado; use o header para blindar retry.
+      const opKey = idemOpKey ?? `production:${prod.id}:receive:${qty}`;
+      const reason = demandId ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
+
+      // Produção LIVRE: só receive, SEM reserve (a reserva p/ request vive no updateDemandStatus).
+      await StockService.receive(client, partId, warehouseId, POOLED_OP_ID, qty, {
+        refType: 'production_3d', refId: prod.id, userId: operatorId, opKey, reason,
+      });
+
+      // PÓS-CHECK de corrida (só com header): se o razão desta op_key aponta p/ OUTRA produção, um POST
+      // concorrente idêntico venceu o crédito enquanto o receive daqui caiu no alreadyApplied (no-op, sem
+      // 23505). Este registro é duplicado -> aborta p/ o ROLLBACK levá-lo junto. O catch faz o replay.
+      if (idemOpKey) {
+        const led = await client.query('SELECT ref_id FROM stock_ledger WHERE op_key = $1 LIMIT 1', [idemOpKey]);
+        if (led.rows[0] && String(led.rows[0].ref_id) !== String(prod.id)) throw new Error('IDEMPOTENT_REPLAY');
+      }
+
+      // 3. Auditoria oficial (INALTERADA).
+      await client.query(
+        `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+        [operatorId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: partId, quantity: qty, reason })],
+      );
+
+      return prod;
+    });
+
+    return res.status(201).json(result);
+  } catch (error: any) {
+    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    // Corrida (2 POSTs idênticos com header): o perdedor cai aqui por uma de duas vias — bateu na unique
+    // do razão (23505) OU o pós-check viu o crédito do vencedor (IDEMPOTENT_REPLAY). Em ambos o
+    // withTransaction fez ROLLBACK (levou o productions_3d duplicado junto). Responde o registro vencedor.
+    const isReplay = error?.message === 'IDEMPOTENT_REPLAY' || (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey');
+    if (isReplay) {
+      console.warn(JSON.stringify({ event: 'production3d_idempotent_conflict', op_key: idemOpKey, via: error?.message === 'IDEMPOTENT_REPLAY' ? 'precheck-late' : '23505' }));
+      if (idemOpKey) {
+        const led = await pool.query('SELECT ref_id FROM stock_ledger WHERE op_key = $1 LIMIT 1', [idemOpKey]);
+        if ((led.rowCount ?? 0) > 0) {
+          const prod = await pool.query(`SELECT ${PRODUCTION_SELECT} FROM productions_3d WHERE id = $1`, [led.rows[0].ref_id]);
+          if ((prod.rowCount ?? 0) > 0) return res.status(201).json(prod.rows[0]);
+        }
+      }
+      return res.status(201).json({ success: true, idempotent: true });
+    }
+    console.error(JSON.stringify({ event: 'production3d_create_error', err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao registar produção 3D' });
   }
 };
 
 export const deleteProduction = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const operatorId = (req as any).user?.id || null; 
-  const client = await pool.connect();
+  const operatorId = (req as any).user?.id || null;
 
   try {
-    await client.query('BEGIN');
+    await withTransaction(async (client) => {
+      const warehouseId = await resolveWarehouseId(client, operatorId);
 
-    // 1. Descobrir qual era a peça e a quantidade
-    const prodRes = await client.query('SELECT product_id, quantity FROM productions_3d WHERE id = $1', [id]);
-    if (prodRes.rows.length === 0) throw new Error("Produção não encontrada");
-    const { product_id, quantity } = prodRes.rows[0];
+      // FOR UPDATE: trava a linha da produção -> 2 deletes paralelos serializam (o 2º acha a linha já
+      // apagada -> 404). Antes era SELECT sem trava: dois deletes subtraíam 2×.
+      const prodRes = await client.query('SELECT product_id, quantity FROM productions_3d WHERE id = $1 FOR UPDATE', [id]);
+      if (prodRes.rows.length === 0) throw new Error('PRODUCAO_NAO_ENCONTRADA');
+      const productId = prodRes.rows[0].product_id;
+      const qty = Number(prodRes.rows[0].quantity);
 
-    // 2. Apagar a produção
-    await client.query('DELETE FROM productions_3d WHERE id = $1', [id]);
+      // Reverte a ENTRADA pelo MOTOR: reduz só on_hand, guard on_hand-qty >= reserved. Se o saldo já
+      // foi consumido/reservado, reverseReceive lança SALDO_INSUFICIENTE_REVERSAO -> tx faz ROLLBACK ->
+      // a produção NÃO é apagada (fim do GREATEST(...,0) que pisava em 0 silenciosamente). op_key
+      // content-addressed no id estável -> idempotente mesmo numa corrida.
+      if (productId && qty > 0) {
+        await StockService.reverseReceive(client, productId, warehouseId, POOLED_OP_ID, qty, {
+          refType: 'production_3d', refId: id, userId: operatorId,
+          opKey: `production:${id}:reverse:${qty}`,
+          reason: 'Correção: apagou registro de Produção 3D (reverte entrada)',
+        });
+      }
 
-    // 3. Subtrair do estoque
-    await client.query(`
-        UPDATE stock 
-        SET quantity_on_hand = GREATEST(COALESCE(quantity_on_hand, 0) - $2, 0)
-        WHERE product_id = $1
-    `, [product_id, quantity]);
+      await client.query('DELETE FROM productions_3d WHERE id = $1', [id]);
+      await client.query(
+        `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+        [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id: productId, quantity: qty, reason: 'Correção: Apagou registo de Produção 3D' })],
+      );
+    });
 
-    // 4. Registar no histórico (Auditoria)
-    await client.query(`
-        INSERT INTO audit_logs (user_id, action, details) 
-        VALUES ($1, $2, $3)
-    `, [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id, quantity, reason: 'Correção: Apagou registo de Produção 3D' })]);
-
-    await client.query('COMMIT');
-    res.json({ success: true });
-    
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Erro ao apagar produção e reverter estoque:', error);
-    res.status(500).json({ error: 'Erro ao apagar produção 3D' });
-  } finally {
-    client.release();
+    return res.json({ success: true });
+  } catch (error: any) {
+    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (error.message === 'PRODUCAO_NAO_ENCONTRADA') return res.status(404).json({ error: 'Produção não encontrada.' });
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'production3d_delete_idempotent_conflict', id, detail: error?.detail ?? null }));
+      return res.json({ success: true });
+    }
+    console.error(JSON.stringify({ event: 'production3d_delete_error', id, err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao apagar produção 3D' });
   }
 };

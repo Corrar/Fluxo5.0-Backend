@@ -23,7 +23,8 @@ export type StockErrorCode =
   | 'TRANSFERENCIA_INSUFICIENTE'
   | 'AJUSTE_ABAIXO_RESERVA'
   | 'ARMAZEM_INVALIDO'
-  | 'QTD_INVALIDA';
+  | 'QTD_INVALIDA'
+  | 'SALDO_INSUFICIENTE_REVERSAO';
 
 export class StockError extends Error {
   constructor(
@@ -184,6 +185,26 @@ export const StockService = {
     const cur = await ensureAndLock(client, productId, warehouseId, opId);
     if (newOnHand < cur.reserved) throw new StockError('AJUSTE_ABAIXO_RESERVA', `Saldo alvo (${newOnHand}) menor que o reservado (${cur.reserved}).`, productId, warehouseId, opId);
     return persist(client, productId, warehouseId, opId, 'adjust', { onHand: newOnHand, reserved: cur.reserved }, { dOnHand: newOnHand - cur.onHand, dReserved: 0 }, refs);
+  },
+
+  /**
+   * Reverte uma ENTRADA física (o INVERSO de receive) — ex.: apagar um registro de Produção 3D.
+   * Reduz SÓ quantity_on_hand; NUNCA toca quantity_reserved. Por isso NÃO é `consume`: consume
+   * libera reserva (reserved -= min(qty, reserved)) e, num produto com reservas de OUTRAS
+   * separações, "desproduzir" liberaria reserva alheia — furo. Aqui a reserva fica intacta.
+   * Guard: on_hand - qty >= reserved (não se reverte o que já está reservado/consumido) -> senão
+   * StockError('SALDO_INSUFICIENTE_REVERSAO'). Idempotente por op_key (content-addressed), FOR UPDATE
+   * via ensureAndLock, entrada no razão. kind 'adjust' (o CHECK do stock_ledger não tem 'reverse';
+   * é uma correção de saldo físico), com delta_on_hand negativo e delta_reserved 0.
+   */
+  async reverseReceive(client: PoolClient, productId: string, warehouseId: string, opId: string | null, qty: number, refs: StockRefs = {}): Promise<StockSnapshot> {
+    assertQty(qty, productId, warehouseId, opId);
+    if (await alreadyApplied(client, refs.opKey)) { const c = await ensureAndLock(client, productId, warehouseId, opId); return snapshot(productId, warehouseId, opId, c.onHand, c.reserved); }
+    const cur = await ensureAndLock(client, productId, warehouseId, opId);
+    if (cur.onHand - qty < cur.reserved) {
+      throw new StockError('SALDO_INSUFICIENTE_REVERSAO', `Não é possível reverter ${qty}: disponível para reversão é ${cur.onHand - cur.reserved} (on_hand ${cur.onHand}, reservado ${cur.reserved} intocável).`, productId, warehouseId, opId);
+    }
+    return persist(client, productId, warehouseId, opId, 'adjust', { onHand: cur.onHand - qty, reserved: cur.reserved }, { dOnHand: -qty, dReserved: 0 }, refs);
   },
 
   /**

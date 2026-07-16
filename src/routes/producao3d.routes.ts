@@ -48,9 +48,11 @@ router.put('/demands/:id/status', requirePermission('separacoes:edit'), updateDe
 router.get('/productions', getProductions);
 
 // 🚀 REGISTRA uma nova produção e dá entrada automática no estoque
-router.post('/productions', createProduction);
+// Escreve saldo (receive) -> mesma permissão dos demais fluxos de escrita de estoque.
+router.post('/productions', requirePermission('separacoes:edit'), createProduction);
 
 // 🗑️ REMOVE um registro de produção e reverte a quantidade no estoque
-router.delete('/productions/:id', deleteProduction);
+// Escreve saldo (reverseReceive) -> mesma permissão.
+router.delete('/productions/:id', requirePermission('separacoes:edit'), deleteProduction);
 
 export default router;
