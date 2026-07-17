@@ -7,6 +7,13 @@ import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import {
+  registerPendingReturns,
+  conferReturn as conferReturnCore,
+  rejectReturn as rejectReturnCore,
+  listReturnableItems,
+  ReturnError,
+} from '../services/returns.service';
 
 export const getStock = async (req: Request, res: Response) => {
   try {
@@ -321,98 +328,187 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
 // DEVOLUÇÕES DE ORDEM DE PRODUÇÃO (OP) E NOVA ENTRADA EM LOTE (ENTRIES)
 // =========================================================================
 
+// GET /stock/returns/op/:opCode — o que ainda dá pra devolver da OP (saldo WIP per-OP − em trânsito).
+// Shape: { has_perop_history: boolean, items: [...] }. A UX decide o estado vazio pelo has_perop_history,
+// NÃO por status HTTP — os DOIS vazios têm mensagens diferentes:
+//   items=[] & has_perop_history=false -> OP legada (zero evento per-OP) -> "use a Entrada de Reaproveitamento".
+//   items=[] & has_perop_history=true  -> tem rastro mas nada disponível  -> "nada a devolver no momento".
+//   items=[...]                        -> renderiza os itens.
+//   404 {error}                        -> OP inexistente (único caso de status de erro aqui).
+// (O 400 tipado SEM_RASTRO_PER_OP vive no REGISTER como defesa; ver registerPendingReturns.)
 export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
   const { opCode } = req.params;
-
   try {
-    const query = `
-      WITH OPData AS (
-          SELECT id FROM client_services WHERE op_code = $1
-      ),
-      Withdrawn AS (
-          SELECT
-              si.product_id,
-              p.name,
-              p.sku,
-              SUM(si.quantity) as total_withdrawn
-          FROM separations s
-          JOIN separation_items si ON s.id = si.separation_id
-          JOIN products p ON si.product_id = p.id
-          WHERE s.client_service_id = (SELECT id FROM OPData)
-          GROUP BY si.product_id, p.name, p.sku
-      ),
-      Returned AS (
-          SELECT
-              product_id,
-              SUM(quantity) as total_returned
-          FROM op_returns
-          WHERE client_service_id = (SELECT id FROM OPData)
-          GROUP BY product_id
-      )
-      SELECT
-          w.product_id,
-          w.name,
-          w.sku,
-          w.total_withdrawn,
-          COALESCE(r.total_returned, 0) as total_returned,
-          (w.total_withdrawn - COALESCE(r.total_returned, 0)) as available_to_return
-      FROM Withdrawn w
-      LEFT JOIN Returned r ON w.product_id = r.product_id
-      WHERE (w.total_withdrawn - COALESCE(r.total_returned, 0)) > 0;
-    `;
-
-    const result = await pool.query(query, [opCode]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Nenhum material disponível para devolução nesta OP.' });
-    }
-
-    res.json(result.rows);
+    const result = await withTransaction(async (client) => {
+      const op = await client.query('SELECT id FROM client_services WHERE op_code = $1', [opCode]);
+      if (op.rows.length === 0) return { notFound: true as const };
+      // Rastro per-OP existe? OP sem NENHUM evento é legada (pré-controle por OP).
+      const ev = await client.query('SELECT 1 FROM op_material_events WHERE client_service_id = $1 LIMIT 1', [op.rows[0].id]);
+      const hasPerop = ev.rows.length > 0;
+      // OP legada: nem roda o listReturnableItems (saldo seria 0) — devolve vazio + a flag.
+      const items = hasPerop ? await listReturnableItems(client, opCode) : [];
+      return { hasPerop, items };
+    });
+    if ('notFound' in result) return res.status(404).json({ error: 'OP não encontrada no sistema.' });
+    res.json({ has_perop_history: result.hasPerop, items: result.items });
   } catch (error: any) {
     res.status(500).json({ error: 'Erro interno ao processar a busca da OP.' });
   }
 };
 
+// GET /stock/returns/op/:opCode/history — a TIMELINE de devoluções da OP (todas as etapas), pra tela
+// de produção acompanhar: pendente -> conferido (com conferred_qty, mostrando divergência) / rejeitado
+// (com reject_reason). Read-only.
+export const getOpReturnHistory = async (req: Request, res: Response) => {
+  const { opCode } = req.params;
+  try {
+    const { rows } = await pool.query(
+      `SELECT q.id, q.product_id, p.name, p.sku, p.unit,
+              q.quantity, q.status, q.conferred_qty, q.reject_reason, q.observation,
+              q.created_at, q.resolved_at,
+              rp.name AS requested_by_name, cp.name AS conferred_by_name
+         FROM op_returns_pending q
+         JOIN client_services cs ON cs.id = q.client_service_id
+         JOIN products p         ON p.id = q.product_id
+         LEFT JOIN profiles rp   ON rp.id = q.requested_by
+         LEFT JOIN profiles cp   ON cp.id = q.conferred_by
+        WHERE cs.op_code = $1
+        ORDER BY q.created_at DESC
+        LIMIT 200`,
+      [opCode],
+    );
+    res.json(rows.map((r) => ({
+      id: r.id, product_id: r.product_id, name: r.name, sku: r.sku, unit: r.unit,
+      quantity: Number(r.quantity),
+      status: r.status,
+      conferred_qty: r.conferred_qty == null ? null : Number(r.conferred_qty),
+      reject_reason: r.reject_reason, observation: r.observation,
+      created_at: r.created_at, resolved_at: r.resolved_at,
+      requested_by_name: r.requested_by_name, conferred_by_name: r.conferred_by_name,
+    })));
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao buscar o histórico de devoluções da OP' });
+  }
+};
+
+// POST /stock/returns — REGISTRO (etapa 1). O chão de fábrica declara a devolução: vira pedido
+// 'pendente' (em trânsito). NÃO credita estoque, op_returns nem o razão per-OP — só reserva a janela
+// de trânsito (o guard vive no service, sob advisory lock). O crédito real é na conferência.
 export const registerReturn = async (req: Request, res: Response) => {
   const { op_code, returns } = req.body;
   const userId = (req as any).user.id;
 
   try {
-    await withTransaction(async (client) => {
-      const warehouseId = await resolveWarehouseId(client, userId);
-
+    const pending = await withTransaction(async (client) => {
       const opResult = await client.query('SELECT id FROM client_services WHERE op_code = $1', [op_code]);
-      if (opResult.rows.length === 0) throw new Error('OP não encontrada no sistema.');
-      const client_service_id = opResult.rows[0].id;
+      if (opResult.rows.length === 0) throw new ReturnError('OP_NAO_ENCONTRADA', 'OP não encontrada no sistema.');
+      const clientServiceId = opResult.rows[0].id;
 
-      for (const item of returns) {
-        if (!item.product_id || !item.quantity || item.quantity <= 0) {
-          throw new Error('Quantidade inválida para devolução.');
-        }
+      const criados = await registerPendingReturns(client, { clientServiceId, items: returns, userId });
 
-        const retRes = await client.query(`
-            INSERT INTO op_returns (client_service_id, product_id, quantity, user_id, observation)
-            VALUES ($1, $2, $3, $4, $5) RETURNING id
-        `, [client_service_id, item.product_id, item.quantity, userId, item.observation]);
-        const returnId = retRes.rows[0].id;
-
-        // Devolve ao físico pelo motor (entrada no ALMOX).
-        await StockService.receive(client, item.product_id, warehouseId, POOLED_OP_ID, Number(item.quantity), {
-          refType: 'op_return', refId: returnId, userId,
-          opKey: `op_return:${returnId}:receive`,
-          reason: 'Devolução de material de OP',
-        });
-      }
-
-      await createLog(userId, 'OP_RETURN', { op_code, itemsReturned: returns.length }, getClientIp(req), client);
+      await createLog(userId, 'OP_RETURN_REQUEST', { op_code, itemsPending: criados.length }, getClientIp(req), client);
+      return criados;
     });
 
-    res.status(201).json({ success: true, message: 'Devolução registada com sucesso!' });
+    res.status(201).json({
+      success: true,
+      message: 'Devolução registrada — aguardando conferência do almoxarifado.',
+      pending,
+    });
   } catch (error: any) {
-    if (error instanceof StockError) return res.status(400).json({ error: error.message });
-    res.status(400).json({ error: error.message || 'Erro ao processar devolução.' });
+    return mapReturnError(error, res);
   }
 };
+
+// GET /stock/returns/pending — a fila da aba Devoluções na Conferência: pedidos ainda 'pendente'.
+export const getPendingReturns = async (req: Request, res: Response) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT q.id, q.client_service_id, q.product_id, q.quantity, q.observation, q.created_at,
+              cs.op_code, p.name, p.sku, p.unit, pr.name AS requested_by_name
+         FROM op_returns_pending q
+         JOIN client_services cs ON cs.id = q.client_service_id
+         JOIN products p         ON p.id = q.product_id
+         LEFT JOIN profiles pr   ON pr.id = q.requested_by
+        WHERE q.status = 'pendente'
+        ORDER BY q.created_at DESC
+        LIMIT 200`,
+    );
+    res.json(rows.map((r) => ({
+      id: r.id, client_service_id: r.client_service_id, op_code: r.op_code,
+      product_id: r.product_id, name: r.name, sku: r.sku, unit: r.unit,
+      quantity: Number(r.quantity), observation: r.observation,
+      requested_by_name: r.requested_by_name, created_at: r.created_at,
+    })));
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao buscar devoluções pendentes' });
+  }
+};
+
+// POST /stock/returns/:id/confer — CONFERÊNCIA (etapa 2). A TX TRIPLA vive no service (conferReturn).
+// body opcional { conferredQty }: ausente = confere o pedido inteiro; presente = quantidade contada
+// (0 < conferredQty <= pedido). Credita os 3 livros e fecha o pedido 'conferido' — tudo ou nada.
+export const conferReturn = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { conferredQty } = req.body ?? {};
+  const userId = (req as any).user.id;
+
+  try {
+    const result = await withTransaction(async (client) => {
+      const r = await conferReturnCore(client, { requestId: id, conferredQty, userId });
+      await createLog(userId, 'OP_RETURN_CONFER', { request_id: id, conferred_qty: r.conferredQty }, getClientIp(req), client);
+      return r;
+    });
+    res.status(201).json({
+      success: true,
+      message: 'Devolução conferida e creditada ao estoque.',
+      request: result.request,
+      conferred_qty: result.conferredQty,
+    });
+  } catch (error: any) {
+    return mapReturnError(error, res);
+  }
+};
+
+// POST /stock/returns/:id/reject — REJEIÇÃO (etapa 2, caminho recusado). Fecha 'rejeitado' e NÃO
+// credita livro nenhum; a quantidade sai da janela de trânsito por deixar de ser 'pendente'.
+export const rejectReturn = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { reason } = req.body ?? {};
+  const userId = (req as any).user.id;
+
+  try {
+    const request = await withTransaction(async (client) => {
+      const r = await rejectReturnCore(client, { requestId: id, reason, userId });
+      await createLog(userId, 'OP_RETURN_REJECT', { request_id: id, reason: reason ?? null }, getClientIp(req), client);
+      return r;
+    });
+    res.status(200).json({ success: true, message: 'Devolução rejeitada.', request });
+  } catch (error: any) {
+    return mapReturnError(error, res);
+  }
+};
+
+// Mapa de erro único do fluxo de devolução (espelha o mapError do opMaterials):
+//   ReturnError            -> 404 se *_NAO_ENCONTRADA/O, senão 400 (msg pronta pro operador).
+//   StockError             -> 400 (erro de domínio do motor de estoque).
+//   23505 no op_key        -> retry de conferência que perdeu a resposta; o crédito do 1º valeu,
+//                             responde idempotente (o FOR UPDATE do pedido já é o guard primário).
+//   resto                  -> 500 com log estruturado (nunca vaza error.message cru).
+function mapReturnError(error: any, res: Response) {
+  if (error instanceof ReturnError) {
+    const status = error.code.endsWith('_NAO_ENCONTRADA') || error.code.endsWith('_NAO_ENCONTRADO') ? 404 : 400;
+    // `code` no corpo: a tela distingue SEM_RASTRO_PER_OP dos outros 400 sem parsear a mensagem.
+    return res.status(status).json({ code: error.code, error: error.message });
+  }
+  if (error instanceof StockError) return res.status(400).json({ error: error.message });
+  if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+    console.warn(JSON.stringify({ event: 'confer_return_idempotent_conflict', detail: error?.detail ?? null }));
+    return res.status(201).json({ success: true, idempotent: true });
+  }
+  console.error(JSON.stringify({ event: 'return_error', err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
+  return res.status(500).json({ error: 'Erro ao processar devolução.' });
+}
 
 // =========================================================================
 // ENTRADA DE STOCK EM LOTE (NFe / Reaproveitamento)

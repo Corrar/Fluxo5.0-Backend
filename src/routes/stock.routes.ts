@@ -2,13 +2,17 @@
 
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middlewares/auth';
-import { 
-  getStock, 
-  getStockReservations, 
-  updateStock, 
+import {
+  getStock,
+  getStockReservations,
+  updateStock,
   manualWithdrawal,
-  getOpMaterialsForReturn, 
+  getOpMaterialsForReturn,
+  getOpReturnHistory,
   registerReturn,
+  getPendingReturns,
+  conferReturn,
+  rejectReturn,
   registerEntries // A nova função do controller
 } from '../controllers/stock.controller';
 
@@ -67,18 +71,54 @@ router.post('/entries', requirePermission('entradas:add'), registerEntries); // 
 // ROTAS DE DEVOLUÇÕES (OP)
 // =========================================================================
 
+// Devolução em DUAS ETAPAS (peça 3): registro (produção) -> conferência (almox).
+// RBAC (chaves JÁ seedadas — zero seed novo):
+//   registro  -> 'producao:apontar' (semeada na 008; é o chão de fábrica declarando devolução).
+//   conferir/rejeitar -> 'entradas:add' (a mesma chave da entrada/saída de estoque; conferir CREDITA
+//                        o físico, então é a mesma barreira das outras rotas que mexem no estoque).
+// Rota que credita físico não pode ficar em "authenticate only". Leitura -> só authenticate.
+
 /**
  * @route GET /stock/returns/op/:opCode
- * @description Busca os materiais que foram retirados para uma OP e podem ser devolvidos.
+ * @description Materiais da OP que ainda podem ser devolvidos (saldo WIP per-OP − em trânsito).
  * @param {string} opCode - O código da Ordem de Produção.
  */
 router.get('/returns/op/:opCode', getOpMaterialsForReturn);
 
 /**
+ * @route GET /stock/returns/op/:opCode/history
+ * @description Timeline de devoluções da OP (pendente/conferido/rejeitado) — a tela de produção acompanha.
+ */
+router.get('/returns/op/:opCode/history', getOpReturnHistory);
+
+/**
+ * @route GET /stock/returns/pending
+ * @description Fila da aba Devoluções na Conferência: pedidos ainda pendentes de conferência.
+ */
+router.get('/returns/pending', getPendingReturns);
+
+/**
  * @route POST /stock/returns
- * @description Efetiva a devolução de materiais de uma OP ao armazém (atualiza op_returns e stock).
+ * @description ETAPA 1 — registra o pedido de devolução (pendente/em trânsito). NÃO credita estoque.
  * @body { op_code: string, returns: Array<{ product_id: string, quantity: number, observation?: string }> }
  */
-router.post('/returns', registerReturn);
+router.post('/returns', requirePermission('producao:apontar'), registerReturn);
+
+/**
+ * @route PUT /stock/returns/:id/confer
+ * @description ETAPA 2 — confere o pedido: credita os 3 livros (per-OP, físico central, op_returns).
+ *   PUT porque TRANSICIONA o estado do pedido (pendente -> conferido), no padrão do PUT /requests/:id/status.
+ * @param {string} id - O id do pedido em op_returns_pending.
+ * @body { conferredQty?: number } - ausente = confere o pedido inteiro.
+ */
+router.put('/returns/:id/confer', requirePermission('entradas:add'), conferReturn);
+
+/**
+ * @route PUT /stock/returns/:id/reject
+ * @description ETAPA 2 (recusa) — rejeita o pedido. NÃO credita nada; libera a janela de trânsito.
+ * @param {string} id - O id do pedido em op_returns_pending.
+ * @body { reason?: string }
+ */
+router.put('/returns/:id/reject', requirePermission('entradas:add'), rejectReturn);
 
 export default router;

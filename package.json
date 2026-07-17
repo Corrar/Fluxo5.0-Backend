@@ -26,7 +26,11 @@
   "scripts": {
     "dev": "ts-node src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "smoke:returns:janela": "ts-node src/smokes/smoke_returns_janela.ts",
+    "smoke:returns:total-cost": "ts-node src/smokes/smoke_returns_total_cost.ts",
+    "smoke:returns:grao": "ts-node src/smokes/smoke_returns_grao.ts",
+    "smoke:returns:perop": "ts-node src/smokes/smoke_returns_perop_source.ts"
   },
   "devDependencies": {
     "@types/web-push": "^3.6.4"
