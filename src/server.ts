@@ -29,6 +29,8 @@ import clientsRouter from './routes/clients.routes';
 
 // NOVA ROTA: Módulo de Produção 3D
 import producao3dRouter from './routes/producao3d.routes';
+// Módulo Produção: armazém de material por OP (sub-razão do WIP, pós-entrega da separação)
+import opMaterialsRouter from './routes/opMaterials.routes';
 
 // ==========================================
 // 0. EXTENSÃO DE TIPOS GLOBAIS (TYPESCRIPT)
@@ -134,6 +136,9 @@ app.use('/clients', clientsRouter);
 
 // Módulo de Produção 3D (Fábrica)
 app.use('/producao-3d', producao3dRouter);
+
+// Módulo Produção: armazém de material por OP (recebimento do setor + apontamento do montador)
+app.use('/op-materials', opMaterialsRouter);
 
 // Movimentações Avançadas e Operacional
 app.use('/separations', separationsRouter);
