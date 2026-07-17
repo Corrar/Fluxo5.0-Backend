@@ -5,6 +5,7 @@ import {
   consumeOpMaterial,
   getOpBalance,
   getPendingReceipts,
+  getOpEvents,
 } from '../controllers/opMaterials.controller';
 import { authenticate, requirePermission } from '../middlewares/auth';
 
@@ -29,5 +30,6 @@ router.post('/consume', requirePermission('producao:apontar'), consumeOpMaterial
 // Leitura -> só autenticação (mesmo critério dos GETs de /producao-3d).
 router.get('/balance/:clientServiceId', getOpBalance);
 router.get('/pending-receipts', getPendingReceipts);
+router.get('/events/:clientServiceId', getOpEvents);
 
 export default router;

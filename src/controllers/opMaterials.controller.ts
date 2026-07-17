@@ -37,6 +37,23 @@ function num(v: any): number {
 // fila lista o que o submit recusa.
 const STATUS_ENTREGUES = ['entregue', 'concluida'];
 
+// CUTOFF DE GO-LIVE do armazém per-OP. Sem ele a fila do Recebimento nasce com ~77 separações /
+// 276 itens desde 27/02: material que saiu do almox há meses e já foi consumido no chão de fábrica.
+// Ninguém vai "receber" aquilo — é fila morta que esconde o trabalho real.
+//
+// O CAMPO: não existe delivered_at nem updated_at em separations; só created_at e sent_at.
+// COALESCE(sent_at, created_at) é o timestamp de ENTREGA de verdade nos dois caminhos:
+//   - 'entregue' (Quadro Gestão): sent_at é gravado pelo authorize action='entregar' e cobre 13/13
+//     das linhas. Usar created_at aqui seria errado — a entrega acontece até 84 dias depois da
+//     criação nos dados reais.
+//   - 'concluida' (saída manual): sent_at é NULL em 532/532 (manualWithdrawal não grava), MAS a
+//     separação é criada E consumida na MESMA transação -> created_at É o instante da entrega.
+// LIMITAÇÃO: uma linha 'entregue' com sent_at NULL cairia no created_at e poderia entrar na fila
+// cedo demais. Hoje não existe nenhuma (13/13 têm sent_at); se o authorize algum dia deixar de
+// gravar sent_at, este filtro passa a mentir. O certo de vez é um delivered_at próprio.
+const CUTOFF_DEFAULT = '2026-07-17';
+const CUTOFF_DATE = (process.env.PEROP_CUTOFF_DATE || '').trim() || CUTOFF_DEFAULT;
+
 // Fórmula da projeção em UM lugar só. Todo saldo per-OP passa por aqui — se um event_type novo
 // entrar no CHECK da 008, é ESTE trecho que decide o sinal dele (e só ele).
 const SALDO_SQL = `
@@ -278,12 +295,14 @@ export const getPendingReceipts = async (req: Request, res: Response) => {
         WHERE s.status = ANY($2)
           -- OP real obrigatória: NULL = pooled = sem armazém de OP pra alimentar.
           AND s.client_service_id IS NOT NULL
+          -- Cutoff de go-live: só entrega a partir da virada. Ver CUTOFF_DATE.
+          AND COALESCE(s.sent_at, s.created_at) >= $3::timestamp
           AND ($1::text IS NULL OR s.destination = $1)
           -- só o que ainda falta receber. Item autorizado com quantity=0 (35 dos 318 entregues hoje)
           -- nunca saiu do almox -> teto 0 -> não entra na fila.
           AND si.quantity > COALESCE(r.total, 0)
         ORDER BY COALESCE(s.sent_at, s.created_at) DESC NULLS LAST, p.name ASC`,
-      [sector, STATUS_ENTREGUES],
+      [sector, STATUS_ENTREGUES, CUTOFF_DATE],
     );
     return res.json(rows.map((r) => ({
       separation_id: r.separation_id, sector: r.sector, status: r.status, sent_at: r.sent_at,
@@ -294,6 +313,48 @@ export const getPendingReceipts = async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error(JSON.stringify({ event: 'opmat_pending_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
     return res.status(500).json({ error: 'Erro ao buscar recebimentos pendentes' });
+  }
+};
+
+// ==========================================================================
+// e) GET /op-materials/events/:clientServiceId — extrato do razão da OP (read-only).
+//    ?event_type= filtra um tipo (o Apontamentos usa 'consumido' pra listar os apontamentos).
+//    LIMIT 50 fixo: é extrato de tela, não relatório. Se virar relatório, paginar aqui.
+// ==========================================================================
+const EVENT_TYPES = ['recebido', 'consumido', 'devolvido', 'transferido_out', 'transferido_in'];
+
+export const getOpEvents = async (req: Request, res: Response) => {
+  const { clientServiceId } = req.params;
+  const raw = typeof req.query.event_type === 'string' ? req.query.event_type.trim() : '';
+  // Tipo inválido -> 400 em vez de devolver lista vazia (vazio mentiria "a OP não tem nada").
+  if (raw && !EVENT_TYPES.includes(raw)) {
+    return res.status(400).json({ error: `event_type inválido. Use um de: ${EVENT_TYPES.join(', ')}.` });
+  }
+  const tipo = raw || null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT e.id, e.event_type, e.qty, e.created_at,
+              e.product_id, p.sku, p.name, p.unit,
+              e.ref_separation_id, e.ref_separation_item_id, e.ref_event_id,
+              e.user_id, pr.name AS user_name
+         FROM op_material_events e
+         JOIN products p       ON p.id = e.product_id
+         LEFT JOIN profiles pr ON pr.id = e.user_id
+        WHERE e.client_service_id = $1
+          AND ($2::text IS NULL OR e.event_type = $2)
+        ORDER BY e.created_at DESC
+        LIMIT 50`,
+      [clientServiceId, tipo],
+    );
+    return res.json(rows.map((r) => ({
+      id: r.id, event_type: r.event_type, qty: num(r.qty), created_at: r.created_at,
+      product_id: r.product_id, sku: r.sku, name: r.name, unit: r.unit,
+      ref_separation_id: r.ref_separation_id, ref_separation_item_id: r.ref_separation_item_id,
+      ref_event_id: r.ref_event_id, user_id: r.user_id, user_name: r.user_name,
+    })));
+  } catch (error: any) {
+    console.error(JSON.stringify({ event: 'opmat_events_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao buscar o extrato da OP' });
   }
 };
 
