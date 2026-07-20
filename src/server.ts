@@ -8,6 +8,7 @@ import { globalLimiter } from './middlewares/rateLimiters';
 import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
 import { warmup } from './db';
+import { buildAllowedOrigins, corsSourceLabel } from './config/cors';
 
 // --- Rotas (Routers) ---
 import authRouter from './routes/auth.routes';
@@ -65,18 +66,12 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Aplica limite de requisições globais para evitar sobrecarga ou ataques DDoS
 app.use(globalLimiter); 
 
-// Configuração de CORS: Define quem pode "conversar" com a sua API
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'http://localhost:8080',             // Front dev (Vite) local
-  'http://127.0.0.1:8080',             // Front dev local (loopback IPv4)
-  'http://[::1]:8080',                 // Front dev local (loopback IPv6)
-  'https://fluxo-royale.vercel.app',
-  'https://fluxoroyale21.vercel.app',
-  'https://fluxo-royale.com.br',       // Domínio oficial
-  'https://www.fluxo-royale.com.br'    // Subdomínio oficial
-];
+// Configuração de CORS: Define quem pode "conversar" com a sua API.
+// Origens vêm da env CORS_ORIGINS (lista separada por vírgula) quando setada; se ausente,
+// usa o fallback hard-coded de sempre (dev local não quebra). localhost:5173 sempre incluído.
+// Parsing/fallback testável em ./config/cors.
+const allowedOrigins = buildAllowedOrigins();
+console.log(`[CORS] origens permitidas (fonte: ${corsSourceLabel()}): ${allowedOrigins.join(', ')}`);
 
 const corsOptions = {
   origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
