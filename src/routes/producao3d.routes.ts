@@ -1,10 +1,12 @@
 // src/routes/producao3d.routes.ts
 import { Router } from 'express';
-import { 
-  get3DParts, 
-  update3DPartDetails, 
-  getDemands, 
-  updateDemandStatus, 
+import {
+  get3DParts,
+  update3DPartDetails,
+  getDemands,
+  updateDemandStatus,
+  updateDemandNotes,
+  deleteDemand,
   getProductions,
   createProduction, // <-- ADICIONADO: Importação da função de criar
   deleteProduction  // <-- ADICIONADO: Importação da função de apagar
@@ -39,6 +41,14 @@ router.get('/demands', getDemands);
 // Altera o status de uma demanda (ex: mover de 'Aceita' para 'Concluída')
 // Concluir escreve saldo (receive+reserve) -> mesma permissão do fluxo análogo (separations/replenishments authorize).
 router.put('/demands/:id/status', requirePermission('separacoes:edit'), updateDemandStatus);
+
+// Edita a anotação livre da demanda (campo `notes`). Não toca estoque, mas é escrita no Kanban ->
+// mesma permissão das demais ações da fábrica, pra não abrir uma porta mais frouxa que o resto.
+router.put('/demands/:id/notes', requirePermission('separacoes:edit'), updateDemandNotes);
+
+// "Excluir" demanda = soft-cancel (status='Cancelada'). Recusa cancelar demanda Concluída, cuja
+// reversão correta é o DELETE /productions/:id (passa pelo reverseReceive). Ver deleteDemand.
+router.delete('/demands/:id', requirePermission('separacoes:edit'), deleteDemand);
 
 // ==========================================
 // 📊 HISTÓRICO E MÉTRICAS (Dashboard)

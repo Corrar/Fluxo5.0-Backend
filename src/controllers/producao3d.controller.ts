@@ -8,10 +8,13 @@ import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 // ==========================================
 export const get3DParts = async (req: Request, res: Response) => {
   try {
+    // AND active = true: o DELETE /products/:id ARQUIVA (active=false), não apaga. Sem este filtro
+    // a peça "excluída" pela tela reaparecia no próximo refetch do catálogo — o botão de excluir
+    // parecia não funcionar. O catálogo 3D é uma view de products e tem de respeitar o arquivamento.
     const { rows } = await pool.query(`
-        SELECT id, sku, name, image_url as image, production_minutes, filament_grams, description 
-        FROM products 
-        WHERE is_3d = true 
+        SELECT id, sku, name, image_url as image, production_minutes, filament_grams, description
+        FROM products
+        WHERE is_3d = true AND active = true
         ORDER BY name ASC
     `);
     
@@ -55,8 +58,9 @@ export const update3DPartDetails = async (req: Request, res: Response) => {
 export const getDemands = async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query(`
-        SELECT d.id, d.product_id as "partId", d.request_id as "requestId", d.quantity, 
-               d.op_number as "opNumber", d.priority, d.status, d.notes, d.created_at as "createdAt",
+        SELECT d.id, d.product_id as "partId", d.request_id as "requestId", d.quantity,
+               d.op_number as "opNumber", d.priority, d.status, d.notes,
+               d.rejection_reason as "rejectionReason", d.created_at as "createdAt",
                p.name as requester
         FROM demands_3d d
         LEFT JOIN requests r ON d.request_id = r.id
@@ -69,10 +73,23 @@ export const getDemands = async (req: Request, res: Response) => {
   }
 };
 
+// Status de recusa do Kanban 3D (o front mapeia 'rejeitada' -> este valor em P3_DEM_FRONT2BACK).
+const DEMAND_STATUS_REJEITADA = 'Rejeitada';
+// Teto defensivo do texto livre (a coluna é TEXT, sem limite no banco).
+const DEMAND_TEXT_MAX = 2000;
+// Normaliza texto livre vindo do body: string vazia/whitespace/não-string -> null (não grava '').
+const normText = (v: any): string | null => {
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  return t ? t.slice(0, DEMAND_TEXT_MAX) : null;
+};
+
 export const updateDemandStatus = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, reason } = req.body;
   const userId = (req as any).user.id;
+  // Só faz sentido na transição p/ recusa; nos demais status o motivo é ignorado (ver UPDATE abaixo).
+  const rejectionReason = normText(reason);
 
   try {
     await withTransaction(async (client) => {
@@ -85,7 +102,18 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
       if (status === 'Concluída' && atual === 'Cancelada') throw new Error('DEMANDA_CANCELADA');
 
       // UPDATE do status movido pra DEPOIS do guard (antes rodava antes do check).
-      await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
+      // rejection_reason só é TOCADA na transição p/ 'Rejeitada' — nos demais status a coluna fica
+      // como está (o front só a exibe quando rejeitada, então um valor antigo é invisível; e não
+      // apagá-la preserva o motivo se a demanda for reaberta e recusada de novo sem texto novo).
+      // NUNCA escreve em `notes`: lá vive o resumo do pedido + a anotação livre. Ver migration 010.
+      if (status === DEMAND_STATUS_REJEITADA) {
+        await client.query(
+          'UPDATE demands_3d SET status = $1, rejection_reason = $2 WHERE id = $3',
+          [status, rejectionReason, id],
+        );
+      } else {
+        await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
+      }
 
       if (status === 'Concluída') {
         const quantity = Number(cur.rows[0].quantity);
@@ -137,6 +165,77 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
       return res.json({ success: true });
     }
     res.status(500).json({ error: 'Erro ao mover demanda no Kanban' });
+  }
+};
+
+// Edita a ANOTAÇÃO LIVRE da demanda. Campo separado do motivo da recusa (rejection_reason, 010):
+// `notes` nasce com o resumo do pedido escrito pela requests.controller e o operador complementa.
+// Não mexe em status nem em estoque -> sem transação, sem StockService, sem op_key.
+export const updateDemandNotes = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { notes } = req.body;
+  const userId = (req as any).user.id;
+  const value = normText(notes); // '' / whitespace -> null (limpar a anotação é uma ação válida)
+
+  try {
+    const upd = await pool.query(
+      'UPDATE demands_3d SET notes = $1 WHERE id = $2 RETURNING id, notes',
+      [value, id],
+    );
+    if (upd.rowCount === 0) return res.status(404).json({ error: 'Demanda não encontrada.' });
+
+    await pool.query(
+      `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+      [userId, 'ANOTACAO_DEMANDA_3D', JSON.stringify({ demand_id: id })],
+    );
+
+    return res.json({ success: true, notes: upd.rows[0].notes });
+  } catch (error: any) {
+    console.error(JSON.stringify({ event: 'demand3d_notes_error', id, err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao salvar anotação da demanda' });
+  }
+};
+
+// "Excluir" demanda = SOFT-CANCEL (status='Cancelada'), espelhando o deleteReplenishment.
+//
+// POR QUE NÃO HARD DELETE: a FK é demands_3d.request_id -> requests(id) ON DELETE CASCADE, ou seja o
+// cascade corre no sentido request->demand. Apagar a DEMANDA não deixa órfão referencial, mas deixa
+// um órfão de NEGÓCIO e silencioso: a solicitação continua aberta, possivelmente já com estoque
+// reservado no ato da criação (o reserve parcial da requests.controller), e nada mais vai produzir o
+// que falta. Pior: productions_3d.demand_id é ON DELETE SET NULL — apagar uma demanda que já teve
+// produção desliga o histórico dela sem aviso (o ledger sobrevive, a rastreabilidade não).
+// 'Cancelada' já é o status que o sistema escreve quando a solicitação de origem é cancelada.
+export const deleteDemand = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const userId = (req as any).user.id;
+
+  try {
+    await withTransaction(async (client) => {
+      // FOR UPDATE: 2 cancelamentos paralelos serializam aqui (o 2º vê 'Cancelada' e cai no guard).
+      const cur = await client.query('SELECT status FROM demands_3d WHERE id = $1 FOR UPDATE', [id]);
+      if (cur.rows.length === 0) throw new Error('DEMANDA_NAO_ENCONTRADA');
+      const atual = cur.rows[0].status;
+
+      // Concluída MOVEU ESTOQUE (receive + reserve no updateDemandStatus). Cancelar aqui só trocaria
+      // o rótulo e deixaria o saldo creditado sem contrapartida. A reversão correta é o
+      // DELETE /producao-3d/productions/:id, que passa pelo reverseReceive e recusa se já foi consumido.
+      if (atual === 'Concluída') throw new Error('DEMANDA_CONCLUIDA');
+      if (atual === 'Cancelada') throw new Error('DEMANDA_JA_CANCELADA');
+
+      await client.query("UPDATE demands_3d SET status = 'Cancelada' WHERE id = $1", [id]);
+      await client.query(
+        `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+        [userId, 'CANCELAR_DEMANDA_3D', JSON.stringify({ demand_id: id, status_anterior: atual })],
+      );
+    });
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    if (error.message === 'DEMANDA_NAO_ENCONTRADA') return res.status(404).json({ error: 'Demanda não encontrada.' });
+    if (error.message === 'DEMANDA_CONCLUIDA') return res.status(400).json({ error: 'Demanda concluída não pode ser cancelada — a peça já entrou no estoque. Apague o registro de produção para reverter.' });
+    if (error.message === 'DEMANDA_JA_CANCELADA') return res.status(400).json({ error: 'Demanda já cancelada.' });
+    console.error(JSON.stringify({ event: 'demand3d_cancel_error', id, err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao cancelar demanda 3D' });
   }
 };
 
