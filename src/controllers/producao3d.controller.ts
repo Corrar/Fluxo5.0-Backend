@@ -11,22 +11,44 @@ export const get3DParts = async (req: Request, res: Response) => {
     // AND active = true: o DELETE /products/:id ARQUIVA (active=false), não apaga. Sem este filtro
     // a peça "excluída" pela tela reaparecia no próximo refetch do catálogo — o botão de excluir
     // parecia não funcionar. O catálogo 3D é uma view de products e tem de respeitar o arquivamento.
+    //
+    // `disponivel` e `pedidos` são ADITIVOS (a Vitrine 3D precisa deles; Catálogo/Dashboard/Demandas
+    // ignoram). Ambos agregam ANTES de juntar, pelo mesmo motivo do low-stock: o stock tem 1 linha
+    // por (product_id, warehouse_id) e mais as per-OP — juntar cru por product_id duplicaria a peça.
+    //   disponivel = saldo POOLED somado entre armazéns (op_id IS NULL; material com op_id já está
+    //                comprometido com uma OP e não pode ser separado pra outro pedido).
+    //   pedidos    = quanto já foi solicitado da peça (ranking "Mais Solicitadas"). Exclui requests
+    //                'rejeitado', que englobam os cancelamentos — pedido cancelado não é popularidade.
     const { rows } = await pool.query(`
-        SELECT id, sku, name, image_url as image, production_minutes, filament_grams, description
-        FROM products
-        WHERE is_3d = true AND active = true
-        ORDER BY name ASC
+        SELECT p.id, p.sku, p.name, p.image_url as image, p.production_minutes, p.filament_grams, p.description,
+               (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0)) AS disponivel,
+               COALESCE(rq.pedidos, 0) AS pedidos
+          FROM products p
+          LEFT JOIN (
+            SELECT product_id, SUM(quantity_on_hand) AS on_hand, SUM(quantity_reserved) AS reserved
+              FROM stock WHERE op_id IS NULL GROUP BY product_id
+          ) s ON s.product_id = p.id
+          LEFT JOIN (
+            SELECT ri.product_id, SUM(ri.quantity_requested) AS pedidos
+              FROM request_items ri JOIN requests r ON r.id = ri.request_id
+             WHERE ri.product_id IS NOT NULL AND r.status <> 'rejeitado'
+             GROUP BY ri.product_id
+          ) rq ON rq.product_id = p.id
+         WHERE p.is_3d = true AND p.active = true
+         ORDER BY p.name ASC
     `);
-    
+
     const formatted = rows.map(r => ({
-       id: r.id, 
-       code: r.sku || 'S/N', 
-       name: r.name, 
-       image: r.image, 
-       productionMinutes: r.production_minutes || 0, 
-       filamentGrams: r.filament_grams || 0, 
-       material: 'Padrão', 
-       description: r.description
+       id: r.id,
+       code: r.sku || 'S/N',
+       name: r.name,
+       image: r.image,
+       productionMinutes: r.production_minutes || 0,
+       filamentGrams: r.filament_grams || 0,
+       material: 'Padrão',
+       description: r.description,
+       disponivel: Number(r.disponivel) || 0,
+       pedidos: Number(r.pedidos) || 0
     }));
     
     res.json(formatted);
