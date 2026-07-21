@@ -6,18 +6,34 @@ import { pool } from '../db';
  */
 export const getDashboardStats = async (req: Request, res: Response) => {
   try {
+    // GRÃO (3ª ocorrência da mesma classe — ver low-stock e get3DParts): o stock tem 1 linha por
+    // (product_id, warehouse_id) no pooled e mais as per-OP. Os JOINs antigos eram crus por
+    // product_id, então low_stock CONTAVA o produto uma vez por armazém e total_value SOMAVA as
+    // linhas per-OP junto com as pooled (material da OP inflando o valor do inventário livre).
+    // Agora ambos passam pelo mesmo CTE agregado, pooled-only.
+    //
+    // low_stock ALINHADO à regra da tela Críticos (getLowStockProducts): `<=` e COALESCE(min_stock,0).
+    // Antes usava `<` estrito + `min_stock IS NOT NULL` — o KPI "abaixo do mínimo" do Relatórios
+    // divergia da contagem da tela Críticos, dois números diferentes pro mesmo conceito na cara do
+    // usuário. Regra única: disponível <= mínimo, mínimo ausente conta como 0.
     const query = `
-      SELECT 
+      WITH pooled AS (
+        SELECT product_id,
+               SUM(quantity_on_hand)  AS on_hand,
+               SUM(quantity_reserved) AS reserved
+          FROM stock WHERE op_id IS NULL GROUP BY product_id
+      )
+      SELECT
         (SELECT COUNT(*) FROM products WHERE active = true) as total_products,
-        (SELECT COUNT(*) FROM products p LEFT JOIN stock s ON p.id = s.product_id 
-         WHERE p.min_stock IS NOT NULL 
-         AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC) 
-         AND p.active = true) as low_stock,
+        (SELECT COUNT(*) FROM products p LEFT JOIN pooled s ON s.product_id = p.id
+          WHERE p.active = true
+            AND (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0))
+                <= COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0)) as low_stock,
         (SELECT COUNT(*) FROM requests) as total_requests,
         (SELECT COUNT(*) FROM requests WHERE status = 'aberto') as open_requests,
         (SELECT COUNT(*) FROM separations WHERE status IN ('pendente', 'em_separacao', 'entregue')) as total_separations,
-        (SELECT COALESCE(SUM(s.quantity_on_hand * CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC)), 0) 
-         FROM stock s JOIN products p ON s.product_id = p.id WHERE p.active = true) as total_value
+        (SELECT COALESCE(SUM(s.on_hand * CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC)), 0)
+           FROM pooled s JOIN products p ON s.product_id = p.id WHERE p.active = true) as total_value
     `;
     const { rows } = await pool.query(query);
     const s = rows[0];
@@ -204,11 +220,20 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       ORDER BY rep.created_at DESC`, [start, end]);
     
     // 🟢 CORREÇÃO: Puxar a data do xl.created_at
+    // GRÃO: mesmo fix do dashboard/stats — o JOIN cru por product_id repetia o produto uma vez por
+    // armazém e tratava linha per-OP como estoque livre. Agrega pooled-only antes de juntar.
+    // `disponivel` entra ao lado de `quantidade` (on_hand): o relatório de estoque parado precisa do
+    // saldo livre, não do bruto.
     const estoqueRes = await pool.query(`
-      SELECT p.name as produto, p.sku, 
-             COALESCE(CAST(NULLIF(CAST(s.quantity_on_hand AS TEXT), '') AS NUMERIC), 0) as quantidade, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco, 
-             COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0) as estoque_minimo, 
+      WITH pooled AS (
+        SELECT product_id, SUM(quantity_on_hand) AS on_hand, SUM(quantity_reserved) AS reserved
+          FROM stock WHERE op_id IS NULL GROUP BY product_id
+      )
+      SELECT p.name as produto, p.sku,
+             COALESCE(s.on_hand, 0) as quantidade,
+             (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0)) as disponivel,
+             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco,
+             COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0) as estoque_minimo,
              GREATEST(
                (SELECT MAX(xl.created_at)::timestamp FROM xml_items xi JOIN xml_logs xl ON xi.xml_log_id = xl.id WHERE xi.product_id = p.id), 
                (SELECT MAX(COALESCE(sep.sent_at, sep.created_at))::timestamp FROM separation_items si 
@@ -217,9 +242,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
                (SELECT MAX(r.created_at)::timestamp FROM request_items ri 
                 JOIN requests r ON ri.request_id = r.id 
                 WHERE r.status IN ('aprovado', 'entregue') AND ri.product_id = p.id)
-             ) as ultima_movimentacao 
-      FROM stock s 
-      JOIN products p ON s.product_id = p.id WHERE p.active = true`);
+             ) as ultima_movimentacao
+      FROM products p
+      LEFT JOIN pooled s ON s.product_id = p.id
+     WHERE p.active = true`);
     
     // 🟢 CORREÇÃO: Comparativo do mês passado também usa xl.created_at
     const comparativoRes = await pool.query(`

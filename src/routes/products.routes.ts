@@ -23,7 +23,11 @@ const router = Router();
 router.get('/', authenticate, requirePermission('produtos:view'), getProducts);
 
 // Listar produtos com stock baixo (Alinhado com a permissão de relatórios/críticos)
-router.get('/low-stock', authenticate, requirePermission('estoque_critico:view'), getLowStockProducts);
+// 'estoque_critico' (SEM sufixo :view) — é a chave que o role_permissions realmente tem, com 10
+// papéis semeados. 'estoque_critico:view' NÃO existe no seed (0 linhas): a rota exigia uma chave
+// inexistente, então só o admin (que faz bypass em requirePermission) via a tela Críticos — todos
+// os outros papéis, inclusive o almoxarife, levavam 403.
+router.get('/low-stock', authenticate, requirePermission('estoque_critico'), getLowStockProducts);
 
 // 🗑️ Rota para procurar produtos inativos (fantasmas) - DEVE vir antes das rotas com /:id
 router.get('/inactive', authenticate, requirePermission('produtos:view'), getInactiveProducts);
