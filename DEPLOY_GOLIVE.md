@@ -26,7 +26,8 @@ SELECT
   (SELECT count(*) FROM information_schema.columns WHERE table_name='xml_logs'      AND column_name='nf_number')        AS m007_nf_number,
   to_regclass('public.op_material_events')                                                             AS m008_op_material_events,
   (SELECT count(*) FROM role_permissions WHERE page_key='producao:apontar')                            AS m008_perm_apontar_rows,
-  to_regclass('public.op_returns_pending')                                                             AS m009_op_returns_pending;
+  to_regclass('public.op_returns_pending')                                                             AS m009_op_returns_pending,
+  (SELECT count(*) FROM information_schema.columns WHERE table_name='demands_3d'    AND column_name='rejection_reason') AS m010_demand_reject_reason;
 
 -- ---- GRÃO DO ESTOQUE: op_split DEVE ser 0; a 2ª query NÃO deve retornar linha ----
 SELECT count(*) AS stock_rows, count(*) FILTER (WHERE op_id IS NOT NULL) AS op_split FROM stock;
@@ -42,7 +43,7 @@ SELECT page_key, array_agg(role ORDER BY role) AS roles
 
 ## A) MIGRATIONS a aplicar em PROD (em ordem)
 
-O repo tem **6** migrations. Todas idempotentes; **aplique EM ORDEM** (as de baixo dependem das de cima):
+O repo tem **7** migrations. Todas idempotentes; **aplique EM ORDEM** (as de baixo dependem das de cima):
 
 | Migration | O que cria/altera | Assinatura pra auditar |
 |---|---|---|
@@ -52,9 +53,11 @@ O repo tem **6** migrations. Todas idempotentes; **aplique EM ORDEM** (as de bai
 | `007_nf_number.sql` | `stock_ledger.nf_number`, `xml_logs.nf_number` | colunas existem |
 | `008_op_material_events.sql` | **peça 1**: `op_material_events` + **seed `producao:apontar`** (8 papéis) | tabela existe + `producao:apontar` tem linhas |
 | `009_op_returns_pending.sql` | **peça 3**: `op_returns_pending` | tabela existe |
+| `010_demand_rejection_reason.sql` | **módulo 3D**: `demands_3d.rejection_reason` (motivo da recusa em coluna própria — `notes` carrega o resumo do pedido e não pode ser sobrescrita) | coluna existe |
 
-- **Represadas confirmadas (dev-only):** `008` e `009`. **Se as demais (004–007) aparecerem NULL/0 na auditoria, também estão represadas** — não dá pra afirmar sem rodar §0 em prod. `008`/`009` dependem de `004` (StockService inteiro fala com `stock`/`stock_ledger`); sem `004`, nada de estoque 5.0 funciona.
-- **Como aplicar:** o repo **não tem migration runner** — o padrão é rodar cada `.sql` na branch Neon e promover (ver cabeçalho das migrations). Aplicar cada arquivo faltante contra prod, na ordem 004→009.
+- **Represadas confirmadas (dev-only):** `008`, `009` e `010`. **Se as demais (004–007) aparecerem NULL/0 na auditoria, também estão represadas** — não dá pra afirmar sem rodar §0 em prod. `008`/`009` dependem de `004` (StockService inteiro fala com `stock`/`stock_ledger`); sem `004`, nada de estoque 5.0 funciona.
+- **`010` é independente das demais**: só faz `ADD COLUMN` em `demands_3d` (tabela do schema base, fora deste versionamento). Não depende da 004 e pode ser aplicada isolada. **Mas o front do módulo 3D já espera a coluna** — sem ela, `GET /producao-3d/demands` quebra (a query seleciona `rejection_reason`). Aplicar a 010 **antes ou junto** com o deploy do backend novo, nunca depois.
+- **Como aplicar:** o repo **não tem migration runner** — o padrão é rodar cada `.sql` na branch Neon e promover (ver cabeçalho das migrations). Aplicar cada arquivo faltante contra prod, na ordem 004→010.
 
 ---
 
@@ -102,7 +105,7 @@ outra linha e o saldo se fragmenta.
 
 ## Ordem sugerida de go-live
 1. Rodar **§0 (auditoria)** em prod → saber exatamente o que falta.
-2. Aplicar migrations faltantes **004→009** (idempotentes) na ordem.
+2. Aplicar migrations faltantes **004→010** (idempotentes) na ordem.
 3. Reconferir §0: todas as colunas não-NULL, `producao:apontar` com linhas, grão `op_split = 0`.
 4. Confirmar `entradas:add` no `almoxarife` e o mapa de papéis reais (§B).
 5. Setar `PEROP_CUTOFF_DATE` em prod (§C).
