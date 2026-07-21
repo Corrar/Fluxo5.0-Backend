@@ -60,19 +60,45 @@ export const getProducts = async (req: Request, res: Response) => {
 
 export const getLowStockProducts = async (req: Request, res: Response) => {
   try {
+    // GRÃO: o stock tem 1 linha por (product_id, warehouse_id) no pooled (uq_stock_pooled) e ainda
+    // linhas per-OP (uq_stock_op). O JOIN antigo era `LEFT JOIN stock ON p.id = s.product_id`, SEM
+    // filtro e SEM agregação — com o produto em 2 armazéns ele retornava o produto DUPLICADO e, pior,
+    // comparava o saldo de CADA LINHA com o min_stock (20+20=40 com mínimo 30 acusava 2 críticos
+    // falsos). Passava despercebido só porque hoje cada produto tem uma linha pooled única.
+    //
+    // Agora agrega ANTES de comparar: 1 linha por produto, saldo somado entre armazéns.
+    // POOLED-ONLY (op_id IS NULL) de propósito: material com op_id já está comprometido com uma OP e
+    // não é disponível pra reposição — contá-lo esconderia a ruptura até faltar de verdade.
+    // critical_since agregado por MIN = desde quando o item está crítico em qualquer armazém.
     const { rows } = await query(`
-      SELECT p.id, p.sku, p.name, p.unit, p.min_stock, p.purchase_status, p.purchase_note, p.delivery_forecast, COALESCE(s.quantity_on_hand, 0) as quantity, COALESCE(s.quantity_reserved, 0) as quantity_reserved, s.critical_since, (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) as disponivel,
-        (SELECT COALESCE(SUM(ri.quantity_requested), 0) FROM request_items ri JOIN requests r ON ri.request_id = r.id WHERE ri.product_id = p.id AND r.status IN ('aberto', 'aprovado')) as demanda_reprimida
-      FROM products p LEFT JOIN stock s ON p.id = s.product_id
-      WHERE p.active = true AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) <= COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0) ORDER BY (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) ASC
+      SELECT p.id, p.sku, p.name, p.unit, p.min_stock, p.purchase_status, p.purchase_note, p.delivery_forecast,
+             COALESCE(s.on_hand, 0)  as quantity,
+             COALESCE(s.reserved, 0) as quantity_reserved,
+             s.critical_since,
+             (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0)) as disponivel,
+             (SELECT COALESCE(SUM(ri.quantity_requested), 0)
+                FROM request_items ri JOIN requests r ON ri.request_id = r.id
+               WHERE ri.product_id = p.id AND r.status IN ('aberto', 'aprovado')) as demanda_reprimida
+        FROM products p
+        LEFT JOIN (
+          SELECT product_id,
+                 SUM(quantity_on_hand)  AS on_hand,
+                 SUM(quantity_reserved) AS reserved,
+                 MIN(critical_since)    AS critical_since
+            FROM stock
+           WHERE op_id IS NULL
+           GROUP BY product_id
+        ) s ON s.product_id = p.id
+       WHERE p.active = true
+         AND (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0))
+             <= COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0)
+       ORDER BY (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0)) ASC
     `);
-    
-    const safeRows = rows.map(r => {
-       const { parsed } = sanitizeTags(r.tags);
-       return { ...r, tags: JSON.stringify(parsed) }; 
-    });
 
-    res.json(safeRows);
+    // `tags` não é selecionado por esta query — o sanitizeTags(r.tags) antigo recebia undefined e
+    // devolvia "[]" pra TODO produto, independentemente das tags reais. Campo removido em vez de
+    // mantido mentindo; nenhum consumidor o usava (a tela Críticos era mock).
+    res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar estoque baixo' }); }
 };
 
