@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { pool, withTransaction } from '../db';
+import { pool, query, withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
@@ -8,10 +8,39 @@ import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT rep.*, (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'product_id', ri.product_id, 'quantity', ri.quantity, 'qty_requested', ri.qty_requested, 'products', json_build_object('id', p.id, 'name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price, 'stock', json_build_object('quantity_on_hand', COALESCE(st.quantity_on_hand, 0), 'quantity_reserved', COALESCE(st.quantity_reserved, 0)), 'stock_available', GREATEST(0, COALESCE(st.quantity_on_hand, 0) - COALESCE(st.quantity_reserved, 0))))), '[]'::json) FROM replenishment_items ri JOIN products p ON ri.product_id = p.id LEFT JOIN stock st ON p.id = st.product_id WHERE ri.replenishment_id = rep.id) as items
+    // GRÃO (5ª e última ocorrência da mesma classe — ver low-stock, get3DParts, dashboard/stats e
+    // general.estoque[]): o JOIN era `LEFT JOIN stock st ON p.id = st.product_id`, sem warehouse_id,
+    // sem op_id e sem agregação — e ele vive DENTRO do json_agg dos itens. Com o produto em mais de
+    // um armazém o MESMO item saía duplicado no array `items[]`, e `stock_available` virava o saldo
+    // de uma linha arbitrária (qual dependia do plano de execução). Agora agrega antes de juntar.
+    // POOLED-ONLY (op_id IS NULL): material já empenhado numa OP não está disponível pra reposição.
+    // RETRY: leitura idempotente via query({retryable:true}) — mata o 500 transitório de cold start
+    // do Neon (era pool.query cru, fora do wrapper). Precisa ser explícito: a query começa com WITH
+    // e o auto-detect de db.ts só marca SELECT/EXPLAIN/SHOW/TABLE/VALUES como retentável.
+    const { rows } = await query(`
+      WITH pooled AS (
+        SELECT product_id,
+               SUM(quantity_on_hand)  AS on_hand,
+               SUM(quantity_reserved) AS reserved
+          FROM stock WHERE op_id IS NULL GROUP BY product_id
+      )
+      SELECT rep.*, (
+        SELECT COALESCE(json_agg(json_build_object(
+          'id', ri.id, 'product_id', ri.product_id, 'quantity', ri.quantity, 'qty_requested', ri.qty_requested,
+          'products', json_build_object(
+            'id', p.id, 'name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price,
+            'stock', json_build_object(
+              'quantity_on_hand', COALESCE(st.on_hand, 0),
+              'quantity_reserved', COALESCE(st.reserved, 0)),
+            'stock_available', GREATEST(0, COALESCE(st.on_hand, 0) - COALESCE(st.reserved, 0))
+          ))), '[]'::json)
+        FROM replenishment_items ri
+        JOIN products p ON ri.product_id = p.id
+        LEFT JOIN pooled st ON st.product_id = p.id
+        WHERE ri.replenishment_id = rep.id
+      ) as items
       FROM replenishments rep ORDER BY rep.created_at DESC
-    `);
+    `, [], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar pedidos de reposição' }); }
 };
@@ -207,21 +236,26 @@ export const deleteReplenishment = async (req: Request, res: Response) => {
       // GUARD (preservado): não cancela concluída nem já cancelada -> evita dupla liberação de reserva.
       if (status === 'concluido' || status === 'cancelada') throw new Error('REP_NAO_CANCELAVEL');
 
-      // Só há reserva a liberar se estava em_preparo (o 'reservar' é quem move p/ reserved).
-      if (status === 'em_preparo') {
-        const warehouseId = await resolveWarehouseId(client, userId);
-        const itemsRes = await client.query('SELECT id, product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);
-        for (const item of itemsRes.rows) {
-          const qty = parseFloat(item.quantity || 0);
-          if (qty > 0) {
-            // release pelo motor (nunca deixa reserva negativa + grava no ledger). op_key content-addressed
-            // com a AÇÃO 'cancel' -> não colide com reserve/deliver/revert do authorize do mesmo item.
-            await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
-              refType: 'replenishment', refId: id, userId,
-              opKey: `replenishment:${id}:item:${item.id}:cancel:release:${qty}`,
-              reason: 'Liberação de reserva ao cancelar reposição',
-            });
-          }
+      // A liberação segue o que os ITENS realmente seguram (quantity > 0), NÃO o rótulo do status.
+      //
+      // O gate anterior era `if (status === 'em_preparo')`, partindo de que só o 'reservar' produz
+      // reserva. Mas o `reverter` do authorize também reserva (receive + reserve) e devolve o pedido
+      // para 'pendente' — então a sequência concluido -> reverter -> cancelar caía fora do gate e
+      // VAZAVA a reserva: o estoque ficava empenhado para sempre, sem nenhum pedido segurando.
+      // Iterar os itens cobre qualquer caminho: quantity = 0 (nunca reservado) não gera release
+      // nenhum, então continua correto para o pedido 'pendente' que nunca passou por separação.
+      const warehouseId = await resolveWarehouseId(client, userId);
+      const itemsRes = await client.query('SELECT id, product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);
+      for (const item of itemsRes.rows) {
+        const qty = parseFloat(item.quantity || 0);
+        if (qty > 0) {
+          // release pelo motor (nunca deixa reserva negativa + grava no ledger). op_key content-addressed
+          // com a AÇÃO 'cancel' -> não colide com reserve/deliver/revert do authorize do mesmo item.
+          await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
+            refType: 'replenishment', refId: id, userId,
+            opKey: `replenishment:${id}:item:${item.id}:cancel:release:${qty}`,
+            reason: 'Liberação de reserva ao cancelar reposição',
+          });
         }
       }
 

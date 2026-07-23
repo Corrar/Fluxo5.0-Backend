@@ -39,12 +39,24 @@ const sanitizeTags = (tagsData: any): { is3D: boolean, parsed: string[] } => {
 
 export const getProducts = async (req: Request, res: Response) => {
   try {
+    // GRÃO (6ª ocorrência da mesma classe): o JOIN cru por product_id DUPLICAVA o produto na lista
+    // quando ele tinha linha em mais de um armazém, e o `stock` exibido virava o de uma linha
+    // arbitrária. É a fonte do catálogo de Produtos e do seletor de materiais da Reposição, então o
+    // saldo errado aqui contamina a decisão de quanto pedir. Agrega pooled-only antes de juntar.
+    // RETRY explícito: já usava query(), mas o CTE fez a query começar com WITH — o auto-detect de
+    // db.ts (só SELECT/…) deixou de marcá-la como retentável. Reafirma {retryable:true} (leitura).
     const { rows } = await query(`
+      WITH pooled AS (
+        SELECT product_id,
+               SUM(quantity_on_hand)  AS on_hand,
+               SUM(quantity_reserved) AS reserved
+          FROM stock WHERE op_id IS NULL GROUP BY product_id
+      )
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.tags, p.unit_price, p.sales_price, p.min_stock, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
-        json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0), 'quantity_reserved', COALESCE(s.quantity_reserved, 0)) as stock
-      FROM products p LEFT JOIN stock s ON p.id = s.product_id WHERE p.active = true ORDER BY p.name ASC
-    `);
+        json_build_object('quantity_on_hand', COALESCE(s.on_hand, 0), 'quantity_reserved', COALESCE(s.reserved, 0)) as stock
+      FROM products p LEFT JOIN pooled s ON s.product_id = p.id WHERE p.active = true ORDER BY p.name ASC
+    `, [], { retryable: true });
     
     // 🛡️ A CORREÇÃO MÁGICA AQUI:
     // Nós limpamos a sujeira e devolvemos exatamente em formato de Texto (JSON.stringify)
