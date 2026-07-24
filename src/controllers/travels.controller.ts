@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { pool, withTransaction } from '../db';
+import { pool, query, withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
@@ -8,9 +8,11 @@ import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 export const getTravelOrders = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
+    // `query` (não pool.query cru): SELECT puro -> auto-elegível a retry (cold start Neon).
+    // unit_price entra no aninhado: é a fonte dos R$ (Levado/Retornado/Consumido) da tela Confronto.
+    const { rows } = await query(`
       SELECT t.*,
-        (SELECT json_agg(json_build_object('id', ti.id, 'product_id', ti.product_id, 'quantity_out', ti.quantity_out, 'quantity_returned', ti.quantity_returned, 'status', ti.status, 'products', json_build_object('name', p.name, 'sku', p.sku, 'unit', p.unit))) FROM travel_order_items ti JOIN products p ON ti.product_id = p.id WHERE ti.travel_order_id = t.id) as items
+        (SELECT json_agg(json_build_object('id', ti.id, 'product_id', ti.product_id, 'quantity_out', ti.quantity_out, 'quantity_returned', ti.quantity_returned, 'status', ti.status, 'products', json_build_object('name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price))) FROM travel_order_items ti JOIN products p ON ti.product_id = p.id WHERE ti.travel_order_id = t.id) as items
       FROM travel_orders t ORDER BY t.status ASC, t.created_at DESC
     `);
     res.json(rows);
