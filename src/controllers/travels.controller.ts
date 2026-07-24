@@ -1,8 +1,10 @@
 import { Request, Response } from 'express';
-import { pool } from '../db';
+import { pool, withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { StockService, StockError } from '../services/stock.service';
+import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 export const getTravelOrders = async (req: Request, res: Response) => {
   try {
@@ -43,219 +45,280 @@ export const createTravelOrder = async (req: Request, res: Response) => {
 
 export const reconcileTravelOrder = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { returnedItems } = req.body; 
+  const { returnedItems } = req.body;
   const userId = (req as any).user.id;
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const toCheck = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (toCheck.rows.length === 0) throw new Error('Viagem não encontrada.');
-    if (toCheck.rows[0].status === 'reconciled') throw new Error('Esta viagem já passou por acerto.');
+    await withTransaction(async (client) => {
+      // GUARD (preservado 1:1): trava a LINHA da viagem ANTES de qualquer escrita -> 2 reconciles
+      // paralelos serializam aqui; o sequencial vê 'reconciled' e lança. É proteção pessimista por
+      // lock + flag (não por op_key), mas as op_keys abaixo são cinto-e-suspensório numa corrida.
+      const toCheck = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+      if (toCheck.rows.length === 0) throw new Error('VIAGEM_NAO_ENCONTRADA');
+      if (toCheck.rows[0].status === 'reconciled') throw new Error('VIAGEM_JA_RECONCILIADA');
 
-    const currentItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
-    const returnedMap = new Map(returnedItems.map((i: any) => [i.product_id, i]));
+      const warehouseId = await resolveWarehouseId(client, userId);
+      const currentItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
+      const returnedMap = new Map((returnedItems as any[]).map((i: any) => [i.product_id, i]));
 
-    for (const oldItem of currentItemsRes.rows) {
-      const returnedData: any = returnedMap.get(oldItem.product_id);
-      const returnedQty = returnedData ? Number(returnedData.returnedQuantity) : 0;
-      if (returnedQty < 0) throw new Error("Quantidade devolvida não pode ser negativa.");
+      for (const oldItem of currentItemsRes.rows) {
+        const returnedData: any = returnedMap.get(oldItem.product_id);
+        const returnedQty = returnedData ? Number(returnedData.returnedQuantity) : 0;
+        if (returnedQty < 0) throw new Error('QTD_DEVOLVIDA_NEGATIVA');
 
-      const qtyOut = Number(oldItem.quantity_out);
-      const missing = qtyOut - returnedQty; 
-      let itemStatus = missing > 0 ? 'missing' : missing < 0 ? 'extra' : 'ok';
+        const qtyOut = Number(oldItem.quantity_out);
+        const missing = qtyOut - returnedQty;
+        const itemStatus = missing > 0 ? 'missing' : missing < 0 ? 'extra' : 'ok';
 
-      await client.query(`UPDATE travel_order_items SET quantity_returned = $1, status = $2 WHERE id = $3`, [returnedQty, itemStatus, oldItem.id]);
-      
-      // Remove da reserva a totalidade que ele tinha levado, afinal a viagem acabou para esse item
-      await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [qtyOut, oldItem.product_id]);
+        await client.query('UPDATE travel_order_items SET quantity_returned = $1, status = $2 WHERE id = $3', [returnedQty, itemStatus, oldItem.id]);
 
-      // --- ATUALIZAÇÃO FÍSICA DO ESTOQUE E GERAÇÃO DE LOGS PARA RELATÓRIOS ---
-      
-      // Cálculos da viagem para este item
-      const consumed = Math.max(0, qtyOut - returnedQty); 
-      const returnedToStock = Math.min(qtyOut, returnedQty); 
-      const extra = Math.max(0, returnedQty - qtyOut);
+        // Cálculos da viagem para este item.
+        const consumed = Math.max(0, qtyOut - returnedQty);
+        const returnedToStock = Math.min(qtyOut, returnedQty);
+        const extra = Math.max(0, returnedQty - qtyOut);
 
-      // 1. MATERIAL CONSUMIDO NA OBRA (Baixa no Físico e Gera Log de Saída)
-      if (consumed > 0) {
-          await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`, [consumed, oldItem.product_id]);
-          
-          // 📝 LOG TRADUZIDO
-          await createLog(userId, 'CONFRONTO_SAIDA', { 
-              id_viagem: id, 
-              id_produto: oldItem.product_id, 
-              quantidade: consumed,
-              tipo_confronto: 'Consumido'
-          }, getClientIp(req), client);
-      }
-
-      // 2. MATERIAL DEVOLVIDO AO ESTOQUE (Gera Log de Entrada apenas - o físico já lá estava porque era apenas reserva)
-      if (returnedToStock > 0) {
-          // 📝 LOG TRADUZIDO
-          await createLog(userId, 'CONFRONTO_ENTRADA', { 
-              id_viagem: id, 
-              id_produto: oldItem.product_id, 
-              quantidade: returnedToStock,
-              tipo_confronto: 'Devolvido'
-          }, getClientIp(req), client);
-      }
-
-      // 3. MATERIAL EXTRA (Gera Log de Entrada E aumenta o Físico, pois veio a mais)
-      if (extra > 0) {
-          await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [extra, oldItem.product_id]);
-          
-          // 📝 LOG TRADUZIDO
-          await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', { 
-              id_viagem: id, 
-              id_produto: oldItem.product_id, 
-              quantidade: extra,
-              tipo_confronto: 'Extra'
-          }, getClientIp(req), client);
-      }
-    }
-
-    // Agora lida com materiais que nem sequer estavam na viagem e foram devolvidos! (Extra Puro)
-    for (const retItem of returnedItems) {
-        if (!currentItemsRes.rows.some(old => old.product_id === retItem.product_id) && retItem.returnedQuantity > 0) {
-            await client.query(`INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out, quantity_returned, status) VALUES ($1, $2, 0, $3, 'extra')`, [id, retItem.product_id, retItem.returnedQuantity]);
-            await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [retItem.returnedQuantity, retItem.product_id]);
-            
-            // 📝 LOG TRADUZIDO
-            await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', { 
-                id_viagem: id, 
-                id_produto: retItem.product_id, 
-                quantidade: retItem.returnedQuantity,
-                tipo_confronto: 'Extra Puro'
-            }, getClientIp(req), client);
+        // 1) LIBERA A RESERVA INTEIRA que a viagem segurava. A viagem acabou p/ este item -> solta os
+        //    qtyOut reservados no create, seja qual for o split. release nunca deixa reserva negativa.
+        if (qtyOut > 0) {
+          await StockService.release(client, oldItem.product_id, warehouseId, POOLED_OP_ID, qtyOut, {
+            refType: 'travel', refId: id, userId,
+            opKey: `travel:${id}:item:${oldItem.id}:reconcile:release:${qtyOut}`,
+            reason: 'Fim da viagem: libera a reserva do item (confronto)',
+          });
         }
-    }
 
-    await client.query(`UPDATE travel_orders SET status = 'reconciled', updated_at = NOW() WHERE id = $1`, [id]);
-    
-    // 📝 LOG TRADUZIDO
-    await createLog(userId, 'FINALIZAR_CONFRONTO_VIAGEM', { id_viagem: id }, getClientIp(req), client);
-    
-    await client.query('COMMIT');
+        // 2) CONSUMIDO na obra = baixa SÓ física. reverseReceive (NÃO consume): a reserva já foi
+        //    liberada no passo 1; consume mexeria em quantity_reserved do agregado pooled (reservas de
+        //    OUTRAS separações) -> furo. Guard on_hand-consumed >= reserved segura (invariante do reserve).
+        if (consumed > 0) {
+          await StockService.reverseReceive(client, oldItem.product_id, warehouseId, POOLED_OP_ID, consumed, {
+            refType: 'travel', refId: id, userId,
+            opKey: `travel:${id}:item:${oldItem.id}:reconcile:consume:${consumed}`,
+            reason: 'Confronto: material consumido na obra (baixa física)',
+          });
+          await createLog(userId, 'CONFRONTO_SAIDA', { id_viagem: id, id_produto: oldItem.product_id, quantidade: consumed, tipo_confronto: 'Consumido' }, getClientIp(req), client);
+        }
+
+        // 3) DEVOLVIDO ao estoque = SÓ log. O físico NUNCA saiu (create só reservou) e o release do
+        //    passo 1 já devolveu a disponibilidade -> nada de estoque a movimentar aqui.
+        if (returnedToStock > 0) {
+          await createLog(userId, 'CONFRONTO_ENTRADA', { id_viagem: id, id_produto: oldItem.product_id, quantidade: returnedToStock, tipo_confronto: 'Devolvido' }, getClientIp(req), client);
+        }
+
+        // 4) EXTRA (voltou MAIS do que levou) = entrada física nova. receive pelo motor (cria linha LAZY).
+        if (extra > 0) {
+          await StockService.receive(client, oldItem.product_id, warehouseId, POOLED_OP_ID, extra, {
+            refType: 'travel', refId: id, userId,
+            opKey: `travel:${id}:item:${oldItem.id}:reconcile:extra:${extra}`,
+            reason: 'Confronto: material extra (entrada física)',
+          });
+          await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', { id_viagem: id, id_produto: oldItem.product_id, quantidade: extra, tipo_confronto: 'Extra' }, getClientIp(req), client);
+        }
+      }
+
+      // Materiais que NEM estavam na viagem e voltaram (Extra Puro): cria o item (RETURNING id p/
+      // ancorar a op_key) e dá entrada física via receive.
+      for (const retItem of (returnedItems as any[])) {
+        const retQty = Number(retItem.returnedQuantity);
+        if (!currentItemsRes.rows.some((old: any) => old.product_id === retItem.product_id) && retQty > 0) {
+          const insRes = await client.query(
+            `INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out, quantity_returned, status) VALUES ($1, $2, 0, $3, 'extra') RETURNING id`,
+            [id, retItem.product_id, retQty],
+          );
+          const newItemId = insRes.rows[0].id;
+          await StockService.receive(client, retItem.product_id, warehouseId, POOLED_OP_ID, retQty, {
+            refType: 'travel', refId: id, userId,
+            opKey: `travel:${id}:item:${newItemId}:reconcile:extrapuro:${retQty}`,
+            reason: 'Confronto: material extra puro (não estava na viagem)',
+          });
+          await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', { id_viagem: id, id_produto: retItem.product_id, quantidade: retQty, tipo_confronto: 'Extra Puro' }, getClientIp(req), client);
+        }
+      }
+
+      await client.query("UPDATE travel_orders SET status = 'reconciled', updated_at = NOW() WHERE id = $1", [id]);
+      await createLog(userId, 'FINALIZAR_CONFRONTO_VIAGEM', { id_viagem: id }, getClientIp(req), client);
+    });
+
     if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
     res.json({ success: true });
   } catch (err: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
+    if (err instanceof StockError) return res.status(400).json({ error: err.message });
+    if (err.message === 'VIAGEM_NAO_ENCONTRADA') return res.status(404).json({ error: 'Viagem não encontrada.' });
+    if (err.message === 'VIAGEM_JA_RECONCILIADA') return res.status(400).json({ error: 'Esta viagem já passou por acerto.' });
+    if (err.message === 'QTD_DEVOLVIDA_NEGATIVA') return res.status(400).json({ error: 'Quantidade devolvida não pode ser negativa.' });
+    // Rede de segurança de concorrência: MESMA op_key em paralelo bate no índice único do razão ->
+    // withTransaction fez ROLLBACK (nada duplicou) -> resposta idempotente. Espelha o 4479760/e7b4606.
+    if (err?.code === '23505' && err?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'travel_reconcile_idempotent_conflict', op_key: /\(op_key\)=\(([^)]*)\)/.exec(err?.detail ?? '')?.[1] ?? null }));
+      return res.json({ success: true });
+    }
+    console.error(JSON.stringify({ event: 'travel_reconcile_error', id, err_code: err?.code ?? null, err_msg: String(err?.message ?? '').slice(0, 300) }));
+    res.status(500).json({ error: 'Erro ao realizar o confronto da viagem' });
+  }
 };
 
 export const updateTravelOrder = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { technicians, city, items, status } = req.body;
   const userId = (req as any).user.id;
-  const client = await pool.connect();
+
+  // Validação de payload ANTES da transação -> item inválido vira 400 (o cru respondia 500 aqui dentro).
   try {
     validatePositiveItems(items);
-    await client.query('BEGIN');
-    const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
-    if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
-    if (orderRes.rows[0].status === 'reconciled') throw new Error('Não é possível editar uma viagem já concluída.');
+  } catch (e: any) {
+    return res.status(400).json({ error: e.message });
+  }
 
-    await client.query('UPDATE travel_orders SET technicians = $1, city = $2, status = COALESCE($3, status) WHERE id = $4', [technicians, city, status, id]);
+  try {
+    await withTransaction(async (client) => {
+      // GUARD (preservado): trava a linha + rejeita 'reconciled'. Converge ao alvo (relê oldItems fresco).
+      const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+      if (orderRes.rows.length === 0) throw new Error('VIAGEM_NAO_ENCONTRADA');
+      if (orderRes.rows[0].status === 'reconciled') throw new Error('VIAGEM_JA_RECONCILIADA');
 
-    const oldItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
-    const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
+      await client.query('UPDATE travel_orders SET technicians = $1, city = $2, status = COALESCE($3, status) WHERE id = $4', [technicians, city, status, id]);
 
-    for (const oldItem of oldItemsRes.rows) {
-      if (!newItemsMap.has(oldItem.product_id)) {
-        await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2', [oldItem.quantity_out, oldItem.product_id]);
-        await client.query('DELETE FROM travel_order_items WHERE id = $1', [oldItem.id]);
-      } else {
-        const newItem: any = newItemsMap.get(oldItem.product_id);
-        const diff = Number(newItem.quantity) - Number(oldItem.quantity_out);
-        if (diff !== 0) {
-           await client.query('UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2', [diff, oldItem.product_id]);
-           await client.query('UPDATE travel_order_items SET quantity_out = $1 WHERE id = $2', [newItem.quantity, oldItem.id]);
+      const warehouseId = await resolveWarehouseId(client, userId);
+      const oldItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
+      const newItemsMap = new Map((items as any[]).map((i: any) => [i.product_id, i]));
+
+      for (const oldItem of oldItemsRes.rows) {
+        if (!newItemsMap.has(oldItem.product_id)) {
+          // Item REMOVIDO da viagem -> alvo 0 -> libera a reserva inteira e apaga o item.
+          const qtyOut = Number(oldItem.quantity_out);
+          if (qtyOut > 0) {
+            await StockService.release(client, oldItem.product_id, warehouseId, POOLED_OP_ID, qtyOut, {
+              refType: 'travel', refId: id, userId,
+              opKey: `travel:${id}:item:${oldItem.id}:update:setqty:0`,
+              reason: 'Edição de viagem: item removido (libera reserva)',
+            });
+          }
+          await client.query('DELETE FROM travel_order_items WHERE id = $1', [oldItem.id]);
+        } else {
+          const newItem: any = newItemsMap.get(oldItem.product_id);
+          const newQty = Number(newItem.quantity);
+          const diff = newQty - Number(oldItem.quantity_out);
+          if (diff !== 0) {
+            // op_key CONTENT-ADDRESSED pelo ALVO (setqty:${newQty}), igual authorizeReplenishment.
+            // TRADE-OFF ACEITO: 5->8->5->8 reusa a op_key setqty:8 -> a 2ª subida vira no-op. OK porque
+            // é edição interativa sob FOR UPDATE (não é rota de retry).
+            const opKey = `travel:${id}:item:${oldItem.id}:update:setqty:${newQty}`;
+            if (diff > 0) {
+              await StockService.reserve(client, oldItem.product_id, warehouseId, POOLED_OP_ID, diff, { refType: 'travel', refId: id, userId, opKey, reason: 'Edição de viagem: aumenta reserva do item' });
+            } else {
+              await StockService.release(client, oldItem.product_id, warehouseId, POOLED_OP_ID, -diff, { refType: 'travel', refId: id, userId, opKey, reason: 'Edição de viagem: reduz reserva do item' });
+            }
+            await client.query('UPDATE travel_order_items SET quantity_out = $1 WHERE id = $2', [newQty, oldItem.id]);
+          }
         }
       }
-    }
 
-    for (const item of items) {
-      if (!oldItemsRes.rows.some(old => old.product_id === item.product_id)) {
-        await client.query('INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)', [id, item.product_id, item.quantity]);
-        await client.query('UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2', [item.quantity, item.product_id]);
+      for (const item of (items as any[])) {
+        if (!oldItemsRes.rows.some((old: any) => old.product_id === item.product_id)) {
+          // Item NOVO -> RETURNING id p/ ancorar a op_key -> reserva.
+          const qty = Number(item.quantity);
+          const insRes = await client.query('INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3) RETURNING id', [id, item.product_id, qty]);
+          const newItemId = insRes.rows[0].id;
+          if (qty > 0) {
+            await StockService.reserve(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
+              refType: 'travel', refId: id, userId,
+              opKey: `travel:${id}:item:${newItemId}:update:setqty:${qty}`,
+              reason: 'Edição de viagem: item novo (reserva)',
+            });
+          }
+        }
       }
-    }
 
-    // 📝 LOG TRADUZIDO
-    await createLog(userId, 'EDITAR_VIAGEM', { id_viagem: id, edicoes: 'Técnicos, cidade ou itens alterados' }, getClientIp(req), client);
-    await client.query('COMMIT');
+      await createLog(userId, 'EDITAR_VIAGEM', { id_viagem: id, edicoes: 'Técnicos, cidade ou itens alterados' }, getClientIp(req), client);
+    });
+
     if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
     res.json({ success: true });
   } catch (err: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
+    if (err instanceof StockError) return res.status(400).json({ error: err.message });
+    if (err.message === 'VIAGEM_NAO_ENCONTRADA') return res.status(404).json({ error: 'Viagem não encontrada.' });
+    if (err.message === 'VIAGEM_JA_RECONCILIADA') return res.status(400).json({ error: 'Não é possível editar uma viagem já concluída.' });
+    if (err?.code === '23505' && err?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'travel_update_idempotent_conflict', op_key: /\(op_key\)=\(([^)]*)\)/.exec(err?.detail ?? '')?.[1] ?? null }));
+      return res.json({ success: true });
+    }
+    console.error(JSON.stringify({ event: 'travel_update_error', id, err_code: err?.code ?? null, err_msg: String(err?.message ?? '').slice(0, 300) }));
+    res.status(500).json({ error: 'Erro ao editar a viagem' });
+  }
 };
 
 export const deleteTravelOrder = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
-  const client = await pool.connect();
-  
+
   try {
-    await client.query('BEGIN');
-    
-    // Fazemos o bloqueio da linha (FOR UPDATE) para evitar conflitos de concorrência
-    const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
-    
-    if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
-    const status = orderRes.rows[0].status;
+    await withTransaction(async (client) => {
+      // FOR UPDATE: 2 deletes paralelos serializam; o 2º acha a viagem já apagada -> 404.
+      const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+      if (orderRes.rows.length === 0) throw new Error('VIAGEM_NAO_ENCONTRADA');
+      const status = orderRes.rows[0].status;
 
-    // Buscamos todos os itens atrelados a esta viagem
-    const itemsRes = await client.query('SELECT product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);
+      const warehouseId = await resolveWarehouseId(client, userId);
+      const itemsRes = await client.query('SELECT id, product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);
 
-    if (status === 'pending') {
-      // 1. Viagem estava aberta. Apenas limpamos o que estava reservado para ela.
-      for (const item of itemsRes.rows) {
-        await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [item.quantity_out, item.product_id]);
-      }
-    } else if (status === 'reconciled') {
-      // 2. Viagem estava concluída. Precisamos desfazer a matemática exata do confronto físico!
-      for (const item of itemsRes.rows) {
-        const qtyOut = Number(item.quantity_out);
-        const qtyRet = Number(item.quantity_returned) || 0;
-        
-        const consumed = Math.max(0, qtyOut - qtyRet);
-        const extra = Math.max(0, qtyRet - qtyOut);
+      if (status === 'reconciled') {
+        // Viagem CONCLUÍDA moveu FÍSICO no confronto -> desfaz a matemática exata (o inverso do reconcile).
+        for (const item of itemsRes.rows) {
+          const qtyOut = Number(item.quantity_out);
+          const qtyRet = Number(item.quantity_returned) || 0;
+          const consumed = Math.max(0, qtyOut - qtyRet);
+          const extra = Math.max(0, qtyRet - qtyOut);
 
-        // O material que o sistema achou que foi "consumido" volta a ficar disponível fisicamente
-        if (consumed > 0) {
-          await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [consumed, item.product_id]);
+          // reconcile fez on_hand -= consumed -> devolve com receive.
+          if (consumed > 0) {
+            await StockService.receive(client, item.product_id, warehouseId, POOLED_OP_ID, consumed, {
+              refType: 'travel', refId: id, userId,
+              opKey: `travel:${id}:item:${item.id}:delete:revert-consume:${consumed}`,
+              reason: 'Apagar viagem concluída: devolve o consumido ao físico',
+            });
+          }
+          // reconcile fez on_hand += extra -> tira com reverseReceive (recusa se já foi consumido/reservado,
+          // em vez do GREATEST(0,...) cru que pisava em 0 e escondia furo).
+          if (extra > 0) {
+            await StockService.reverseReceive(client, item.product_id, warehouseId, POOLED_OP_ID, extra, {
+              refType: 'travel', refId: id, userId,
+              opKey: `travel:${id}:item:${item.id}:delete:revert-extra:${extra}`,
+              reason: 'Apagar viagem concluída: retira o extra do físico',
+            });
+          }
         }
-        
-        // O material que veio "extra" é retirado do físico, pois ele vai sumir do sistema
-        if (extra > 0) {
-          await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`, [extra, item.product_id]);
+      } else {
+        // QUALQUER status NÃO-reconciliado (pending, awaiting_stock, e futuros): a reserva ainda está de pé.
+        // DOUTRINA do deleteReplenishment (4479760): libera pelo que os ITENS realmente seguram (qty_out>0),
+        // NÃO pelo rótulo do status. Antes o gate `if(pending)/else if(reconciled)` deixava 'awaiting_stock'
+        // cair fora dos dois braços -> hard delete sem release -> RESERVA VAZADA. Este else tapa o buraco.
+        for (const item of itemsRes.rows) {
+          const qtyOut = Number(item.quantity_out);
+          if (qtyOut > 0) {
+            await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qtyOut, {
+              refType: 'travel', refId: id, userId,
+              opKey: `travel:${id}:item:${item.id}:delete:release:${qtyOut}`,
+              reason: 'Apagar viagem em aberto: libera a reserva do item',
+            });
+          }
         }
       }
-    }
 
-    // 3. Independentemente do status, nós apagamos os itens e a viagem (Hard Delete)
-    await client.query('DELETE FROM travel_order_items WHERE travel_order_id = $1', [id]);
-    await client.query('DELETE FROM travel_orders WHERE id = $1', [id]);
-    
-    // 📝 LOG DA EXCLUSÃO
-    await createLog(userId, 'APAGAR_VIAGEM', { id_viagem: id, status_anterior: status }, getClientIp(req), client);
-    
-    await client.query('COMMIT');
-    
-    // Atualiza o painel do frontend em tempo real
-    if ((req as any).io) { 
-        (req as any).io.emit('travel_orders_update'); 
-        (req as any).io.emit('stock_updated'); 
-    }
-    
-    res.json({ success: true, message: "Confronto apagado e estoque restaurado com sucesso." });
+      // Hard delete (preservado): apaga os itens e a viagem.
+      await client.query('DELETE FROM travel_order_items WHERE travel_order_id = $1', [id]);
+      await client.query('DELETE FROM travel_orders WHERE id = $1', [id]);
+      await createLog(userId, 'APAGAR_VIAGEM', { id_viagem: id, status_anterior: status }, getClientIp(req), client);
+    });
+
+    if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
+    res.json({ success: true, message: 'Confronto apagado e estoque restaurado com sucesso.' });
   } catch (err: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: err.message });
-  } finally { 
-    client.release(); 
+    if (err instanceof StockError) return res.status(400).json({ error: err.message });
+    if (err.message === 'VIAGEM_NAO_ENCONTRADA') return res.status(404).json({ error: 'Viagem não encontrada.' });
+    if (err?.code === '23505' && err?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'travel_delete_idempotent_conflict', id, detail: err?.detail ?? null }));
+      return res.json({ success: true, message: 'Confronto apagado e estoque restaurado com sucesso.' });
+    }
+    console.error(JSON.stringify({ event: 'travel_delete_error', id, err_code: err?.code ?? null, err_msg: String(err?.message ?? '').slice(0, 300) }));
+    res.status(500).json({ error: 'Erro ao apagar a viagem' });
   }
 };
