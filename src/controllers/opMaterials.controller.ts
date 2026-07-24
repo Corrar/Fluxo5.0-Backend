@@ -223,6 +223,88 @@ export const consumeOpMaterial = async (req: Request, res: Response) => {
 };
 
 // ==========================================================================
+// b2) POST /op-materials/transfer — transferência de material OP -> OP (peça 4).
+//     WIP -> WIP: NÃO toca o físico central (doutrina do módulo — o material já saiu do ALMOX
+//     na entrega da separação; aqui ele só muda de OP). Par de eventos no MESMO commit:
+//     'transferido_out' na origem e 'transferido_in' no destino, com o IN apontando pro OUT
+//     via ref_event_id — a direção prevista na 008.
+//     SEM guard de status da OP: simétrico com o consume (decisão 24/07/2026 — o conserto dos
+//     guards de OP fechada do sistema é peça própria; nascer assimétrico confundiria mais).
+// ==========================================================================
+export const transferOpMaterial = async (req: Request, res: Response) => {
+  const { fromClientServiceId, toClientServiceId, productId, qty } = req.body ?? {};
+  const userId = (req as any).user?.id ?? null;
+  const idemKey = idemFrom(req);
+  const quantidade = num(qty);
+
+  try {
+    if (!fromClientServiceId) throw new OpMatError('OP_ORIGEM_OBRIGATORIA', 'Informe a OP de origem.');
+    if (!toClientServiceId) throw new OpMatError('OP_DESTINO_OBRIGATORIA', 'Informe a OP de destino.');
+    if (String(fromClientServiceId) === String(toClientServiceId)) throw new OpMatError('OPS_IGUAIS', 'Origem e destino são a mesma OP.');
+    if (!productId) throw new OpMatError('PRODUTO_OBRIGATORIO', 'Informe o produto.');
+    if (!(quantidade > 0)) throw new OpMatError('QTD_INVALIDA', 'Quantidade precisa ser maior que zero.');
+    if (!idemKey) throw new OpMatError('IDEMPOTENCY_KEY_OBRIGATORIA', 'Header X-Idempotency-Key é obrigatório neste endpoint.');
+
+    // 1 chave -> 2 op_keys (o razão é por evento). O par comita atômico no withTransaction:
+    // a presença do OUT no razão <=> o IN também está lá.
+    const outKey = `opmat:xfer:${idemKey}:out`;
+    const inKey = `opmat:xfer:${idemKey}:in`;
+
+    const result = await withTransaction(async (client) => {
+      // 1. PRÉ-CHECK do replay ANTES do guard de saldo (mesma razão do receive/consume: o retry
+      //    de quem só perdeu a resposta não pode brigar com o saldo que ele próprio já moveu).
+      const ja = await client.query(
+        `SELECT id, event_type, client_service_id, product_id, qty, ref_event_id, created_at
+           FROM op_material_events WHERE op_key = ANY($1)`,
+        [[outKey, inKey]],
+      );
+      if (ja.rows.length > 0) {
+        const out = ja.rows.find((r: any) => r.event_type === 'transferido_out') ?? null;
+        const inn = ja.rows.find((r: any) => r.event_type === 'transferido_in') ?? null;
+        return { out, in: inn, idempotent: true };
+      }
+
+      // 2. Existência das DUAS OPs (o FK só barraria no INSERT, com erro feio).
+      const ops = await client.query(`SELECT id FROM client_services WHERE id = ANY($1)`, [[fromClientServiceId, toClientServiceId]]);
+      const achadas = new Set(ops.rows.map((r: any) => String(r.id)));
+      if (!achadas.has(String(fromClientServiceId))) throw new OpMatError('OP_ORIGEM_NAO_ENCONTRADA', 'OP de origem não encontrada.');
+      if (!achadas.has(String(toClientServiceId))) throw new OpMatError('OP_DESTINO_NAO_ENCONTRADA', 'OP de destino não encontrada.');
+
+      // 3. ADVISORY LOCK da ORIGEM — a MESMA string do consume (invariante D4: consume, devolver e
+      //    transferir_out disputam o MESMO saldo e TÊM que se excluir mutuamente). O destino não
+      //    trava: só recebe crédito, não há guard de saldo a proteger lá.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`opmat:${fromClientServiceId}:${productId}`]);
+
+      // 4. Guard de saldo na origem, DEPOIS do lock (a ordem é o contrato).
+      const saldo = await saldoDe(client, fromClientServiceId, productId);
+      if (quantidade > saldo) {
+        throw new OpMatError('SALDO_INSUFICIENTE_NA_OP',
+          `Saldo insuficiente na OP de origem: tem ${saldo} deste material no armazém da OP e tentou transferir ${quantidade}.`);
+      }
+
+      // 5. O par. IN aponta pro OUT via ref_event_id.
+      const out = await client.query(
+        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key)
+         VALUES ('transferido_out', $1, $2, $3, $4, $5)
+         RETURNING id, event_type, client_service_id, product_id, qty, created_at`,
+        [fromClientServiceId, productId, quantidade, userId, outKey],
+      );
+      const inn = await client.query(
+        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, ref_event_id, user_id, op_key)
+         VALUES ('transferido_in', $1, $2, $3, $4, $5, $6)
+         RETURNING id, event_type, client_service_id, product_id, qty, ref_event_id, created_at`,
+        [toClientServiceId, productId, quantidade, out.rows[0].id, userId, inKey],
+      );
+      return { out: out.rows[0], in: inn.rows[0], saldoRestanteOrigem: saldo - quantidade, idempotent: false };
+    });
+
+    return res.status(201).json({ success: true, ...result });
+  } catch (error: any) {
+    return mapError(error, res, 'transfer');
+  }
+};
+
+// ==========================================================================
 // c) GET /op-materials/balance/:clientServiceId — a projeção. É o que a tela Armazém renderiza.
 // ==========================================================================
 export const getOpBalance = async (req: Request, res: Response) => {
@@ -355,6 +437,53 @@ export const getOpEvents = async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error(JSON.stringify({ event: 'opmat_events_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
     return res.status(500).json({ error: 'Erro ao buscar o extrato da OP' });
+  }
+};
+
+// ==========================================================================
+// f) GET /op-materials/summary — os 3 KPIs do sub-razão pro Painel da Produção (read-only).
+//    wip_unidades: Σ saldo projetado de TODAS as OPs (a fórmula única SALDO_SQL, sem grão).
+//    wip_linhas: pares (OP, produto) com saldo > 0 — material distinto parado em chão de fábrica.
+//    apontamentos_7d: eventos 'consumido' nos últimos 7 dias (1 evento = 1 apontamento).
+//    recebimentos_pendentes: linhas da MESMA query da fila do Recebimento (condições idênticas
+//    ao pending-receipts — se divergirem, o KPI mente sobre a fila).
+// ==========================================================================
+export const getOpSummary = async (_req: Request, res: Response) => {
+  try {
+    const [wip, apont, pend] = await Promise.all([
+      pool.query(
+        `SELECT COALESCE(SUM(saldo), 0) AS unidades, COUNT(*) FILTER (WHERE saldo > 0) AS linhas
+           FROM (SELECT client_service_id, product_id, ${SALDO_SQL} AS saldo
+                   FROM op_material_events GROUP BY client_service_id, product_id) s`,
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS n FROM op_material_events
+          WHERE event_type = 'consumido' AND created_at >= NOW() - INTERVAL '7 days'`,
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS n
+           FROM separations s
+           JOIN separation_items si ON si.separation_id = s.id
+           LEFT JOIN LATERAL (
+                SELECT SUM(e.qty) AS total FROM op_material_events e
+                 WHERE e.ref_separation_item_id = si.id AND e.event_type = 'recebido'
+           ) r ON TRUE
+          WHERE s.status = ANY($1)
+            AND s.client_service_id IS NOT NULL
+            AND COALESCE(s.sent_at, s.created_at) >= $2::timestamp
+            AND si.quantity > COALESCE(r.total, 0)`,
+        [STATUS_ENTREGUES, CUTOFF_DATE],
+      ),
+    ]);
+    return res.json({
+      wip_unidades: num(wip.rows[0].unidades),
+      wip_linhas: num(wip.rows[0].linhas),
+      apontamentos_7d: num(apont.rows[0].n),
+      recebimentos_pendentes: num(pend.rows[0].n),
+    });
+  } catch (error: any) {
+    console.error(JSON.stringify({ event: 'opmat_summary_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao calcular o resumo da produção' });
   }
 };
 

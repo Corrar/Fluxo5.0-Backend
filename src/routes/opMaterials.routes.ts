@@ -3,9 +3,11 @@ import { Router } from 'express';
 import {
   receiveOpMaterial,
   consumeOpMaterial,
+  transferOpMaterial,
   getOpBalance,
   getPendingReceipts,
   getOpEvents,
+  getOpSummary,
 } from '../controllers/opMaterials.controller';
 import { authenticate, requirePermission } from '../middlewares/auth';
 
@@ -26,10 +28,12 @@ router.use(authenticate);
 // Escreve no razão da OP -> exige a chave de produção.
 router.post('/receive', requirePermission('producao:apontar'), receiveOpMaterial);
 router.post('/consume', requirePermission('producao:apontar'), consumeOpMaterial);
+router.post('/transfer', requirePermission('producao:apontar'), transferOpMaterial);
 
 // Leitura -> só autenticação (mesmo critério dos GETs de /producao-3d).
 router.get('/balance/:clientServiceId', getOpBalance);
 router.get('/pending-receipts', getPendingReceipts);
 router.get('/events/:clientServiceId', getOpEvents);
+router.get('/summary', getOpSummary);
 
 export default router;
