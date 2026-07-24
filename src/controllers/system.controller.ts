@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
-import { pool } from '../db';
+// `query` (wrapper com retry de cold start do Neon) importado como `dbQuery`: várias funções deste
+// arquivo têm uma string SQL local chamada `query`/`let query`, e o nome cru colidiria (TDZ/shadow).
+import { pool, query as dbQuery } from '../db';
 
 /**
  * Busca estatísticas globais para os cards do Dashboard.
@@ -35,7 +37,9 @@ export const getDashboardStats = async (req: Request, res: Response) => {
         (SELECT COALESCE(SUM(s.on_hand * CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC)), 0)
            FROM pooled s JOIN products p ON s.product_id = p.id WHERE p.active = true) as total_value
     `;
-    const { rows } = await pool.query(query);
+    // RETRY: era pool.query cru; a query começa com WITH (fora do auto-detect de db.ts), então
+    // {retryable:true} explícito. `query` aqui é a string SQL local; o wrapper é `dbQuery`.
+    const { rows } = await dbQuery(query, [], { retryable: true });
     const s = rows[0];
     res.json({ 
       totalProducts: parseInt(s.total_products || '0'), 
@@ -224,7 +228,9 @@ export const getGeneralReports = async (req: Request, res: Response) => {
     // armazém e tratava linha per-OP como estoque livre. Agrega pooled-only antes de juntar.
     // `disponivel` entra ao lado de `quantidade` (on_hand): o relatório de estoque parado precisa do
     // saldo livre, não do bruto.
-    const estoqueRes = await pool.query(`
+    // RETRY: leitura idempotente; começa com WITH (fora do auto-detect) -> {retryable:true} explícito.
+    // `dbQuery` (não `query`) porque getGeneralReports tem um `let query` local mais abaixo.
+    const estoqueRes = await dbQuery(`
       WITH pooled AS (
         SELECT product_id, SUM(quantity_on_hand) AS on_hand, SUM(quantity_reserved) AS reserved
           FROM stock WHERE op_id IS NULL GROUP BY product_id
@@ -245,7 +251,7 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              ) as ultima_movimentacao
       FROM products p
       LEFT JOIN pooled s ON s.product_id = p.id
-     WHERE p.active = true`);
+     WHERE p.active = true`, [], { retryable: true });
     
     // 🟢 CORREÇÃO: Comparativo do mês passado também usa xl.created_at
     const comparativoRes = await pool.query(`

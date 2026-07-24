@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { pool, withTransaction } from '../db';
+import { pool, query, withTransaction } from '../db';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
@@ -19,7 +19,10 @@ export const get3DParts = async (req: Request, res: Response) => {
     //                comprometido com uma OP e não pode ser separado pra outro pedido).
     //   pedidos    = quanto já foi solicitado da peça (ranking "Mais Solicitadas"). Exclui requests
     //                'rejeitado', que englobam os cancelamentos — pedido cancelado não é popularidade.
-    const { rows } = await pool.query(`
+    // RETRY: leitura idempotente via query({retryable:true}) — era pool.query cru, sem defesa de cold
+    // start do Neon. O grão aqui é subquery (a query começa com SELECT, então o auto-detect até
+    // pegaria); {retryable:true} explícito blinda o intento e sobrevive a virar CTE no futuro.
+    const { rows } = await query(`
         SELECT p.id, p.sku, p.name, p.image_url as image, p.production_minutes, p.filament_grams, p.description,
                (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0)) AS disponivel,
                COALESCE(rq.pedidos, 0) AS pedidos
@@ -36,7 +39,7 @@ export const get3DParts = async (req: Request, res: Response) => {
           ) rq ON rq.product_id = p.id
          WHERE p.is_3d = true AND p.active = true
          ORDER BY p.name ASC
-    `);
+    `, [], { retryable: true });
 
     const formatted = rows.map(r => ({
        id: r.id,
