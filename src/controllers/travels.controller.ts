@@ -20,27 +20,101 @@ export const getTravelOrders = async (req: Request, res: Response) => {
 export const createTravelOrder = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { technicians, city, items, status } = req.body;
-  const client = await pool.connect();
+
+  // Validação FORA da transação -> item inválido vira 400 (o cru respondia 500 aqui dentro).
   try {
     validatePositiveItems(items);
-    await client.query('BEGIN');
-    const initialStatus = status || 'pending';
-    const toRes = await client.query(`INSERT INTO travel_orders (technicians, city, status, created_by) VALUES ($1, $2, $3, $4) RETURNING id`, [technicians, city, initialStatus, userId]);
-    
-    for (const item of items) {
-      await client.query(`INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)`, [toRes.rows[0].id, item.product_id, item.quantity]);
-      await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, item.product_id]);
-    }
-    
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'CRIAR_VIAGEM', { id_viagem: toRes.rows[0].id, tecnicos: technicians, cidade: city }, getClientIp(req), client);
-    await client.query('COMMIT');
+  } catch (e: any) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  // X-Idempotency-Key (opcional): string não-vazia -> âncora ESTÁVEL cross-request (espelha createProduction).
+  // array (header repetido) / ausente / vazio -> tratado como ausente.
+  const idemRaw = req.headers['x-idempotency-key'];
+  const idemKey = typeof idemRaw === 'string' && idemRaw.trim() ? idemRaw.trim() : null;
+  // ÂNCORA multi-item = o 1º item com qty>0. Como TODOS os reserves commitam ATÔMICOS no mesmo
+  // withTransaction, a presença do op_key da âncora no razão <=> a viagem INTEIRA committou. Por isso o
+  // pré/pós-check olham SÓ a âncora (checar todos os itens seria redundante — mesmo destino transacional;
+  // e ambíguo se dois POSTs reusassem a chave com corpos diferentes — contrato: mesma chave = mesmo corpo).
+  const anchorItem = (items as any[]).find((i: any) => Number(i.quantity) > 0) || null;
+  const idemOpKey = idemKey && anchorItem
+    ? `travel:idem:${idemKey}:item:${anchorItem.product_id}:reserve:${Number(anchorItem.quantity)}`
+    : null;
+
+  try {
+    const result = await withTransaction(async (client) => {
+      const warehouseId = await resolveWarehouseId(client, userId);
+
+      // PRÉ-CHECK (só com header): se o razão já tem a op_key da âncora, um POST anterior já criou a
+      // viagem INTEIRA. Devolve o id existente SEM inserir outra travel_order (retry SEQUENCIAL não
+      // duplica a viagem). ref_id do razão = id da viagem original.
+      if (idemOpKey) {
+        const led = await client.query('SELECT ref_id FROM stock_ledger WHERE op_key = $1 LIMIT 1', [idemOpKey]);
+        if ((led.rowCount ?? 0) > 0) {
+          return { id: led.rows[0].ref_id, success: true, idempotent: true };
+        }
+      }
+
+      const initialStatus = status || 'pending';
+      const toRes = await client.query(
+        `INSERT INTO travel_orders (technicians, city, status, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
+        [technicians, city, initialStatus, userId],
+      );
+      const travelId = toRes.rows[0].id;
+
+      for (const item of (items as any[])) {
+        const qty = Number(item.quantity);
+        // RETURNING id p/ ancorar o fallback SEM header (o id do item é estável dentro da viagem).
+        const insItem = await client.query(
+          `INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3) RETURNING id`,
+          [travelId, item.product_id, qty],
+        );
+        const itemId = insItem.rows[0].id;
+        if (qty > 0) {
+          // COM header: op_key content-addressed por idemKey+produto+qty (idempotência cross-request).
+          // SEM header: fallback nos ids FRESCOS (travel+item) -> NÃO dá idempotência cross-request
+          // (cada POST = ids novos = op_keys novas = nova reserva). Documentado; use o header p/ blindar retry.
+          const opKey = idemKey
+            ? `travel:idem:${idemKey}:item:${item.product_id}:reserve:${qty}`
+            : `travel:${travelId}:item:${itemId}:reserve:${qty}`;
+          await StockService.reserve(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
+            refType: 'travel', refId: travelId, userId, opKey,
+            reason: 'Reserva de material para viagem',
+          });
+        }
+      }
+
+      // PÓS-CHECK de corrida (só com header): se a op_key da âncora aponta p/ OUTRA viagem, um POST
+      // concorrente idêntico venceu a âncora enquanto o nosso reserve dela caiu no alreadyApplied (no-op,
+      // sem 23505). Esta viagem é duplicada -> aborta p/ o ROLLBACK levá-la junto. O catch faz o replay.
+      if (idemOpKey) {
+        const led = await client.query('SELECT ref_id FROM stock_ledger WHERE op_key = $1 LIMIT 1', [idemOpKey]);
+        if (led.rows[0] && String(led.rows[0].ref_id) !== String(travelId)) throw new Error('IDEMPOTENT_REPLAY');
+      }
+
+      await createLog(userId, 'CRIAR_VIAGEM', { id_viagem: travelId, tecnicos: technicians, cidade: city }, getClientIp(req), client);
+      return { id: travelId, success: true };
+    });
+
     if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
-    res.status(201).json({ id: toRes.rows[0].id, success: true });
+    return res.status(201).json(result);
   } catch (err: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
+    if (err instanceof StockError) return res.status(400).json({ error: err.message });
+    // Corrida (2 POSTs idênticos com header): o perdedor cai aqui por 23505 (bateu na unique do razão)
+    // OU por IDEMPOTENT_REPLAY (o pós-check viu o crédito do vencedor). Em ambos o withTransaction fez
+    // ROLLBACK (levou a travel_order duplicada junto). Responde a viagem VENCEDORA. Espelha o 06fc48d.
+    const isReplay = err?.message === 'IDEMPOTENT_REPLAY' || (err?.code === '23505' && err?.constraint === 'uq_stock_ledger_opkey');
+    if (isReplay) {
+      console.warn(JSON.stringify({ event: 'travel_create_idempotent_conflict', op_key: idemOpKey, via: err?.message === 'IDEMPOTENT_REPLAY' ? 'poscheck' : '23505' }));
+      if (idemOpKey) {
+        const led = await pool.query('SELECT ref_id FROM stock_ledger WHERE op_key = $1 LIMIT 1', [idemOpKey]);
+        if ((led.rowCount ?? 0) > 0) return res.status(201).json({ id: led.rows[0].ref_id, success: true, idempotent: true });
+      }
+      return res.status(201).json({ success: true, idempotent: true });
+    }
+    console.error(JSON.stringify({ event: 'travel_create_error', err_code: err?.code ?? null, err_msg: String(err?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao criar a viagem' });
+  }
 };
 
 export const reconcileTravelOrder = async (req: Request, res: Response) => {

@@ -30,10 +30,10 @@ router.get('/', getTravelOrders);
 
 /**
  * @route POST /
- * @desc Cria uma nova viagem (travel order) e reserva os itens no estoque.
- * @note RBAC (separacoes:edit) entra na SUB-PEÇA B, junto com a migração do create (X-Idempotency-Key).
+ * @desc Cria uma nova viagem (travel order) e reserva os itens no estoque (StockService.reserve).
+ * Escreve saldo (reserve) -> separacoes:edit. Idempotência cross-request via header X-Idempotency-Key.
  */
-router.post('/', createTravelOrder);
+router.post('/', requirePermission('separacoes:edit'), createTravelOrder);
 
 /**
  * @route POST /:id/reconcile
