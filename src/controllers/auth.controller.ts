@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
+import { roleExistsInRbac } from '../services/rbac';
 
 // Define a chave secreta do JWT (Use variáveis de ambiente em produção)
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -76,8 +77,12 @@ export const login = async (req: Request, res: Response): Promise<Response | voi
     // Registra o login no sistema de auditoria
     await createLog(user.id, 'LOGIN', { message: 'Login realizado' }, getClientIp(req));
 
+    // NUNCA devolver a linha crua de users: ela carrega o hash bcrypt (encrypted_password)
+    // e métricas internas (total_minutes, last_active). O front só usa id/email.
+    const safeUser = { id: user.id, email: user.email };
+
     // O RETURN final garante que o Express encerre a requisição entregando os dados
-    return res.json({ token, user, profile: profiles[0], permissions: userPermissions });
+    return res.json({ token, user: safeUser, profile: profiles[0], permissions: userPermissions });
     
   } catch (error: any) {
     console.error("Erro no login:", error);
@@ -87,35 +92,53 @@ export const login = async (req: Request, res: Response): Promise<Response | voi
 
 
 /**
- * Função para gerenciar o Registro de novos usuários
- * @param req Objeto de requisição do Express
- * @param res Objeto de resposta do Express
+ * Função para gerenciar o Registro de novos usuários.
+ * Rota FECHADA atrás de authenticate + canManageUsers (só admin cria conta).
+ *
+ * ⚠ BOOTSTRAP: como não existe mais auto-cadastro, o PRIMEIRO admin de um ambiente
+ * novo tem de ser semeado direto no banco (seed/SQL) — sem ele ninguém passa no gate.
  */
 export const register = async (req: Request, res: Response): Promise<Response | void> => {
   const { email, password, name, role, sector } = req.body;
-  
+
+  // Validação na borda: nada de INSERT com campo faltando/quebrado.
+  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    return res.status(400).json({ error: 'E-mail inválido.' });
+  }
+  if (typeof password !== 'string' || password.length < 6) {
+    return res.status(400).json({ error: 'A senha deve ter pelo menos 6 caracteres.' });
+  }
+  if (typeof name !== 'string' || name.trim() === '') {
+    return res.status(400).json({ error: 'Nome é obrigatório.' });
+  }
+  // Mesma allowlist RBAC do PUT /users/:id/role: só papéis que existem na matriz.
+  if (!(await roleExistsInRbac(role))) {
+    return res.status(400).json({ error: 'cargo inválido' });
+  }
+
   // Inicia um client dedicado para podermos usar transações (BEGIN/COMMIT/ROLLBACK)
   const client = await pool.connect();
-  
+
   try {
     await client.query('BEGIN'); // Inicia a transação
-    
+
     // Verifica se o e-mail já existe no sistema
-    const userCheck = await client.query('SELECT id FROM users WHERE email = $1', [email]);
+    const userCheck = await client.query('SELECT id FROM users WHERE email = $1', [cleanEmail]);
     if (userCheck.rows.length > 0) {
       await client.query('ROLLBACK');
       // Correção: A mensagem foi alterada para ficar mais clara
       return res.status(400).json({ error: 'Este e-mail já está em uso por outro usuário.' });
     }
-    
+
     // Criptografa a senha
     const salt = await bcrypt.genSalt(10);
     const encryptedPassword = await bcrypt.hash(password, salt);
-    
+
     // Insere o usuário na tabela 'users'
     const userRes = await client.query(
       'INSERT INTO users (email, encrypted_password, is_active) VALUES ($1, $2, true) RETURNING id',
-      [email, encryptedPassword]
+      [cleanEmail, encryptedPassword]
     );
     const newUserId = userRes.rows[0].id;
 
@@ -126,15 +149,12 @@ export const register = async (req: Request, res: Response): Promise<Response | 
       [newUserId, name, role, sector]
     );
 
-    // Cria o log caso exista um usuário logado criando este novo registro (ex: um admin)
-    const reqUser = (req as any).user;
-    if (reqUser) {
-        await createLog(reqUser.id, 'CREATE_USER', { target_user_id: newUserId, role, name }, getClientIp(req), client);
-    }
+    // Auditoria INCONDICIONAL: a rota exige autenticação, então req.user sempre existe.
+    await createLog((req as any).user.id, 'CREATE_USER', { target_user_id: newUserId, role, name }, getClientIp(req), client);
 
     // Confirma as inserções no banco
     await client.query('COMMIT');
-    return res.status(201).json({ success: true, message: 'Usuário registrado com sucesso!' });
+    return res.status(201).json({ success: true, id: newUserId, message: 'Usuário registrado com sucesso!' });
     
   } catch (error: any) {
     // Em caso de qualquer erro, desfaz tudo (ROLLBACK)

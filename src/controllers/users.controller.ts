@@ -4,6 +4,7 @@ import { Request, Response } from 'express';
 import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
+import { roleExistsInRbac } from '../services/rbac';
 import bcrypt from 'bcryptjs';
 
 export const getUsers = async (req: Request, res: Response) => {
@@ -22,27 +23,70 @@ export const getUsers = async (req: Request, res: Response) => {
 
 export const updateRole = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { role, sector } = req.body; 
+  const { role, sector } = req.body;
   const userId = (req as any).user.id;
-  
+
+  // Allowlist RBAC: só papéis que EXISTEM em role_permissions são atribuíveis aqui.
+  if (!(await roleExistsInRbac(role))) {
+    return res.status(400).json({ error: 'cargo inválido' });
+  }
+
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
+    const target = await client.query('SELECT role FROM profiles WHERE id = $1 FOR UPDATE', [id]);
+    if (target.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+
+    // Guard do último admin: rebaixar o único 'admin' deixaria o sistema sem gestão.
+    // FOR UPDATE em todas as linhas admin serializa rebaixamentos concorrentes.
+    if (target.rows[0].role === 'admin' && role !== 'admin') {
+      const admins = await client.query(`SELECT id FROM profiles WHERE role = 'admin' FOR UPDATE`);
+      if (admins.rows.length <= 1) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Não é possível rebaixar o único administrador do sistema.' });
+      }
+    }
+
     // Atualizamos o perfil com Cargo e Setor
     if (sector) {
-      await pool.query('UPDATE profiles SET role = $1, sector = $2 WHERE id = $3', [role, sector, id]);
-      
+      await client.query('UPDATE profiles SET role = $1, sector = $2 WHERE id = $3', [role, sector, id]);
+
       // 🟢 CORREÇÃO APLICADA: Voltámos a usar a string 'UPDATE_ROLE' para não quebrar a validação (ENUM) da Base de Dados.
       // O novo setor continua a ser guardado, mas dentro do objeto JSON que a base de dados aceita bem!
-      await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role, new_sector: sector }, getClientIp(req));
+      await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role, new_sector: sector }, getClientIp(req), client);
     } else {
-      await pool.query('UPDATE profiles SET role = $1 WHERE id = $2', [role, id]);
-      await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role }, getClientIp(req));
+      await client.query('UPDATE profiles SET role = $1 WHERE id = $2', [role, id]);
+      await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role }, getClientIp(req), client);
     }
-    
+
+    await client.query('COMMIT');
+
+    // O token do alvo ainda carrega o cargo velho — avisa o front pra forçar re-login
+    // (mesmo evento/formato do saveUserPermissions, com as permissões do novo cargo).
+    // Sala `user:${id}` é a do socket AUTENTICADO (config/socket.ts); a sala com id cru
+    // fica junto por compatibilidade com o padrão legado dos outros emits.
+    if ((req as any).io) {
+      const permRes = await pool.query(`
+        SELECT page_key FROM role_permissions WHERE role = $1
+        UNION
+        SELECT page_key FROM user_permissions WHERE user_id = $2
+      `, [role, id]);
+      const permissions = permRes.rows.map((r: { page_key: string }) => r.page_key);
+      (req as any).io.to(`user:${id}`).to(id).emit('user_permissions_updated', { userId: id, permissions });
+    }
+
     res.json({ success: true });
-  } catch (error: any) { 
+  } catch (error: any) {
+    try { await client.query('ROLLBACK'); } catch(e) {}
     console.error("Erro ao atualizar função:", error);
     // 🟢 Melhoria de Debug: Agora devolvemos o erro detalhado da base de dados caso volte a falhar.
-    res.status(500).json({ error: 'Erro ao atualizar função e setor', details: error.message }); 
+    res.status(500).json({ error: 'Erro ao atualizar função e setor', details: error.message });
+  } finally {
+    client.release();
   }
 };
 
@@ -72,12 +116,52 @@ export const updateStatus = async (req: Request, res: Response) => {
 export const deleteUser = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
+
+  if (id === userId) {
+    return res.status(400).json({ error: 'Não pode excluir a própria conta.' });
+  }
+
+  const client = await pool.connect();
   try {
-    await pool.query('DELETE FROM users WHERE id = $1', [id]);
-    await createLog(userId, 'DELETE_USER', { target_user_id: id }, getClientIp(req));
+    await client.query('BEGIN');
+
+    const target = await client.query(
+      `SELECT u.email, p.role FROM users u LEFT JOIN profiles p ON p.id = u.id WHERE u.id = $1 FOR UPDATE OF u`,
+      [id]
+    );
+    if (target.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
+
+    // Guard do último admin (mesma serialização por FOR UPDATE do updateRole).
+    if (target.rows[0].role === 'admin') {
+      const admins = await client.query(`SELECT id FROM profiles WHERE role = 'admin' FOR UPDATE`);
+      if (admins.rows.length <= 1) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Não é possível excluir o único administrador do sistema.' });
+      }
+    }
+
+    // Log antes do DELETE, na MESMA tx: se o hard-delete falhar, o log some no rollback.
+    await createLog(userId, 'DELETE_USER', { target_user_id: id, target_email: target.rows[0].email }, getClientIp(req), client);
+    await client.query('DELETE FROM users WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
     res.json({ success: true });
-  } catch (error: any) { 
-    res.status(500).json({ error: 'Erro ao excluir usuário' }); 
+  } catch (error: any) {
+    try { await client.query('ROLLBACK'); } catch(e) {}
+    // FK NO ACTION (audit_logs, requests, op_returns): usuário com histórico não sai por
+    // hard-delete — o caminho honesto é suspender a conta (preserva a auditoria).
+    if (error?.code === '23503') {
+      return res.status(409).json({
+        error: 'Usuário tem histórico vinculado (auditoria/pedidos) e não pode ser excluído. Use a suspensão da conta para bloquear o acesso.'
+      });
+    }
+    console.error("Erro ao excluir usuário:", error);
+    res.status(500).json({ error: 'Erro ao excluir usuário' });
+  } finally {
+    client.release();
   }
 };
 
