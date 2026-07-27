@@ -67,8 +67,8 @@ export const updateRole = async (req: Request, res: Response) => {
 
     // O token do alvo ainda carrega o cargo velho — avisa o front pra forçar re-login
     // (mesmo evento/formato do saveUserPermissions, com as permissões do novo cargo).
-    // Sala `user:${id}` é a do socket AUTENTICADO (config/socket.ts); a sala com id cru
-    // fica junto por compatibilidade com o padrão legado dos outros emits.
+    // Sala `user:${id}` é a do socket AUTENTICADO (config/socket.ts) e a ÚNICA possível:
+    // sem join_room, a sala com o id cru não tem como ser populada por ninguém.
     if ((req as any).io) {
       const permRes = await pool.query(`
         SELECT page_key FROM role_permissions WHERE role = $1
@@ -76,7 +76,7 @@ export const updateRole = async (req: Request, res: Response) => {
         SELECT page_key FROM user_permissions WHERE user_id = $2
       `, [role, id]);
       const permissions = permRes.rows.map((r: { page_key: string }) => r.page_key);
-      (req as any).io.to(`user:${id}`).to(id).emit('user_permissions_updated', { userId: id, permissions });
+      (req as any).io.to(`user:${id}`).emit('user_permissions_updated', { userId: id, permissions });
     }
 
     res.json({ success: true });
