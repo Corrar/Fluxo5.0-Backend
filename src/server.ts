@@ -117,6 +117,13 @@ startExpireRequestsJob();
 // 4. REGISTRO DE ROTAS (API ENDPOINTS)
 // ==========================================
 
+// Health check PÚBLICO — montado ANTES de qualquer router com authenticate (o systemRouter
+// na raiz engole qualquer path não mapeado com 401). Devolve o SHA do deploy (env do Render)
+// pra conferir de fora qual commit está no ar.
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({ ok: true, sha: process.env.RENDER_GIT_COMMIT?.slice(0, 7) ?? 'dev' });
+});
+
 // Autenticação e Perfis de Acesso
 app.use('/auth', authRouter);
 app.use('/users', usersRouter);
