@@ -122,9 +122,11 @@ export const saveUserPermissions = async (req: Request, res: Response) => {
     
     await client.query('COMMIT');
     
-    // ⚡ Atualiza o Frontend em tempo real para este usuário específico
+    // ⚡ Atualiza o Frontend em tempo real para este usuário específico.
+    // Sala `user:${id}` é a do socket AUTENTICADO (config/socket.ts) — a crua fica junto
+    // por compatibilidade, mesmo padrão do updateRole. Só a crua = evento nunca entregue.
     if ((req as any).io) {
-        (req as any).io.to(userId).emit('user_permissions_updated', { userId, permissions });
+        (req as any).io.to(`user:${userId}`).to(userId).emit('user_permissions_updated', { userId, permissions });
     }
 
     res.json({ success: true });
