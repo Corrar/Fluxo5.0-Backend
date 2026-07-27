@@ -124,19 +124,10 @@ export const deleteTask = async (req: Request, res: Response) => {
 };
 
 // --- TAREFAS DA ELÉTRICA ---
-const checkEletricaPermission = async (userId: string) => {
-  const { rows } = await pool.query('SELECT role, sector FROM profiles WHERE id = $1', [userId]);
-  const user = rows[0];
-  if (!user) return false;
-  if (user.role === 'admin') return true;
-  if (user.sector?.toLowerCase() === 'elétrica' || user.sector?.toLowerCase() === 'eletrica') return true;
-  const permCheck = await pool.query('SELECT 1 FROM role_permissions WHERE role = $1 AND page_key = $2', [user.role, 'tarefas_eletrica']);
-  return permCheck.rows.length > 0;
-};
+// Autorização na rota: requirePermission('tarefas_eletrica') — o antigo checkEletricaPermission
+// paralelo (que ignorava user_permissions) foi unificado no RBAC padrão da casa.
 
 export const getEletricaTasks = async (req: Request, res: Response) => {
-  const userId = (req as any).user.id;
-  if (!(await checkEletricaPermission(userId))) return res.status(403).json({ error: 'Acesso negado.' });
   try {
     // 🟢 JOIN também nas tarefas da elétrica
     const { rows } = await pool.query(`
@@ -160,8 +151,7 @@ export const getEletricaTasks = async (req: Request, res: Response) => {
 
 export const createEletricaTask = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  if (!(await checkEletricaPermission(userId))) return res.status(403).json({ error: 'Sem permissão.' });
-  
+
   // 🟢 Recebe op_code
   const { title, description, category, priority, checklist, tags, imageUrl, dueDate, op_code } = req.body;
   try {
@@ -190,8 +180,7 @@ export const createEletricaTask = async (req: Request, res: Response) => {
 export const updateEletricaTask = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
-  if (!(await checkEletricaPermission(userId))) return res.status(403).json({ error: 'Sem permissão.' });
-  
+
   const { title, description, category, priority, checklist, completed, tags, imageUrl, dueDate, op_code } = req.body;
   try {
     const fields: string[] = []; const values: any[] = []; let idx = 1;
@@ -233,7 +222,6 @@ export const updateEletricaTask = async (req: Request, res: Response) => {
 export const deleteEletricaTask = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
-  if (!(await checkEletricaPermission(userId))) return res.status(403).json({ error: 'Sem permissão.' });
   try {
     await pool.query('DELETE FROM eletrica_tasks WHERE id = $1', [id]);
     

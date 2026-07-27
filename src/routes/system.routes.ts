@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate, requirePermission } from '../middlewares/auth';
+import { authenticate, requirePermission, requireAdmin } from '../middlewares/auth';
 import { 
   getDashboardStats, 
   getManagerialReports, 
@@ -29,11 +29,14 @@ router.get('/reports/general', requirePermission('relatorios'), getGeneralReport
 router.get('/reports/available-dates', requirePermission('relatorios'), getAvailableDates);
 router.get('/transactions/recent', requirePermission('relatorios'), getRecentTransactions);
 
-// Logs
-router.get('/admin/logs', getAdminLogs);
+// Logs — page_key 'logs' (hoje só admin) em vez do check inline: comportamento idêntico,
+// mas DB-driven — a tela de Permissões pode conceder auditoria a outro papel sem mexer em código.
+router.get('/admin/logs', requirePermission('logs'), getAdminLogs);
 
 // Configurações do Sistema (Aviso de Login, etc.)
-router.get('/admin/settings', getSettings);    // <-- NOVA ROTA: Ler as definições
-router.put('/admin/settings', updateSetting);  // <-- NOVA ROTA: Guardar as definições
+// Leitura segue para qualquer logado (a tela de Config e avisos precisam ler);
+// ESCRITA é config global → gate de admin em tempo real.
+router.get('/admin/settings', getSettings);
+router.put('/admin/settings', requireAdmin, updateSetting);
 
 export default router;

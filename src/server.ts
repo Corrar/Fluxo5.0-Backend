@@ -22,7 +22,6 @@ import replenishmentsRouter from './routes/replenishments.routes';
 import systemRouter from './routes/system.routes'; 
 import tasksRouter from './routes/tasks.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
-import remindersRouter from './routes/reminders.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
 import trackingRoutes from './routes/tracking.routes';
@@ -140,10 +139,12 @@ app.use('/separations', separationsRouter);
 app.use('/travel-orders', travelsRouter);
 app.use('/replenishments', replenishmentsRouter);
 
-// Tarefas, Lembretes e Escritório
+// Tarefas e Escritório
+// (/reminders foi DESMONTADO: feature morta ponta-a-ponta — tabela inexistente, frontend
+// sem nenhuma chamada, sem page_key, e o CRUD não tinha ownership. Quando a tela de
+// lembretes nascer, volta com tabela + ownership + page_key desenhados juntos.)
 app.use('/tasks', tasksRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
-app.use('/reminders', remindersRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);
 

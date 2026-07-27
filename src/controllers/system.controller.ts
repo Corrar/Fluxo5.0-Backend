@@ -2,6 +2,8 @@ import { Request, Response } from 'express';
 // `query` (wrapper com retry de cold start do Neon) importado como `dbQuery`: várias funções deste
 // arquivo têm uma string SQL local chamada `query`/`let query`, e o nome cru colidiria (TDZ/shadow).
 import { pool, query as dbQuery } from '../db';
+import { createLog } from '../utils/logger';
+import { getClientIp } from '../utils/ip';
 
 /**
  * Busca estatísticas globais para os cards do Dashboard.
@@ -324,11 +326,8 @@ export const getGeneralReports = async (req: Request, res: Response) => {
  * Busca logs de auditoria para o administrador.
  */
 export const getAdminLogs = async (req: Request, res: Response) => {
-  const requesterId = (req as any).user.id;
+  // Autorização na rota: requirePermission('logs') — DB-driven, sem check inline aqui.
   try {
-    const adminCheck = await pool.query("SELECT role FROM profiles WHERE id = $1", [requesterId]);
-    if (adminCheck.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Acesso negado.' });
-
     const { action, user, startDate, endDate } = req.query;
     let query = `
       SELECT a.id, a.action, a.details, a.created_at, a.ip_address, 
@@ -382,11 +381,15 @@ export const updateSetting = async (req: Request, res: Response) => {
     // Usamos INSERT ... ON CONFLICT para inserir a configuração se ela não existir,
     // ou atualizá-la caso a 'key' já exista na tabela.
     await pool.query(
-      `INSERT INTO settings (key, value) 
-       VALUES ($1, $2) 
+      `INSERT INTO settings (key, value)
+       VALUES ($1, $2)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [key, String(value)]
     );
+
+    // Config global é ação sensível — fica no livro de auditoria como o resto da casa.
+    await createLog((req as any).user.id, 'UPDATE_SETTING', { key, value: String(value) }, getClientIp(req));
+
     res.json({ message: 'Configuração salva com sucesso!' });
   } catch (error: any) { 
     res.status(500).json({ error: 'Erro ao salvar a configuração' }); 

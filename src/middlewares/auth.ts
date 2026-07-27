@@ -118,27 +118,37 @@ export const requirePermission = (requiredAction: string) => {
   };
 };
 
-/**
- * Middleware 4: Gate de gestão de utilizadores (criar, mudar cargo, excluir).
- * Consulta o cargo em TEMPO REAL na base — não confia no role gravado no JWT:
- * um admin rebaixado continuaria com token antigo dizendo 'admin' até expirar.
- */
-export const canManageUsers = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void | Response> => {
-  try {
-    const requesterId = req.user?.id;
-    if (!requesterId) {
-      return res.status(401).json({ error: 'Utilizador não identificado na requisição.' });
-    }
+// Cargo consultado em TEMPO REAL na base — não confia no role gravado no JWT:
+// um admin rebaixado continuaria com token antigo dizendo 'admin' até expirar.
+async function isAdminNow(userId: string): Promise<boolean> {
+  const { rows } = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+  return rows[0]?.role?.toLowerCase().trim() === 'admin';
+}
 
-    const { rows } = await pool.query('SELECT role FROM profiles WHERE id = $1', [requesterId]);
-    const role = rows[0]?.role?.toLowerCase().trim();
-    if (role !== 'admin') {
-      return res.status(403).json({ error: 'Apenas administradores podem gerir utilizadores.' });
-    }
+// Fábrica dos gates de admin: mesmo esqueleto (401 sem id, 403 não-admin, 500 em erro),
+// muda só a mensagem do 403 — assim canManageUsers e requireAdmin não divergem nunca.
+const adminGate = (denyMessage: string) => {
+  return async (req: AuthRequest, res: Response, next: NextFunction): Promise<void | Response> => {
+    try {
+      const requesterId = req.user?.id;
+      if (!requesterId) {
+        return res.status(401).json({ error: 'Utilizador não identificado na requisição.' });
+      }
 
-    return next();
-  } catch (error) {
-    console.error("Erro no middleware canManageUsers:", error);
-    return res.status(500).json({ error: 'Erro interno ao validar autorizações de segurança.' });
-  }
+      if (!(await isAdminNow(requesterId))) {
+        return res.status(403).json({ error: denyMessage });
+      }
+
+      return next();
+    } catch (error) {
+      console.error("Erro no gate de admin:", error);
+      return res.status(500).json({ error: 'Erro interno ao validar autorizações de segurança.' });
+    }
+  };
 };
+
+/** Middleware 4: Gate de gestão de utilizadores (criar, mudar cargo, excluir). */
+export const canManageUsers = adminGate('Apenas administradores podem gerir utilizadores.');
+
+/** Middleware 5: Gate genérico de admin (ex.: PUT /admin/settings). */
+export const requireAdmin = adminGate('Apenas administradores podem executar esta ação.');

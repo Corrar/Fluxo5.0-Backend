@@ -167,7 +167,15 @@ export const deleteUser = async (req: Request, res: Response) => {
 
 export const heartbeat = async (req: Request, res: Response) => {
   const { id } = req.params;
-  try { 
+  const requester = (req as any).user;
+
+  // Só o próprio usuário (ou admin) registra atividade. Check pelo JWT, sem ida ao
+  // banco: heartbeat dispara a cada 5min pra todo logado e o dado é métrica, não acesso.
+  if (id !== requester.id && requester.role?.toLowerCase().trim() !== 'admin') {
+    return res.status(403).json({ error: 'Só é possível registrar a própria atividade.' });
+  }
+
+  try {
     await pool.query(`UPDATE users SET total_minutes = COALESCE(total_minutes, 0) + 1, last_active = NOW() WHERE id = $1`, [id]);
     res.json({ success: true }); 
   } catch (error) { 

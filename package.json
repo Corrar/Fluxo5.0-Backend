@@ -29,6 +29,7 @@
     "smoke:returns:total-cost": "ts-node src/smokes/smoke_returns_total_cost.ts",
     "smoke:returns:grao": "ts-node src/smokes/smoke_returns_grao.ts",
     "smoke:security:users": "ts-node src/smokes/smoke_security_users.ts",
+    "smoke:security:rbac": "ts-node src/smokes/smoke_security_rbac.ts",
     "smoke:returns:perop": "ts-node src/smokes/smoke_returns_perop_source.ts"
   },
   "devDependencies": {
