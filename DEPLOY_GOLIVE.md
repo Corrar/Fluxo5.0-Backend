@@ -103,6 +103,17 @@ outra linha e o saldo se fragmenta.
 
 ---
 
+## E) PISO DE VERSÃO — transporte Socket.IO
+
+Transporte Socket.IO era fail-open até `949e870` — go-live obrigatoriamente com este código ou posterior.
+
+Antes desse commit, o handler `join_room` aceitava qualquer sala vinda de socket **sem token**
+(inclusive `admin`), e token inválido degradava em silêncio para anônimo. Um cliente sem nenhuma
+credencial recebia `new_request_notification`, `new_request` e `new_audit_log` — o livro de auditoria
+em tempo real, com IP de admin. Conferir o SHA no ar por `GET /health` antes de liberar.
+
+---
+
 ## Ordem sugerida de go-live
 1. Rodar **§0 (auditoria)** em prod → saber exatamente o que falta.
 2. Aplicar migrations faltantes **004→010** (idempotentes) na ordem.
