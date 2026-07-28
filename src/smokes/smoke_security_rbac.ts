@@ -106,7 +106,9 @@ async function main(): Promise<void> {
     const l1 = await call('GET', '/admin/logs', { token: setorToken });
     check(l1.status === 403, 'não-admin lendo a auditoria → 403', `HTTP ${l1.status}: ${l1.data?.error}`);
     const l2 = await call('GET', '/admin/logs', { token: adminToken });
-    check(l2.status === 200 && Array.isArray(l2.data), 'admin lendo a auditoria → 200', `HTTP ${l2.status}`);
+    // Contrato v1 da Auditoria: envelope { logs, total, limit, offset } (era array cru).
+    check(l2.status === 200 && Array.isArray(l2.data?.logs) && typeof l2.data?.total === 'number',
+      'admin lendo a auditoria → 200 (envelope {logs,total})', `HTTP ${l2.status}`);
 
     // ── FURO 6: elétrica unificada no requirePermission ───────────────────────
     console.log('\n[FURO 6] /eletrica-tasks');

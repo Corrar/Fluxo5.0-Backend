@@ -322,35 +322,118 @@ export const getGeneralReports = async (req: Request, res: Response) => {
   }
 };
 
+// YYYY-MM-DD estrito + sanidade de calendário. O regex sozinho deixaria passar 2026-13-01 ou
+// 2026-02-30 — que estourariam 500 lá dentro, no cast ::date. A borda existe pra devolver 400.
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+const isValidYmd = (s: string): boolean => {
+  if (!YMD_RE.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+};
+
 /**
  * Busca logs de auditoria para o administrador.
+ * Contrato v1 da tela de Auditoria: envelope { logs, total, limit, offset } com filtros e
+ * paginação 100% server-side (o LIMIT fixo antigo cortava a história em 100 e o front não
+ * tinha como saber — filtrar array no cliente em cima disso é a armadilha mapeada no recon).
  */
 export const getAdminLogs = async (req: Request, res: Response) => {
   // Autorização na rota: requirePermission('logs') — DB-driven, sem check inline aqui.
   try {
-    const { action, user, startDate, endDate } = req.query;
-    let query = `
-      SELECT a.id, a.action, a.details, a.created_at, a.ip_address, 
-             COALESCE(p.name, u.email, 'Usuário Removido') as user_name, 
-             COALESCE(p.role::text, 'removido') as user_role
-      FROM audit_logs a 
-      LEFT JOIN users u ON a.user_id = u.id 
-      LEFT JOIN profiles p ON u.id = p.id 
-      WHERE 1=1
-    `;
+    const { action, user, q, startDate, endDate } = req.query;
+
+    // ── Validação NA BORDA: entrada inválida é 400 com mensagem clara, nunca 500 ──
+    // Filtros de texto: se vieram, têm que ser string única (?action=a&action=b chega como array).
+    for (const [name, value] of [['action', action], ['user', user], ['q', q]] as const) {
+      if (value !== undefined && typeof value !== 'string') {
+        return res.status(400).json({ error: `Parâmetro '${name}' inválido: envie um único valor.` });
+      }
+    }
+    // Datas: formato estrito. O valor NUNCA entra na SQL por concatenação — vira parâmetro $n::date.
+    for (const [name, value] of [['startDate', startDate], ['endDate', endDate]] as const) {
+      if (value !== undefined && (typeof value !== 'string' || !isValidYmd(value))) {
+        return res.status(400).json({ error: `Parâmetro '${name}' inválido: use data no formato YYYY-MM-DD (ex.: 2026-07-21).` });
+      }
+    }
+    // limit: default 50, teto 100. DECISÃO: acima do teto (ou 0) é 400, NÃO clamp — coerente com
+    // o resto da borda (malformado → 400) e um clamp silencioso esconderia bug de chamada do
+    // nosso próprio front (que é o único consumidor). offset: inteiro >= 0.
+    const DIGITS_RE = /^\d+$/;
+    const rawLimit = req.query.limit;
+    const rawOffset = req.query.offset;
+    let limit = 50;
+    if (rawLimit !== undefined) {
+      if (typeof rawLimit !== 'string' || !DIGITS_RE.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 100) {
+        return res.status(400).json({ error: "Parâmetro 'limit' inválido: use um inteiro entre 1 e 100." });
+      }
+      limit = Number(rawLimit);
+    }
+    let offset = 0;
+    if (rawOffset !== undefined) {
+      if (typeof rawOffset !== 'string' || !DIGITS_RE.test(rawOffset)) {
+        return res.status(400).json({ error: "Parâmetro 'offset' inválido: use um inteiro maior ou igual a 0." });
+      }
+      offset = Number(rawOffset);
+    }
+
+    // ── Filtros parametrizados, COMPARTILHADOS entre a página e o COUNT ──
+    const conditions: string[] = [];
     const params: any[] = [];
-    let paramIndex = 1;
+    if (action && action !== 'ALL') {
+      params.push(action);
+      conditions.push(`a.action = $${params.length}`);
+    }
+    if (user) {
+      params.push(`%${user}%`);
+      conditions.push(`(p.name ILIKE $${params.length} OR u.email ILIKE $${params.length})`);
+    }
+    if (q) {
+      // Busca livre no conteúdo do log (details é jsonb → ::text cobre chaves e valores).
+      // Curingas % e _ do termo não são escapados — busca literal por '100%' casa tudo. Aceito na v1.
+      params.push(`%${q}%`);
+      conditions.push(`a.details::text ILIKE $${params.length}`);
+    }
+    // Limitação conhecida: $n::date resolve no timezone da sessão (UTC no Neon) — o 'dia' do filtro é o dia UTC, não o local (UTC-3). Conversão pra fuso local = decisão futura.
+    if (startDate) {
+      params.push(startDate);
+      conditions.push(`a.created_at >= $${params.length}::date`);
+    }
+    if (endDate) {
+      // endDate INCLUSIVO via "< dia seguinte" — o '23:59:59' concatenado de antes, além de ser
+      // string na SQL, perdia registros no último segundo do dia.
+      params.push(endDate);
+      conditions.push(`a.created_at < ($${params.length}::date + interval '1 day')`);
+    }
+    const fromWhere = `
+      FROM audit_logs a
+      LEFT JOIN users u ON a.user_id = u.id
+      LEFT JOIN profiles p ON u.id = p.id
+      ${conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : ''}
+    `;
 
-    if (action && action !== 'ALL') { query += ` AND a.action = $${paramIndex}`; params.push(action); paramIndex++; }
-    if (user) { query += ` AND (p.name ILIKE $${paramIndex} OR u.email ILIKE $${paramIndex})`; params.push(`%${user}%`); paramIndex++; }
-    if (startDate) { query += ` AND a.created_at >= $${paramIndex}`; params.push(`${startDate} 00:00:00`); paramIndex++; }
-    if (endDate) { query += ` AND a.created_at <= $${paramIndex}`; params.push(`${endDate} 23:59:59`); paramIndex++; }
+    // total SEMPRE com os MESMOS filtros da página — é ele que dimensiona a paginação no front.
+    // dbQuery (não pool.query cru): leitura idempotente ganha o retry de cold start do Neon.
+    const pageParams = [...params, limit, offset];
+    const [countRes, dataRes] = await Promise.all([
+      dbQuery(`SELECT COUNT(*)::int AS total ${fromWhere}`, params),
+      dbQuery(
+        `SELECT a.id, a.action, a.details, a.created_at, a.ip_address,
+                COALESCE(p.name, u.email, 'Usuário Removido') as user_name,
+                COALESCE(p.role::text, 'removido') as user_role,
+                p.sector
+         ${fromWhere}
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
+        pageParams,
+      ),
+    ]);
+    // Desempate por a.id no ORDER BY: created_at empata (ex.: rajada de logins no mesmo ms) e,
+    // sem tiebreaker, páginas vizinhas podiam repetir/pular linhas entre requests.
 
-    query += ` ORDER BY a.created_at DESC LIMIT 100`;
-    const { rows } = await pool.query(query, params);
-    res.json(rows);
-  } catch (error: any) { 
-    res.status(500).json({ error: "Erro ao buscar logs" }); 
+    res.json({ logs: dataRes.rows, total: countRes.rows[0].total, limit, offset });
+  } catch (error: any) {
+    res.status(500).json({ error: "Erro ao buscar logs" });
   }
 };
 
