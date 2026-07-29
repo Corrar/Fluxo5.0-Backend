@@ -43,3 +43,22 @@ Hard-delete de usuário só é possível pra conta que nunca logou (LOGIN audita
 próprio). Sugestão v2 avaliada e NÃO adotada por ora: DELETE ignorar histórico só-LOGIN
 removeria do livro o registro de que a conta existiu — contra o princípio do livro
 append-only. Revisitar apenas se o 409 virar atrito operacional real.
+
+## Helpdesk: anexos de chamado fora da v1 — amarrado ao storage de arquivos
+
+Anexos de chamado (o print de erro do painelti prometia até 4 imagens) ficaram FORA da v1
+por decisão: o sistema não tem storage de arquivos — a decisão é a mesma do upload de
+imagens de produto (URL via VPS+Caddy ou R2/S3, nunca base64 no banco). É a ausência que o
+usuário final mais vai sentir; entra na carona quando o storage nascer, nos dois lugares.
+
+## Helpdesk: GET /tickets e /tickets/my sem paginação
+
+Volume esperado baixo (chamados de TI de ~15 contas). O envelope {tickets, total} já nasce
+pronto pra ganhar limit/offset depois sem quebrar consumidor (mesmo caminho do
+GET /admin/logs, que nasceu paginado por ser livro que só cresce — chamado encerra).
+
+## notifications (tabela órfã) segue órfã — por decisão
+
+A notificação do helpdesk v1 é SÓ o socket ticket_updated pra user:${requester} (cortesia,
+não garantia — offline refaz o GET ao abrir a tela). Sino in-app persistente lendo/escrevendo
+a tabela notifications é feature própria futura, não carona do helpdesk.

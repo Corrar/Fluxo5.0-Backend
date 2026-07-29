@@ -21,6 +21,7 @@ import travelsRouter from './routes/travels.routes';
 import replenishmentsRouter from './routes/replenishments.routes';
 import systemRouter from './routes/system.routes'; 
 import tasksRouter from './routes/tasks.routes';
+import ticketsRouter from './routes/tickets.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
@@ -151,6 +152,9 @@ app.use('/replenishments', replenishmentsRouter);
 // sem nenhuma chamada, sem page_key, e o CRUD não tinha ownership. Quando a tela de
 // lembretes nascer, volta com tabela + ownership + page_key desenhados juntos.)
 app.use('/tasks', tasksRouter);
+// Helpdesk v1 (migration 012): qualquer logado abre/acompanha os próprios chamados;
+// page_key 'chamados' atende. Gates finos vivem nas rotas/controller de tickets.
+app.use('/tickets', ticketsRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);

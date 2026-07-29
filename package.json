@@ -30,6 +30,7 @@
     "smoke:returns:grao": "ts-node src/smokes/smoke_returns_grao.ts",
     "smoke:security:users": "ts-node src/smokes/smoke_security_users.ts",
     "smoke:users": "ts-node src/smokes/smoke_users.ts",
+    "smoke:tickets": "ts-node src/smokes/smoke_tickets.ts",
     "smoke:security:rbac": "ts-node src/smokes/smoke_security_rbac.ts",
     "smoke:audit:logs": "ts-node src/smokes/smoke_audit_logs.ts",
     "smoke:permissions": "ts-node src/smokes/smoke_permissions.ts",
