@@ -1,7 +1,7 @@
 // src/controllers/users.controller.ts
 
 import { Request, Response } from 'express';
-import { pool } from '../db';
+import { pool, query as dbQuery } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { roleExistsInRbac } from '../services/rbac';
@@ -9,15 +9,42 @@ import bcrypt from 'bcryptjs';
 
 export const getUsers = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT u.id, u.email, u.is_active, COALESCE(p.name, u.email) as name, 
-             COALESCE(p.role, 'setor') as role, COALESCE(p.sector, '-') as sector, 
-             u.created_at, u.total_minutes, u.last_active
-      FROM users u LEFT JOIN profiles p ON u.id = p.id ORDER BY u.created_at DESC
-    `);
+    const requester = (req as any).user;
+
+    // Payload CONDICIONADO: total_minutes/last_active/is_active/email são dado de GESTÃO —
+    // o furo 4 tirou as métricas do payload do login e este GET as devolvia de graça pra
+    // QUALQUER logado. Cheio só pra quem tem a page_key 'usuarios' (mesma consulta do
+    // requirePermission, exceções de user_permissions inclusas) ou admin (mesmo bypass por
+    // JWT do requirePermission). Os demais recebem o payload MAGRO {id, name, role, sector} —
+    // suficiente pro consumidor conhecido (dropdown da aba Exceções de Permissões).
+    const safeRole = String(requester?.role ?? '').toLowerCase().trim();
+    let payloadCheio = safeRole === 'admin';
+    if (!payloadCheio) {
+      const perm = await dbQuery(
+        `SELECT 1 FROM role_permissions WHERE LOWER(role) = $1 AND page_key = 'usuarios'
+         UNION
+         SELECT 1 FROM user_permissions WHERE user_id = $2 AND page_key = 'usuarios'
+         LIMIT 1`,
+        [safeRole, requester.id],
+      );
+      payloadCheio = perm.rows.length > 0;
+    }
+
+    const { rows } = payloadCheio
+      ? await dbQuery(`
+          SELECT u.id, u.email, u.is_active, COALESCE(p.name, u.email) as name,
+                 COALESCE(p.role, 'setor') as role, COALESCE(p.sector, '-') as sector,
+                 u.created_at, u.total_minutes, u.last_active
+          FROM users u LEFT JOIN profiles p ON u.id = p.id ORDER BY u.created_at DESC
+        `)
+      : await dbQuery(`
+          SELECT u.id, COALESCE(p.name, u.email) as name,
+                 COALESCE(p.role, 'setor') as role, COALESCE(p.sector, '-') as sector
+          FROM users u LEFT JOIN profiles p ON u.id = p.id ORDER BY u.created_at DESC
+        `);
     res.json(rows);
-  } catch (error: any) { 
-    res.status(500).json({ error: 'Erro ao buscar usuários' }); 
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao buscar usuários' });
   }
 };
 
@@ -104,7 +131,10 @@ export const updateStatus = async (req: Request, res: Response) => {
     const actionName = is_active ? 'REACTIVATE_USER' : 'SUSPEND_USER';
     await createLog(requesterId, actionName, { target_user_id: id }, getClientIp(req), client);
     
-    if ((req as any).io) { (req as any).io.emit('user_status_changed', { userId: id, is_active }); }
+    // ESCOPADO (era io.emit global): suspensão é informação de gestão — todo logado ficava
+    // sabendo. Vai só pro ALVO (user:${id} — o front dele se desloga; é o único consumo que
+    // os dois fronts fazem hoje) e pra sala 'admin' (telas de gestão atualizarem no futuro).
+    if ((req as any).io) { (req as any).io.to(`user:${id}`).to('admin').emit('user_status_changed', { userId: id, is_active }); }
     res.json({ success: true, is_active });
   } catch (error: any) {
     res.status(500).json({ error: 'Erro ao alterar estado do utilizador' });
@@ -203,7 +233,12 @@ export const resetPassword = async (req: Request, res: Response) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    await client.query('UPDATE users SET encrypted_password = $1 WHERE id = $2', [hashedPassword, id]);
+    const result = await client.query('UPDATE users SET encrypted_password = $1 WHERE id = $2', [hashedPassword, id]);
+    // 404 honesto: id fantasma dava UPDATE de 0 linhas e devolvia success — o admin achava
+    // que trocou a senha de alguém e não trocou a de ninguém.
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Utilizador não encontrado.' });
+    }
 
     await createLog(requesterId, 'REDEFINIR_SENHA', { target_user_id: id }, getClientIp(req), client);
 

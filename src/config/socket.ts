@@ -5,6 +5,7 @@
 
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
+import { query as dbQuery } from '../db';
 import { setLoggerIo } from '../utils/logger';
 
 interface SocketUser {
@@ -41,16 +42,30 @@ export const initSocket = (httpServer: unknown, corsOptions: unknown): typeof io
   setLoggerIo(io);
 
   // Autenticação do handshake, FAIL-CLOSED: a identidade sai do JWT ou a conexão não acontece.
-  // Sem token e token inválido devolvem a MESMA mensagem — o cliente não descobre qual dos dois é.
-  io.use((socket, next) => {
+  // Sem token, token inválido E conta suspensa devolvem a MESMA mensagem — o cliente não
+  // descobre qual das verificações falhou.
+  io.use(async (socket, next) => {
     const token = extractToken(socket);
     if (!token) return next(new Error('Autenticação requerida'));
+    let user: SocketUser;
     try {
-      socket.data.user = jwt.verify(token, JWT_SECRET) as SocketUser;
-      return next();
+      user = jwt.verify(token, JWT_SECRET) as SocketUser;
     } catch {
       return next(new Error('Autenticação requerida'));
     }
+    // FURO 12 (espelho do authenticate HTTP): suspenso não conecta socket — sem este check,
+    // a conta suspensa seguiria RECEBENDO tempo real com o token vivo até ele expirar.
+    // Erro de banco também rejeita (fail-closed, igual ao HTTP).
+    try {
+      const { rows } = await dbQuery('SELECT is_active FROM users WHERE id = $1', [user.id]);
+      if (rows.length === 0 || rows[0].is_active === false) {
+        return next(new Error('Autenticação requerida'));
+      }
+    } catch {
+      return next(new Error('Autenticação requerida'));
+    }
+    socket.data.user = user;
+    return next();
   });
 
   io.on('connection', (socket) => {

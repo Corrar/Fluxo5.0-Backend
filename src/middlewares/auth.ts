@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { pool } from '../db'; // Necessário para a consulta de permissões
+// `query` (wrapper com retry de cold start) importado como `dbQuery`: leituras por PK aqui
+// rodam em TODA request — pool.query cru é a classe do 500 intermitente do /separations.
+import { pool, query as dbQuery } from '../db';
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { throw new Error('JWT_SECRET ausente no ambiente — abortando boot por segurança'); }
@@ -15,23 +17,45 @@ export interface AuthRequest extends Request {
  * Middleware 1: Verifica se o utilizador está logado (Valida o Token JWT)
  * Deve ser o primeiro a ser chamado em qualquer rota protegida.
  */
-export const authenticate = (req: AuthRequest, res: Response, next: NextFunction): void | Response => {
+export const authenticate = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void | Response> => {
   const authHeader = req.headers.authorization;
-  
+
   if (!authHeader) {
     return res.status(401).json({ error: 'Token de autenticação não fornecido.' });
   }
 
   const token = authHeader.split(' ')[1];
-  
+
+  let decoded: any;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    // Injeta os dados do token (id, email, role) no Request para as próximas funções
-    req.user = decoded; 
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (err) {
     return res.status(401).json({ error: 'Token inválido ou expirado. Faça login novamente.' });
   }
+
+  // FURO 12: is_active só era checado no LOGIN — um token vivo (validade 1 dia) de conta
+  // suspensa passava em TODA a API até expirar. O check vive AQUI porque todos os gates
+  // (requirePermission, canManageUsers...) rodam DEPOIS do authenticate: fecha a API inteira
+  // de uma vez, incluindo rotas de authenticate puro.
+  try {
+    const { rows } = await dbQuery('SELECT is_active FROM users WHERE id = $1', [decoded.id]);
+    if (rows.length === 0) {
+      // Conta apagada com token ainda vivo: a sessão não corresponde a usuário nenhum.
+      return res.status(401).json({ error: 'Token inválido ou expirado. Faça login novamente.' });
+    }
+    if (rows[0].is_active === false) {
+      return res.status(403).json({ error: 'Conta suspensa.' });
+    }
+  } catch (dbErr) {
+    // FAIL-CLOSED: sem resposta do banco não dá pra afirmar que a conta está ativa —
+    // deixar passar reabriria o furo exatamente quando o sistema está degradado.
+    console.error('authenticate: falha ao verificar is_active:', dbErr);
+    return res.status(500).json({ error: 'Erro interno ao validar a sessão.' });
+  }
+
+  // Injeta os dados do token (id, email, role) no Request para as próximas funções
+  req.user = decoded;
+  next();
 };
 
 /**

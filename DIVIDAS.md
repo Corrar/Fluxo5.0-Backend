@@ -1,0 +1,38 @@
+# Dívidas técnicas — Fluxo Royale 5.0 (Backend)
+
+Registro nomeado das dívidas aceitas conscientemente, com o porquê e o caminho de saída.
+(Dívidas menores vivem como comentários no ponto exato do código; aqui ficam as que precisam
+de decisão ou de trabalho estrutural futuro. Padrão espelhado do DIVIDAS.md do front.)
+
+## users.role — coluna ENUM vestigial (fonte dupla latente)
+
+`users.role` (ENUM `user_role`, default 'setor') é vestígio: TODOS os gates e o login usam
+`profiles.role` (text), e o `updateRole` não toca `users.role` — as duas colunas divergem
+silenciosamente a cada troca de cargo. Nada lê a coluna hoje, mas ela é uma armadilha pra
+quem for consultar "o papel" direto de `users`. Saída: migração futura derruba a coluna
+(ou a sincroniza e documenta qual é a fonte).
+
+## profiles.total_minutes / profiles.last_active — duplicados vestigiais
+
+O heartbeat escreve métricas em `users.total_minutes`/`users.last_active`; as colunas
+homônimas de `profiles` não são escritas por ninguém e ficam congeladas. Mesma classe da
+dívida acima: fonte dupla latente, migração futura remove.
+
+## Troca obrigatória de senha no 1º login — não existe
+
+A criação de usuário (POST /auth/register) entrega uma senha DEFINIDA PELO ADMIN e nada
+força o usuário a trocá-la no primeiro acesso (não há campo `must_change_password` nem
+fluxo de troca). Decisão consciente da v1 da tela de Usuários (28/07/2026). Saída futura:
+coluna + check no login + tela de troca.
+
+## updateStatus / resetPassword — gate inline em vez de canManageUsers
+
+Os dois handlers checam admin em tempo real INLINE (mesmo efeito do middleware
+`canManageUsers` usado nas rotas vizinhas, mensagens levemente diferentes). Cosmético;
+unificar no middleware quando estes handlers forem tocados de novo.
+
+## authenticate consulta is_active por request — custo aceito (furo 12)
+
+authenticate agora consulta is_active por request (fail-closed). Custo: 1 query/request —
+irrelevante em 15 usuários; se doer em escala, cache curto (30-60s) invalidado pelo
+updateStatus.
