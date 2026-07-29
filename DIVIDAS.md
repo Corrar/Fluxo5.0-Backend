@@ -36,3 +36,10 @@ unificar no middleware quando estes handlers forem tocados de novo.
 authenticate agora consulta is_active por request (fail-closed). Custo: 1 query/request —
 irrelevante em 15 usuários; se doer em escala, cache curto (30-60s) invalidado pelo
 updateStatus.
+
+## Hard-delete de usuário só pra conta que nunca logou
+
+Hard-delete de usuário só é possível pra conta que nunca logou (LOGIN audita com o id do
+próprio). Sugestão v2 avaliada e NÃO adotada por ora: DELETE ignorar histórico só-LOGIN
+removeria do livro o registro de que a conta existiu — contra o princípio do livro
+append-only. Revisitar apenas se o 409 virar atrito operacional real.
