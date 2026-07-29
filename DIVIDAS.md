@@ -57,6 +57,25 @@ Volume esperado baixo (chamados de TI de ~15 contas). O envelope {tickets, total
 pronto pra ganhar limit/offset depois sem quebrar consumidor (mesmo caminho do
 GET /admin/logs, que nasceu paginado por ser livro que só cresce — chamado encerra).
 
+## tasks: guard de OP encerrada compara valores fantasmas
+
+O create/update de tasks (e eletrica_tasks) rejeita OP com status 'finalizada'/'encerrada',
+mas os status REAIS em uso em client_services são 'em_andamento'/'concluido' — o guard
+nunca dispara ('concluido' passa). Mesma família dos guards de OP fechada já registrados.
+Corrigir quando o Quadro de Tarefas for atacado.
+
+## tasks: completed/completed_at inexistentes na tabela
+
+O updateTask escreve completed/completed_at, colunas que NÃO existem em tasks (eletrica_tasks
+tem) — PUT com completed → erro SQL 500. O CRUD nunca rodou de verdade (0 linhas). Decidir o
+destino da tabela (migration corretiva vs status com CHECK) junto com o Quadro de Tarefas.
+
+## dev_projects: capa/anexos fora da v1 — mesma dívida de storage
+
+O mock de projetos prometia capa e anexos (DataURL local). Ficaram fora — mesma dívida de
+storage do helpdesk e das imagens de produto (URL via VPS+Caddy ou R2/S3, nunca base64).
+Entram na carona quando o storage nascer.
+
 ## notifications (tabela órfã) segue órfã — por decisão
 
 A notificação do helpdesk v1 é SÓ o socket ticket_updated pra user:${requester} (cortesia,

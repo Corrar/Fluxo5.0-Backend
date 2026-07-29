@@ -22,6 +22,7 @@ import replenishmentsRouter from './routes/replenishments.routes';
 import systemRouter from './routes/system.routes'; 
 import tasksRouter from './routes/tasks.routes';
 import ticketsRouter from './routes/tickets.routes';
+import devProjectsRouter from './routes/dev-projects.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
@@ -155,6 +156,9 @@ app.use('/tasks', tasksRouter);
 // Helpdesk v1 (migration 012): qualquer logado abre/acompanha os próprios chamados;
 // page_key 'chamados' atende. Gates finos vivem nas rotas/controller de tickets.
 app.use('/tickets', ticketsRouter);
+// dev-projetos v1 (migration 013): projetos internos do dev — router inteiro atrás de
+// requirePermission('projetos'); tasks (Quadro de Tarefas de produção) fica intocada.
+app.use('/dev-projects', devProjectsRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);
