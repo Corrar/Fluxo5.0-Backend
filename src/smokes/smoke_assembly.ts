@@ -40,6 +40,9 @@ import net from 'net';
 const SENHA_SEED = 'Teste@123';
 const OP_A = '73001';
 const OP_B = '88210';
+// Origem usada só no teste de preflight. localhost:5173 é o dev do front e está na allowlist
+// tanto local quanto no Render (conferido) — serve pros dois alvos sem virar config.
+const ORIGEM_TESTE = 'http://localhost:5173';
 let BASE = process.env.SMOKE_BASE_URL ?? '';
 
 const failures: string[] = [];
@@ -175,6 +178,29 @@ async function main(): Promise<void> {
     );
     if (ancora.rows.length === 0) throw new Error('nenhum separation_item no seed pra ancorar o recebido — abortando.');
     const { item_id: itemId, separation_id: sepId, product_id: produtoId, sku } = ancora.rows[0];
+
+    // ── [PREFLIGHT] a VIA DO NAVEGADOR — regra nova da casa (30/07/2026) ─────
+    // Endpoint que exige header customizado TEM que ter esse header na allowlist do CORS. Sem
+    // isso o preflight responde 204 mas o navegador BLOQUEIA o POST real e o backend nem é
+    // chamado — erro que curl e smoke NÃO enxergam, porque nenhum dos dois passa por CORS. Foi
+    // exatamente o que aconteceu com os três POSTs do armazém (receive/consume/transfer) desde a
+    // peça 1: passavam em todo teste e estavam quebrados na única via que o usuário usa.
+    console.log('\n[PREFLIGHT] CORS libera o header que o endpoint exige?');
+    const pre = await fetch(`${BASE}/op-materials/consume`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: ORIGEM_TESTE,
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'x-idempotency-key',
+      },
+    });
+    const allowHeaders = String(pre.headers.get('access-control-allow-headers') ?? '');
+    check(pre.status === 204 || pre.status === 200, 'preflight do consume responde', `HTTP ${pre.status}`);
+    check(
+      allowHeaders.toLowerCase().includes('x-idempotency-key'),
+      'Access-Control-Allow-Headers inclui x-idempotency-key (sem isso o navegador bloqueia receive/consume/transfer)',
+      allowHeaders || '(cabeçalho ausente)',
+    );
 
     // ── [GATE] router inteiro atrás de 'montagem' ────────────────────────────
     console.log('\n[GATE] chave própria montagem');

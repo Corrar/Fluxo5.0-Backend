@@ -93,7 +93,12 @@ const corsOptions = {
     return callback(new Error('Bloqueio CORS: Origem não permitida'), false);
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  // X-Idempotency-Key É OBRIGATÓRIO em POST /op-materials/{receive,consume,transfer}. Sem ele
+  // nesta lista o preflight responde 204 mas NÃO autoriza o header, e o navegador BLOQUEIA o
+  // POST real — o operador vê "sem conexão com o servidor" e o backend nem é chamado. Bug
+  // pré-existente da peça 1: só aparecia pelo navegador (curl e smokes não passam por CORS),
+  // e foi encontrado ao ligar a Montagem, que aponta consumo pela tela.
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key'],
   credentials: true // Importante para cookies ou tokens de sessão
 };
 app.use(cors(corsOptions));
