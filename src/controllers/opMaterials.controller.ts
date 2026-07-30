@@ -12,6 +12,10 @@
 import { Request, Response } from 'express';
 import { pool, withTransaction } from '../db';
 import type { PoolClient } from 'pg';
+// Montagem v1 (016): o consume valida a ETIQUETA de máquina sem duplicar a regra de quem é dona.
+import { machinePorId } from './assembly.controller';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Erro de regra de negócio -> 400 (espelha o StockError do motor: mensagem pronta pro operador).
 class OpMatError extends Error {
@@ -159,9 +163,15 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
 
 // ==========================================================================
 // b) POST /op-materials/consume — o apontamento do montador (peça a peça).
+//
+// machineId é OPCIONAL (migration 016, Montagem v1): ETIQUETA o evento com a máquina que
+// recebeu o material. É DIMENSÃO, não eixo — repare no que NÃO mudou abaixo: o op_key, o
+// pré-check de replay, o advisory lock `opmat:<OP>:<produto>` e o guard de projeção continuam
+// exatamente como estavam. Saldo por máquina seria a mesma classe de erro do op_id no stock.
+// Consumo SEM machineId segue válido (machine_id NULL) — retrocompatível por decisão.
 // ==========================================================================
 export const consumeOpMaterial = async (req: Request, res: Response) => {
-  const { clientServiceId, productId, qty } = req.body ?? {};
+  const { clientServiceId, productId, qty, machineId } = req.body ?? {};
   const userId = (req as any).user?.id ?? null;
   const idemKey = idemFrom(req);
   const quantidade = num(qty);
@@ -172,12 +182,33 @@ export const consumeOpMaterial = async (req: Request, res: Response) => {
     if (!(quantidade > 0)) throw new OpMatError('QTD_INVALIDA', 'Quantidade precisa ser maior que zero.');
     if (!idemKey) throw new OpMatError('IDEMPOTENCY_KEY_OBRIGATORIA', 'Header X-Idempotency-Key é obrigatório neste endpoint.');
 
+    // Etiqueta opcional. Validada ANTES da transação: é regra de entrada, não de saldo.
+    let maquinaId: string | null = null;
+    if (machineId !== undefined && machineId !== null && String(machineId).trim() !== '') {
+      maquinaId = String(machineId).trim();
+      if (!UUID_RE.test(maquinaId)) throw new OpMatError('MAQUINA_INVALIDA', 'machineId inválido.');
+      const maq = await machinePorId(maquinaId);
+      if (!maq) throw new OpMatError('MAQUINA_NAO_ENCONTRADA', 'Máquina não encontrada.');
+      // ⚠ GUARD DE INTEGRIDADE CENTRAL: a árvore da máquina NUNCA mistura OP. Sem ele, um
+      // consumo da OP-B etiquetado com máquina da OP-A criaria uma ficha técnica que o razão
+      // da OP-A não sustenta — número bonito e mentiroso, que é o que esta peça inteira evita.
+      if (String(maq.client_service_id) !== String(clientServiceId)) {
+        throw new OpMatError('MAQUINA_DE_OUTRA_OP',
+          `Máquina pertence à OP ${maq.client_service_id}, consumo é da OP ${clientServiceId}. A árvore de uma máquina só recebe material da própria OP.`);
+      }
+      // Futuro-proof: hoje não há caminho pra 'concluida' (v1 recusa a transição), mas quando a
+      // v2 congelar a ficha, apontar material numa máquina fechada tem que doer aqui.
+      if (maq.status === 'concluida') {
+        throw new OpMatError('MAQUINA_CONCLUIDA', 'Máquina concluída não recebe mais material.');
+      }
+    }
+
     const opKey = `opmat:cons:${idemKey}`;
 
     const result = await withTransaction(async (client) => {
       // 1. PRÉ-CHECK antes de tudo (mesma razão do receive: replay não pode brigar com o guard de saldo).
       const ja = await client.query(
-        `SELECT id, event_type, client_service_id, product_id, qty, created_at FROM op_material_events WHERE op_key = $1`,
+        `SELECT id, event_type, client_service_id, product_id, qty, machine_id, created_at FROM op_material_events WHERE op_key = $1`,
         [opKey],
       );
       if (ja.rows.length > 0) return { evento: ja.rows[0], idempotent: true };
@@ -208,10 +239,10 @@ export const consumeOpMaterial = async (req: Request, res: Response) => {
       }
 
       const ins = await client.query(
-        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key)
-         VALUES ('consumido', $1, $2, $3, $4, $5)
-         RETURNING id, event_type, client_service_id, product_id, qty, created_at`,
-        [clientServiceId, productId, quantidade, userId, opKey],
+        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key, machine_id)
+         VALUES ('consumido', $1, $2, $3, $4, $5, $6)
+         RETURNING id, event_type, client_service_id, product_id, qty, machine_id, created_at`,
+        [clientServiceId, productId, quantidade, userId, opKey, maquinaId],
       );
       return { evento: ins.rows[0], saldoRestante: saldo - quantidade, idempotent: false };
     });

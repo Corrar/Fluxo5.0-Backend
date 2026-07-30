@@ -81,3 +81,31 @@ Entram na carona quando o storage nascer.
 A notificação do helpdesk v1 é SÓ o socket ticket_updated pra user:${requester} (cortesia,
 não garantia — offline refaz o GET ao abrir a tela). Sino in-app persistente lendo/escrevendo
 a tabela notifications é feature própria futura, não carona do helpdesk.
+
+## ordens_producao — tabela rival órfã (candidata ao destino do dev_tasks)
+
+`ordens_producao` (numero_op, cliente_nome, status, closed_at) tem **0 linhas**, nenhuma FK
+apontando pra ela e nenhuma rota: é uma "OP" concorrente da `client_services`, que é a OP viva
+de todo o sistema (razão de material, separações, retornos, projetos, máquinas). Manter duas
+noções de OP é o tipo de ambiguidade que um dia vira bug de relatório. Destino provável: DROP
+com **guarda de premissa** (padrão da 014) quando o Bruno decidir — não antes, porque tabela
+vazia não incomoda ninguém e a decisão é dele.
+
+## Montagem v1: parada NÃO trava consumo e NÃO notifica
+
+Duas decisões conscientes da v1 (migration 016):
+- **Parada é sinalização de gestão, não bloqueio de material.** Uma máquina `parada` continua
+  aceitando consumo etiquetado — o razão responde por saldo, a máquina por andamento, e misturar
+  os dois faria o status de uma tela travar a contabilidade de outra. Se a trava for desejada,
+  ela nasce no consume com mensagem própria, e é decisão de v2.
+- **Sem notificação persistente.** O mock prometia avisar Compras/Financeiro/Comercial/PCP; a
+  v1 grava `stopped_sector` e para por aí, porque `notifications` segue órfã por decisão (ver
+  acima). Quando o sino in-app nascer, a parada é o primeiro assinante natural.
+
+## Montagem v1: a árvore soma só 'consumido'
+
+A árvore do produto (GET /assembly-machines/:id) é `SUM(qty)` dos eventos `consumido` com
+`machine_id = X`. `devolvido` e `transferido_out/in` **ainda não carregam machine_id** — a
+etiqueta nasceu no consume. Subtrair devolução da árvore hoje daria um número que o razão não
+sustenta. Quando o evento de devolução for etiquetado, a fórmula ganha o sinal — e o comentário
+do `getMachine` precisa mudar junto (está escrito lá).

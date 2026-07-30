@@ -24,6 +24,7 @@ import tasksRouter from './routes/tasks.routes';
 import ticketsRouter from './routes/tickets.routes';
 import devProjectsRouter from './routes/dev-projects.routes';
 import devDashboardRouter from './routes/dev-dashboard.routes';
+import assemblyRouter from './routes/assembly.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
@@ -143,6 +144,10 @@ app.use('/producao-3d', producao3dRouter);
 
 // Módulo Produção: armazém de material por OP (recebimento do setor + apontamento do montador)
 app.use('/op-materials', opMaterialsRouter);
+// Montagem de Máquinas v1 (migration 016): a máquina é entidade PRÓPRIA e pertence a uma OP;
+// no razão de material ela é ETIQUETA (op_material_events.machine_id), nunca eixo — a projeção
+// de saldo e o advisory lock seguem por (OP, produto). Gate: requirePermission('montagem').
+app.use('/assembly-machines', assemblyRouter);
 
 // Movimentações Avançadas e Operacional
 app.use('/separations', separationsRouter);
