@@ -327,9 +327,36 @@ async function main(): Promise<void> {
     if (manutId) {
       const dm = await call('DELETE', `/printers-3d/${impressoraId}/maintenances/${manutId}`, { token: adminToken });
       check(dm.status === 200, 'DELETE da manutenção → 200', `HTTP ${dm.status}`);
+
+      // ── [ÓRFÃ] excluir a impressora de referência limpa o settings ────────────
+      // Pré-condição explícita: ela AINDA é a padrão neste ponto (o caso canônico a definiu).
+      console.log('\n[ÓRFÃ] a impressora de referência sai e leva a configuração junto');
+      const antes = await pool.query(`SELECT value FROM settings WHERE key = 'impressora_padrao_3d'`);
+      check(antes.rows[0]?.value === impressoraId, 'pré-condição: a excluída É a impressora de referência', String(antes.rows[0]?.value).slice(0, 8));
+
       const dp = await call('DELETE', `/printers-3d/${impressoraId}`, { token: adminToken });
       check(dp.status === 200, 'DELETE da impressora (sem manutenções) → 200', `HTTP ${dp.status}`);
       if (dp.status === 200) impressorasCriadas.length = 0; // já saiu pela rota
+
+      const depois = await pool.query(`SELECT value FROM settings WHERE key = 'impressora_padrao_3d'`);
+      check(depois.rows[0]?.value === '', 'settings impressora_padrao_3d ficou vazio (sem UUID morto)', JSON.stringify(depois.rows[0]?.value));
+
+      // E o efeito na ponta: sem impressora, energia volta a NULL com alerta — nunca zero.
+      const pOrfa = await call('GET', '/producao-3d/pricing', { token: adminToken });
+      check(pOrfa.data?.impressora_configurada === false && pOrfa.data?.impressora === null,
+        'pricing volta ao estado honesto: impressora não configurada', String(pOrfa.data?.impressora_configurada));
+      const alvo = (pOrfa.data?.pecas || []).find((p: any) => p.id === pecaId);
+      check(alvo?.custo?.energia === null && alvo?.custo?.total === null,
+        'energia e total voltam a NULL (não viram zero)', JSON.stringify(alvo?.custo));
+      check(Array.isArray(alvo?.alertas) && alvo.alertas.includes('SEM_IMPRESSORA'),
+        'alerta SEM_IMPRESSORA na peça', JSON.stringify(alvo?.alertas));
+
+      // O log tem que dizer que a configuração mudou — senão a referência some sem dono.
+      const logOrfa = await pool.query(
+        `SELECT details FROM audit_logs WHERE action = 'EXCLUIR_IMPRESSORA'
+          ORDER BY created_at DESC LIMIT 1`);
+      check(logOrfa.rows[0]?.details?.era_padrao === true,
+        'EXCLUIR_IMPRESSORA registra era_padrao = true', JSON.stringify(logOrfa.rows[0]?.details?.era_padrao));
     }
 
     // Restaura a peça sem filamento (foto tirada no início).

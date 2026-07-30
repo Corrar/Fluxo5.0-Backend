@@ -10,6 +10,11 @@
 // MANUTENÇÃO É SÓ REGISTRO NA v1: o `cost` é gravado pra que o rateio da v2 tenha história, mas
 // NENHUM cálculo desta versão o usa. Registrar sem ratear é honesto; ratear sem base de horas
 // seria inventar número.
+//
+// O DELETE LIMPA A REFERÊNCIA: excluir a impressora escolhida como padrão zera o settings
+// 'impressora_padrao_3d' na MESMA transação, e o log carrega `era_padrao`. Deixar o UUID morto
+// não produzia número errado (o LEFT JOIN do pricing devolve "não configurada"), mas apontar
+// pra uma linha que não existe é dívida esperando virar bug.
 
 import { Request, Response } from 'express';
 import { query as dbQuery, withTransaction } from '../db';
@@ -197,7 +202,15 @@ export const deletePrinter = async (req: Request, res: Response) => {
       const n = await client.query('SELECT count(*)::int AS n FROM printer_maintenances WHERE printer_id = $1', [id]);
       if (n.rows[0].n > 0) return { conflito: n.rows[0].n, display_no: cur.rows[0].display_no } as any;
       await client.query('DELETE FROM printers_3d WHERE id = $1', [id]);
-      return { ok: true, display_no: cur.rows[0].display_no, name: cur.rows[0].name } as any;
+      // A impressora de referência sai junto se for esta. Um UUID morto em settings não mente
+      // pro usuário — o LEFT JOIN do pricing devolve "não configurada" e a energia fica em
+      // branco, que é o estado honesto — mas é sujeira, e sujeira que se limpa na fonte. O
+      // `AND value = $1` é o que torna isto cirúrgico: só apaga se a padrão for a excluída.
+      const cfg = await client.query(
+        `UPDATE settings SET value = '' WHERE key = 'impressora_padrao_3d' AND value = $1 RETURNING key`,
+        [id],
+      );
+      return { ok: true, display_no: cur.rows[0].display_no, name: cur.rows[0].name, eraPadrao: (cfg.rowCount ?? 0) > 0 } as any;
     });
 
     if (out?.notFound) return res.status(404).json({ error: 'Impressora não encontrada.' });
@@ -206,7 +219,10 @@ export const deletePrinter = async (req: Request, res: Response) => {
         error: `Esta impressora tem ${out.conflito} manutenção(ões) registrada(s) e não pode ser excluída — o histórico de gastos morreria junto. Marque como "inativa" para tirá-la de circulação.`,
       });
     }
-    await createLog(userId, 'EXCLUIR_IMPRESSORA', { id, display_no: out.display_no, name: out.name }, getClientIp(req));
+    // era_padrao vai no log porque a exclusão MUDOU a configuração do cálculo. Sem isso, a
+    // impressora de referência ficaria vazia sem nenhum registro de quem a esvaziou.
+    await createLog(userId, 'EXCLUIR_IMPRESSORA',
+      { id, display_no: out.display_no, name: out.name, era_padrao: !!out.eraPadrao }, getClientIp(req));
     return res.json({ success: true });
   } catch (error: any) {
     console.error('deletePrinter:', error?.message ?? error);
