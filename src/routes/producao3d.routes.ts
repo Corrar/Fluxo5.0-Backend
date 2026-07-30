@@ -11,6 +11,7 @@ import {
   createProduction, // <-- ADICIONADO: Importação da função de criar
   deleteProduction  // <-- ADICIONADO: Importação da função de apagar
 } from '../controllers/producao3d.controller';
+import { getPricing, updatePartPricing } from '../controllers/pricing3d.controller';
 import { authenticate, requirePermission } from '../middlewares/auth';
 
 const router = Router();
@@ -28,8 +29,20 @@ router.use(authenticate);
 // Lista todos os produtos marcados com 'is_3d = true'
 router.get('/parts', get3DParts);
 
-// Atualiza detalhes técnicos (tempo, filamento, foto) de uma peça específica
-router.put('/parts/:id', update3DPartDetails);
+// Atualiza detalhes técnicos (tempo, filamento, foto) de uma peça específica.
+// 🔒 FURO FECHADO (migration 017): esta rota aceitava QUALQUER logado editando a ficha técnica de
+// QUALQUER peça — sem gate nenhum além do login. Como os mesmos campos (filament_grams,
+// production_minutes) agora alimentam o CUSTO, mexer neles é mexer em preço. Passa a exigir
+// 'producao_3d', a mesma chave das abas novas.
+router.put('/parts/:id', requirePermission('producao_3d'), update3DPartDetails);
+
+// ==========================================
+// 💰 PRECIFICAÇÃO (aba nova — migration 017)
+// ==========================================
+// A fórmula canônica vive no controller e SÓ lá: o front exibe, não calcula.
+router.get('/pricing', requirePermission('producao_3d'), getPricing);
+// Ficha técnica + margem (+ aplicar preço, que RECALCULA no servidor e ignora preço do body).
+router.put('/parts/:id/pricing', requirePermission('producao_3d'), updatePartPricing);
 
 // ==========================================
 // 📋 DEMANDAS KANBAN (Conectado às Solicitações)

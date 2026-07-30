@@ -33,6 +33,7 @@
     "smoke:tickets": "ts-node src/smokes/smoke_tickets.ts",
     "smoke:devprojects": "ts-node src/smokes/smoke_dev_projects.ts",
     "smoke:devdashboard": "ts-node src/smokes/smoke_dev_dashboard.ts",
+    "smoke:pricing3d": "ts-node src/smokes/smoke_pricing3d.ts",
     "smoke:assembly": "ts-node src/smokes/smoke_assembly.ts",
     "smoke:security:rbac": "ts-node src/smokes/smoke_security_rbac.ts",
     "smoke:audit:logs": "ts-node src/smokes/smoke_audit_logs.ts",

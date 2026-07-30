@@ -25,6 +25,7 @@ import ticketsRouter from './routes/tickets.routes';
 import devProjectsRouter from './routes/dev-projects.routes';
 import devDashboardRouter from './routes/dev-dashboard.routes';
 import assemblyRouter from './routes/assembly.routes';
+import printers3dRouter from './routes/printers3d.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
@@ -146,6 +147,9 @@ app.use('/clients', clientsRouter);
 
 // Módulo de Produção 3D (Fábrica)
 app.use('/producao-3d', producao3dRouter);
+// Registro de Valores 3D (migration 017): impressoras + manutenções, atrás de
+// requirePermission('producao_3d') — a chave que existia no universo e não gateava nada.
+app.use('/printers-3d', printers3dRouter);
 
 // Módulo Produção: armazém de material por OP (recebimento do setor + apontamento do montador)
 app.use('/op-materials', opMaterialsRouter);
