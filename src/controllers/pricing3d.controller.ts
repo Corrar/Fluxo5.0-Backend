@@ -102,11 +102,17 @@ const num = (v: any): number | null => (v === null || v === undefined ? null : N
 // ── GET /producao-3d/pricing — a aba Precificação inteira numa chamada ───────
 export const getPricing = async (_req: Request, res: Response) => {
   try {
-    const [linhas, cfg] = await Promise.all([
+    const [linhas, cfg, filamentos] = await Promise.all([
       dbQuery(PRICING_SQL, [], { retryable: true }),
       dbQuery(`WITH ${CFG_SQL}
                SELECT cfg.tarifa, pr.id AS printer_id, pr.display_no, pr.name, pr.power_watts, pr.status
                  FROM cfg LEFT JOIN printers_3d pr ON pr.id = cfg.printer_id`, [], { retryable: true }),
+      // As bobinas disponíveis pro vínculo. Vive AQUI porque o GET /products não devolve a flag
+      // is_filament (é view de outro módulo, com outro contrato) — e as duas abas novas precisam
+      // exatamente desta lista: o dropdown da Precificação e a seção Filamentos do Registro de
+      // Valores. Uma fonte só, o mesmo gate.
+      dbQuery(`SELECT id, sku, name, unit, unit_price::float8 AS preco_kg
+                 FROM products WHERE is_filament = true AND active = true ORDER BY name`, [], { retryable: true }),
     ]);
 
     const c = cfg.rows[0] ?? {};
@@ -150,6 +156,7 @@ export const getPricing = async (_req: Request, res: Response) => {
       tarifa_configurada: tarifaOk,
       impressora,
       impressora_configurada: !!impressora,
+      filamentos: filamentos.rows,
       pecas,
       total: pecas.length,
       gerado_em: new Date().toISOString(),

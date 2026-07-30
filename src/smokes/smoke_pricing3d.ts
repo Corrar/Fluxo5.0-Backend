@@ -263,6 +263,11 @@ async function main(): Promise<void> {
     check(perto(L?.preco_venda, ESP_VENDA), `preco_venda = ${ESP_VENDA} — total × 1,40`, String(L?.preco_venda));
     check(perto(L?.preco_venda_arredondado, ESP_GRAVADO), `preco_venda_arredondado = ${ESP_GRAVADO} (o que vai pro sales_price)`, String(L?.preco_venda_arredondado));
     check(L?.filament?.sku === SKU_FILAMENTO && perto(L?.filament?.preco_kg, 89), 'filamento vinculado com preço/kg do próprio produto', `${L?.filament?.sku} R$ ${L?.filament?.preco_kg}`);
+    // A lista de bobinas viaja no envelope: é a fonte do dropdown de vínculo e da seção
+    // Filamentos (o GET /products não devolve a flag is_filament).
+    const bobinas = pr.data?.filamentos || [];
+    check(bobinas.length >= 2 && bobinas.some((b: any) => b.sku === SKU_FILAMENTO) && perto(bobinas.find((b: any) => b.sku === SKU_FILAMENTO)?.preco_kg, 89),
+      'envelope traz a lista de filamentos com preço/kg', `${bobinas.length}: ${bobinas.map((b: any) => b.sku).join(', ')}`);
 
     // aplicar_preco: RECALCULA no servidor e grava — nunca aceita preço do body.
     const aplicar = await call('PUT', `/producao-3d/parts/${pecaId}/pricing`, { token: adminToken, body: { aplicar_preco: true, preco_venda: 999.99 } });
