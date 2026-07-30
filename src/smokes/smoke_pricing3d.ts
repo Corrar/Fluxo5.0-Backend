@@ -310,6 +310,68 @@ async function main(): Promise<void> {
       `SELECT COALESCE(SUM(quantity_on_hand), 0)::float8 AS q FROM stock WHERE product_id = $1 AND op_id IS NULL`, [pecaId]);
     check(perto(saldoDepois.rows[0].q, saldoAntes.rows[0].q), 'saldo físico da peça voltou ao original (reverseReceive fez o inverso)', `${saldoAntes.rows[0].q} → ${saldoDepois.rows[0].q}`);
 
+    // ── [PAGINAÇÃO] página, total, busca e as bordas ─────────────────────────
+    // Roda ANTES do bloco [ÓRFÃ] de propósito: lá a impressora de referência é excluída e a
+    // energia vira NULL, o que apagaria o caso canônico que este bloco usa como âncora.
+    console.log('\n[PAGINAÇÃO] limit/offset/q com total do universo filtrado');
+    const universo = (await pool.query(
+      `SELECT COUNT(*)::int AS n FROM products WHERE is_3d = true AND active = true`)).rows[0].n;
+
+    const p1 = await call('GET', '/producao-3d/pricing?limit=2', { token: adminToken });
+    check(p1.status === 200 && (p1.data?.pecas || []).length === 2, 'limit=2 devolve 2 peças', String((p1.data?.pecas || []).length));
+    check(p1.data?.total === universo, `total = ${universo} (universo, não o tamanho da página)`, String(p1.data?.total));
+    check(p1.data?.limit === 2 && p1.data?.offset === 0, 'envelope devolve limit e offset efetivos', `limit=${p1.data?.limit} offset=${p1.data?.offset}`);
+
+    // Página 2 não repete nem pula ninguém: com ORDER BY name, id o corte é estável.
+    const p2 = await call('GET', '/producao-3d/pricing?limit=2&offset=2', { token: adminToken });
+    const ids1 = (p1.data?.pecas || []).map((x: any) => x.id);
+    const ids2 = (p2.data?.pecas || []).map((x: any) => x.id);
+    check(ids2.length === 2 && ids1.every((id: string) => !ids2.includes(id)), 'offset=2 traz outras 2 peças (sem repetir a página 1)', `${ids1.length}+${ids2.length} sem interseção`);
+    const nomes = [...(p1.data?.pecas || []), ...(p2.data?.pecas || [])].map((x: any) => x.name);
+    check(nomes.join('|') === [...nomes].sort((a, b) => a.localeCompare(b, 'pt-BR')).join('|'), 'ordenação name ASC atravessa as páginas', nomes.join(' < '));
+
+    // Offset além do fim: lista vazia, mas o total continua dizendo onde voltar.
+    const pFim = await call('GET', `/producao-3d/pricing?limit=5&offset=${universo + 50}`, { token: adminToken });
+    check(pFim.status === 200 && (pFim.data?.pecas || []).length === 0, 'offset além do fim → pecas: []', String((pFim.data?.pecas || []).length));
+    check(pFim.data?.total === universo, 'total INTACTO na página vazia (é ele que traz o front de volta)', String(pFim.data?.total));
+
+    // Busca: por SKU parcial e por pedaço do nome — as duas no mesmo ?q=.
+    const alvo = (await pool.query('SELECT sku, name FROM products WHERE id = $1', [pecaId])).rows[0];
+    const pedacoSku = String(alvo.sku).slice(-3);          // '001' de '3D-0001'
+    const pedacoNome = String(alvo.name).split(' ')[0];     // 'Engrenagem'
+    const qSku = await call(`GET`, `/producao-3d/pricing?q=${encodeURIComponent(pedacoSku)}`, { token: adminToken });
+    check(qSku.status === 200 && (qSku.data?.pecas || []).some((x: any) => x.sku === alvo.sku), `q por SKU parcial ('${pedacoSku}') acha a peça`, `${qSku.data?.total} resultado(s)`);
+    check(qSku.data?.total === (qSku.data?.pecas || []).length && qSku.data.total < universo, 'total da busca obedece ao filtro (menor que o universo)', `${qSku.data?.total} de ${universo}`);
+    const qNome = await call('GET', `/producao-3d/pricing?q=${encodeURIComponent(pedacoNome)}`, { token: adminToken });
+    check(qNome.status === 200 && (qNome.data?.pecas || []).some((x: any) => x.sku === alvo.sku), `q por pedaço do NOME ('${pedacoNome}') acha a mesma peça`, `${qNome.data?.total} resultado(s)`);
+    const qNada = await call('GET', '/producao-3d/pricing?q=zzz-nao-existe-zzz', { token: adminToken });
+    check(qNada.status === 200 && (qNada.data?.pecas || []).length === 0 && qNada.data?.total === 0, 'busca sem resultado → lista vazia e total 0 (não é erro)', `total=${qNada.data?.total}`);
+    const qVazio = await call('GET', '/producao-3d/pricing?q=%20%20', { token: adminToken });
+    check(qVazio.data?.total === universo, 'q só com espaço = SEM busca (não filtra por string vazia)', String(qVazio.data?.total));
+
+    // O caso canônico continua batendo centavo a centavo dentro da página em que a peça estiver.
+    const canonPag = (qSku.data?.pecas || []).find((x: any) => x.sku === SKU_PECA);
+    check(perto(canonPag?.custo?.material, ESP_MATERIAL) && perto(canonPag?.custo?.energia, ESP_ENERGIA)
+      && perto(canonPag?.custo?.total, ESP_TOTAL) && perto(canonPag?.preco_venda_arredondado, ESP_GRAVADO),
+      'caso canônico intacto na página filtrada (8,90 + 0,4275 = 9,3275 → 13,06)', JSON.stringify(canonPag?.custo));
+    // A derivada também sobrevive ao corte: o LATERAL agrega DEPOIS do LIMIT, e não antes.
+    check(canonPag?.impressas === 0 && canonPag?.media_real === null, 'impressas/media_real corretos na página (agregado roda sobre a página)', `${canonPag?.impressas} · ${canonPag?.media_real}`);
+
+    // Bordas: fora da faixa é 400, NÃO clamp silencioso (mesma política da Auditoria).
+    const bordas: Array<[string, string]> = [
+      ['limit=200', "limit acima do teto 100 → 400 (não devolve 100 calado)"],
+      ['limit=0', 'limit=0 → 400'],
+      ['limit=abc', 'limit não-numérico → 400'],
+      ['offset=-1', 'offset negativo → 400'],
+      ['offset=1.5', 'offset fracionário → 400'],
+    ];
+    for (const [qs, rotulo] of bordas) {
+      const r = await call('GET', `/producao-3d/pricing?${qs}`, { token: adminToken });
+      check(r.status === 400, rotulo, `HTTP ${r.status}`);
+    }
+    const semParam = await call('GET', '/producao-3d/pricing', { token: adminToken });
+    check(semParam.data?.limit === 25 && semParam.data?.offset === 0, 'sem parâmetros → default limit=25, offset=0', `limit=${semParam.data?.limit}`);
+
     // ── [AUDITORIA] as actions novas ─────────────────────────────────────────
     console.log('\n[AUDITORIA] actions da expansão');
     const acts = await pool.query(

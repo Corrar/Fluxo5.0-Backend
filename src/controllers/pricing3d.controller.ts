@@ -27,6 +27,12 @@
 //
 // v1 usa UMA impressora de referência (settings 'impressora_padrao_3d'). Peça × impressora
 // específica é v2 — hoje ninguém sabe em qual máquina cada peça vai rodar.
+//
+// PAGINAÇÃO SERVER-SIDE: envelope { pecas, total, limit, offset } com ?limit (default 25, teto
+// 100), ?offset e ?q (ILIKE sobre sku OU name). O `total` traz o universo FILTRADO, e a mesma
+// condição de busca vale para a página e para a contagem — total que não obedece ao filtro faz
+// o "X–Y de Z" mentir. Fora da faixa é 400, não clamp (política herdada da Auditoria).
+// A ordem do LIMIT dentro da query importa e está explicada em PRICING_SQL.
 
 import { Request, Response } from 'express';
 import { query as dbQuery } from '../db';
@@ -47,9 +53,35 @@ const CFG_SQL = `
       NULLIF((SELECT value FROM settings WHERE key = 'impressora_padrao_3d'), '')::uuid    AS printer_id
   )`;
 
-// A conta inteira. Cada peça 3D ativa vira uma linha com as parcelas e o total.
+// A conta de UMA PÁGINA de peças.
+//   $1 = limit · $2 = offset · $3 = termo de busca (NULL = sem busca) · $4 = uma peça (NULL = todas)
+//
+// O $4 existe para o `aplicar_preco` recalcular UMA peça com esta mesma query — a fórmula mora num
+// lugar só, e é decisão travada que continue assim. Antes isso era um .replace() no texto do WHERE;
+// a paginação reescreveu esse WHERE e o replace passou a injetar $1 num segundo papel, quebrando o
+// aplicar_preco (o smoke pegou). SQL não se remenda por busca-e-troca: se o filtro é variável, ele
+// nasce parâmetro.
+//
+// O LIMIT/OFFSET vive na CTE `pagina`, ANTES do LEFT JOIN LATERAL do agregado — e essa ordem é o
+// ponto inteiro desta query. O LATERAL varre productions_3d por peça; deixá-lo antes do corte
+// faria o banco agregar o histórico das oito (amanhã, oitocentas) peças para depois jogar fora
+// tudo menos a página. Cortando primeiro, o agregado roda sobre as N linhas que vão para a tela.
+//
+// ORDENAÇÃO name ASC + DESEMPATE POR id: sem o desempate, duas peças de mesmo nome podem trocar
+// de lugar entre uma página e outra — a mesma linha apareceria duas vezes ou nenhuma ao virar a
+// página. O mesmo par (name, id) se repete no ORDER BY final porque CTE não garante ordem.
 const PRICING_SQL = `
   WITH ${CFG_SQL},
+  pagina AS (
+    SELECT p.id, p.sku, p.name, p.filament_grams, p.production_minutes,
+           p.margin_percent, p.sales_price, p.filament_product_id
+      FROM products p
+     WHERE p.is_3d = true AND p.active = true
+       AND ($3::text IS NULL OR p.sku ILIKE $3 OR p.name ILIKE $3)
+       AND ($4::uuid IS NULL OR p.id = $4)
+     ORDER BY p.name ASC, p.id ASC
+     LIMIT $1 OFFSET $2
+  ),
   base AS (
     SELECT p.id, p.sku, p.name,
            p.filament_grams, p.production_minutes, p.margin_percent, p.sales_price,
@@ -69,12 +101,14 @@ const PRICING_SQL = `
            CASE WHEN pr.power_watts IS NULL OR cfg.tarifa IS NULL OR cfg.tarifa <= 0 THEN NULL
                 ELSE ROUND((p.production_minutes::numeric / 60) * (pr.power_watts::numeric / 1000) * cfg.tarifa, 4)
            END AS custo_energia
-      FROM products p
+      -- FROM pagina (não products): o filtro, a ordem e o corte já aconteceram acima.
+      FROM pagina p
       CROSS JOIN cfg
       -- O JOIN exige is_filament: vínculo apontando pra produto que deixou de ser bobina não
       -- vira preço fantasma — vira NULL + alerta, e alguém conserta o cadastro.
       LEFT JOIN products f    ON f.id = p.filament_product_id AND f.is_filament = true
       LEFT JOIN printers_3d pr ON pr.id = cfg.printer_id
+      -- Agrega SÓ o histórico das peças desta página (ver o comentário do LIMIT acima).
       LEFT JOIN LATERAL (
         SELECT count(*)::int AS producoes,
                SUM(pd.quantity)::int AS impressas,
@@ -83,7 +117,6 @@ const PRICING_SQL = `
                ROUND(SUM(pd.total_minutes)::numeric  / NULLIF(SUM(pd.quantity), 0), 2) AS minutos_reais
           FROM productions_3d pd WHERE pd.product_id = p.id
       ) ag ON TRUE
-     WHERE p.is_3d = true AND p.active = true
   )
   SELECT b.*,
          -- Total só existe se AS DUAS parcelas existem: um total que ignora a energia em silêncio
@@ -95,15 +128,56 @@ const PRICING_SQL = `
          CASE WHEN b.custo_material IS NULL OR b.custo_energia IS NULL THEN NULL
               ELSE ROUND((b.custo_material + b.custo_energia) * (1 + b.margin_percent / 100), 2) END AS preco_venda_arredondado
     FROM base b
-   ORDER BY b.name ASC`;
+   ORDER BY b.name ASC, b.id ASC`;
+
+// COUNT com EXATAMENTE o mesmo filtro da página, e em query própria de propósito: um
+// `count(*) OVER ()` viajando nas linhas se perderia justo quando a página vem vazia (offset
+// além do fim), que é quando o front mais precisa do total pra saber onde voltar.
+const PRICING_COUNT_SQL = `
+  SELECT COUNT(*)::int AS total
+    FROM products p
+   WHERE p.is_3d = true AND p.active = true
+     AND ($1::text IS NULL OR p.sku ILIKE $1 OR p.name ILIKE $1)`;
 
 const num = (v: any): number | null => (v === null || v === undefined ? null : Number(v));
 
-// ── GET /producao-3d/pricing — a aba Precificação inteira numa chamada ───────
-export const getPricing = async (_req: Request, res: Response) => {
+// ── GET /producao-3d/pricing — uma PÁGINA da aba Precificação ────────────────
+// ENVELOPE ADITIVO: `pecas` continua sendo `pecas` e mantém o mesmo shape por item; `total`,
+// `limit` e `offset` entram AO LADO. O front que já está no ar ignora os campos novos e recebe
+// as 25 primeiras peças — degrada para "a primeira página" durante a janela de deploy, nunca
+// para tela quebrada. É o que permite subir backend antes de front sem coreografia.
+export const getPricing = async (req: Request, res: Response) => {
   try {
-    const [linhas, cfg, filamentos] = await Promise.all([
-      dbQuery(PRICING_SQL, [], { retryable: true }),
+    // ── Validação NA BORDA, mesma política da Auditoria (system.controller) ──
+    // Fora da faixa é 400, NÃO clamp: o consumidor é o nosso próprio front, e devolver 100 pra
+    // quem pediu 200 calado esconderia bug de chamada em vez de denunciá-lo.
+    const DIGITS_RE = /^\d+$/;
+    const { limit: rawLimit, offset: rawOffset, q: rawQ } = req.query;
+
+    let limit = 25;
+    if (rawLimit !== undefined) {
+      if (typeof rawLimit !== 'string' || !DIGITS_RE.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 100) {
+        return res.status(400).json({ error: "Parâmetro 'limit' inválido: use um inteiro entre 1 e 100." });
+      }
+      limit = Number(rawLimit);
+    }
+    let offset = 0;
+    if (rawOffset !== undefined) {
+      if (typeof rawOffset !== 'string' || !DIGITS_RE.test(rawOffset)) {
+        return res.status(400).json({ error: "Parâmetro 'offset' inválido: use um inteiro maior ou igual a 0." });
+      }
+      offset = Number(rawOffset);
+    }
+    if (rawQ !== undefined && typeof rawQ !== 'string') {
+      return res.status(400).json({ error: "Parâmetro 'q' inválido: envie um único valor." });
+    }
+    // Termo vazio/só espaço = SEM busca (NULL), não busca por ''. Curingas % e _ digitados não
+    // são escapados — buscar por '100%' casa tudo; mesma licença aceita na Auditoria.
+    const termo = typeof rawQ === 'string' && rawQ.trim() ? `%${rawQ.trim()}%` : null;
+
+    const [linhas, total, cfg, filamentos] = await Promise.all([
+      dbQuery(PRICING_SQL, [limit, offset, termo, null], { retryable: true }),
+      dbQuery(PRICING_COUNT_SQL, [termo], { retryable: true }),
       dbQuery(`WITH ${CFG_SQL}
                SELECT cfg.tarifa, pr.id AS printer_id, pr.display_no, pr.name, pr.power_watts, pr.status
                  FROM cfg LEFT JOIN printers_3d pr ON pr.id = cfg.printer_id`, [], { retryable: true }),
@@ -158,7 +232,13 @@ export const getPricing = async (_req: Request, res: Response) => {
       impressora_configurada: !!impressora,
       filamentos: filamentos.rows,
       pecas,
-      total: pecas.length,
+      // `total` MUDOU DE SIGNIFICADO: era pecas.length (tamanho da resposta), agora é o universo
+      // filtrado — é ele que dimensiona "X–Y de Z" e diz se existe próxima página. Os dois valores
+      // eram idênticos enquanto tudo cabia numa resposta só, e o campo não tinha consumidor no
+      // front (que lê `custo.total` por peça, outra coisa). `limit` e `offset` são novos.
+      total: total.rows[0]?.total ?? 0,
+      limit,
+      offset,
       gerado_em: new Date().toISOString(),
     });
   } catch (error: any) {
@@ -226,7 +306,8 @@ export const updatePartPricing = async (req: Request, res: Response) => {
     // sales_price. Nunca aceita preço pronto do body — o front manda a intenção, não o número.
     let precoAplicado: number | null = null;
     if (aplicar_preco === true) {
-      const calc = await dbQuery(`${PRICING_SQL.replace('WHERE p.is_3d = true AND p.active = true', 'WHERE p.is_3d = true AND p.active = true AND p.id = $1')}`, [id]);
+      // Mesma query da tela, filtrada em UMA peça pelo $4: uma fórmula, uma fonte.
+      const calc = await dbQuery(PRICING_SQL, [1, 0, null, id], { retryable: true });
       const linha = calc.rows[0];
       if (!linha || linha.preco_venda_arredondado === null) {
         return res.status(400).json({
