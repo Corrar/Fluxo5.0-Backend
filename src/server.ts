@@ -23,6 +23,7 @@ import systemRouter from './routes/system.routes';
 import tasksRouter from './routes/tasks.routes';
 import ticketsRouter from './routes/tickets.routes';
 import devProjectsRouter from './routes/dev-projects.routes';
+import devDashboardRouter from './routes/dev-dashboard.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
@@ -159,6 +160,9 @@ app.use('/tickets', ticketsRouter);
 // dev-projetos v1 (migration 013): projetos internos do dev — router inteiro atrás de
 // requirePermission('projetos'); tasks (Quadro de Tarefas de produção) fica intocada.
 app.use('/dev-projects', devProjectsRouter);
+// dev-painel v1 (migration 015 — só a page_key): LEITURA agregada de tickets + dev_projects
+// numa chamada só, atrás de requirePermission('dev_dashboard'). Nenhum número sem SQL.
+app.use('/dev-dashboard', devDashboardRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);
