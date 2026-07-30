@@ -109,3 +109,19 @@ A árvore do produto (GET /assembly-machines/:id) é `SUM(qty)` dos eventos `con
 etiqueta nasceu no consume. Subtrair devolução da árvore hoje daria um número que o razão não
 sustenta. Quando o evento de devolução for etiquetado, a fórmula ganha o sinal — e o comentário
 do `getMachine` precisa mudar junto (está escrito lá).
+
+## `date` de productions_3d vem do relógio do CLIENTE
+
+O POST `/producao-3d/productions` grava o `date` que vem no corpo, e quem preenche é o navegador
+(`producao3d.jsx:263` manda `new Date().toISOString()`; não existe campo de data no formulário).
+O servidor deveria carimbar `now()` — precedente na casa: o "hoje do Postgres" do dev-painel, que
+existe justamente para nenhum número depender do relógio da máquina de quem olha.
+
+O sintoma medido (30/07): produção registrada num PC adiantado nasce "no futuro" para quem lê
+noutra máquina. O Dashboard 3D descartava essas linhas em silêncio — o card mostrava menos peças
+do que o estoque e do que a Precificação. **O clamp no front (fix do Dashboard) mitiga a leitura;
+a raiz continua aqui.**
+
+Não é fix de uma linha: mudar quem carimba a data altera o contrato de um POST **com consumidor
+no ar** e muda o significado do histórico (passa a ser a hora do servidor, não a da máquina que
+produziu). Missão própria, com recon dos consumidores do campo `date` antes de qualquer troca.
