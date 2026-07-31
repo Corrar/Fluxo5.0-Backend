@@ -18,6 +18,9 @@
 //               closed_at; dono com chamado já em_analise → 400.
 //   [TIMELINE]  dono e atendente comentam (201); socket do requester recebe ticket_updated
 //               no comentário do atendente E na transição; socket de terceiro: ZERO eventos.
+//   [FILA-VIVA] a criação emite ticket_created pra sala 'admin': o socket do 001 recebe com
+//               payload auto-suficiente; o socket do 010 (não-admin, sem 'chamados') NÃO
+//               recebe — contra-prova de que a emissão não virou broadcast.
 //   [PRIORIDADE] atendente reclassifica media→alta (200, auditoria {de,para}); dono → 403.
 //   [AUDITORIA] as 7 actions do ciclo conferidas no banco por ticket_id.
 //
@@ -93,18 +96,28 @@ async function main(): Promise<void> {
     const id001: string = admin.user.id;
     const id005: string = setor.user.id;
 
-    // ── Sockets ANTES de qualquer ação: 005 (requester) e 010 (terceiro) ─────
-    console.log('\n[SOCKETS] requester (005) e terceiro (010) conectados');
+    // ── Sockets ANTES de qualquer ação: 005 (requester), 010 (terceiro), 001 (atendente) ──
+    // O 001 entra aqui por causa do [FILA-VIVA]: 'ticket_created' é emitido DENTRO do POST
+    // /tickets, então o socket dele precisa estar conectado ANTES da criação, senão o teste
+    // mediria o próprio atraso de conexão em vez do evento.
+    console.log('\n[SOCKETS] requester (005), terceiro (010) e atendente (001) conectados');
     const sock005 = await abrirSocket(setorToken);
     const sock010 = await abrirSocket(terceiroToken);
+    const sock001 = await abrirSocket(adminToken);
     check(sock005.ok, 'socket do 005 conecta', sock005.ok ? 'conectado' : String(sock005.err));
     check(sock010.ok, 'socket do 010 conecta', sock010.ok ? 'conectado' : String(sock010.err));
+    check(sock001.ok, 'socket do 001 (admin) conecta', sock001.ok ? 'conectado' : String(sock001.err));
     if (sock005.socket) socketsAbertos.push(sock005.socket);
     if (sock010.socket) socketsAbertos.push(sock010.socket);
+    if (sock001.socket) socketsAbertos.push(sock001.socket);
     const eventos005: any[] = [];
     const eventos010: any[] = [];
+    const criados001: any[] = [];
+    const criados010: any[] = [];
     sock005.socket?.on('ticket_updated', (d: any) => eventos005.push(d));
     sock010.socket?.on('ticket_updated', (d: any) => eventos010.push(d));
+    sock001.socket?.on('ticket_created', (d: any) => criados001.push(d));
+    sock010.socket?.on('ticket_created', (d: any) => criados010.push(d));
 
     // ── [BORDA] abertura ─────────────────────────────────────────────────────
     console.log('\n[BORDA] abertura de chamado');
@@ -120,6 +133,22 @@ async function main(): Promise<void> {
       'válido → 201 com display_no numérico', `HTTP ${c1.status}: display_no=${c1.data?.display_no}`);
     const t1: string = c1.data.id;
     ticketsCriados.push(t1);
+
+    // ── [FILA-VIVA] a criação acorda a fila do atendente (31/07/2026) ────────
+    // O que se prova aqui: 'ticket_created' chega ao ADMIN sem ninguém pedir, com payload
+    // auto-suficiente, e NÃO chega a quem não atende. O 010 é o contra-prova da sala: se ele
+    // receber, a emissão vazou de 'admin' pra broadcast.
+    console.log('\n[FILA-VIVA] ticket_created na criação');
+    await sleep(1200); // entrega do socket
+    const ev = criados001.find((d) => d?.ticketId === t1);
+    check(!!ev, '001 (admin) recebe ticket_created do chamado novo', ev ? `1 evento (display_no=${ev.display_no})` : `nenhum (${criados001.length} evento(s) de outros ids)`);
+    check(!!ev && ev.display_no === c1.data.display_no && typeof ev.title === 'string' && ev.title.length > 0
+      && typeof ev.requester_name === 'string' && ev.requester_name.length > 0,
+      'payload auto-suficiente {ticketId, display_no, title, requester_name}',
+      ev ? `display_no=${ev.display_no} title="${ev.title}" requester_name="${ev.requester_name}"` : 'sem evento');
+    check(criados010.length === 0,
+      '010 (não-admin, sem chamados) NÃO recebe ticket_created',
+      `${criados010.length} evento(s)`);
 
     // ── [OWNERSHIP] ──────────────────────────────────────────────────────────
     console.log('\n[OWNERSHIP] requester × terceiro sem chamados');

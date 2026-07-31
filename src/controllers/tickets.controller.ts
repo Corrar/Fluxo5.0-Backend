@@ -10,12 +10,18 @@
 //     em_desenvolvimento -> concluido; aberto -> cancelado. Guard inline em transação com
 //     FOR UPDATE (padrão updateRequestStatus), auditoria com action distinta por transição.
 //
-// NOTIFICAÇÃO v1 = SÓ socket 'ticket_updated' pra sala user:${requester_id} (cortesia, não
-// garantia — quem está offline refaz o GET quando abrir a tela). Quando o REQUESTER comenta,
-// emite também pra sala 'admin': o atendente de hoje é admin (o módulo Dev não mudou na v1) —
-// ASSIMETRIA CONSCIENTE: um futuro atendente não-admin com 'chamados' não está nessa sala;
-// quando esse papel nascer, a sala certa nasce junto (mesma limitação anotada no
-// user_status_changed da tela Usuários).
+// NOTIFICAÇÃO (cortesia, não garantia — quem está offline refaz o GET quando abrir a tela).
+// Dois eventos, dois consumidores:
+//   'ticket_updated' -> sala user:${requester_id} — o DONO acompanhando o chamado dele
+//                       (comentário do atendente, transição de status, reclassificação).
+//                       Quando o REQUESTER comenta, vai também pra sala 'admin'.
+//   'ticket_created' -> sala 'admin' — a FILA do atendente (31/07/2026). Antes disso a
+//                       criação não emitia nada e a fila só acordava no F5.
+// ASSIMETRIA CONSCIENTE E ACEITA (Bruno, 31/07/2026): as duas emissões pra atendente usam a
+// sala 'admin' porque o atendente da v1 É admin. Atendente não-admin com a page_key 'chamados'
+// não está nessa sala e não recebe — dívida NOMEADA; a saída é sala por permissão quando
+// existir um segundo atendente (mesma limitação anotada no user_status_changed da tela
+// Usuários).
 
 import { Request, Response } from 'express';
 import { pool, query as dbQuery } from '../db';
@@ -50,6 +56,30 @@ function emitTicket(req: Request, requesterId: string, payload: object, tambemAd
   (tambemAdmin ? alvo.to('admin') : alvo).emit('ticket_updated', { at: Date.now(), ...payload });
 }
 
+// Chamado NOVO acorda a FILA do atendente (decisão do Bruno, 31/07/2026). Até aqui o
+// createTicket não emitia NADA: medido no ar em 31/07/2026 — com a fila aberta e um chamado
+// sendo criado, o atendente seguia vendo "Novos (0)" e só descobria o chamado dando F5.
+//
+// Evento PRÓPRIO ('ticket_created', não 'ticket_updated') porque o consumidor é OUTRO: quem
+// escuta aqui é a fila do atendente, não o detalhe do dono. Misturar os dois faria a tela do
+// requester recarregar por chamado que não é dele.
+//
+// Payload MÍNIMO e auto-suficiente ({ticketId, display_no, title, requester_name}): dá pra
+// avisar/atualizar sem uma segunda chamada. O GET continua sendo a verdade — isto é cortesia,
+// igual ao resto da v1.
+//
+// ASSIMETRIA ACEITA (decisão do Bruno, 31/07/2026), a MESMA do comentário do requester: a sala
+// é 'admin' porque o atendente da v1 É admin. Atendente não-admin que tenha a page_key
+// 'chamados' NÃO está nessa sala e NÃO recebe este evento — não é esquecimento, é dívida
+// NOMEADA. Saída no dia em que existir um segundo atendente: sala por PERMISSÃO (o handshake
+// do socket resolve 'chamados' com o mesmo critério do podeAtender e faz join numa sala
+// própria), aposentando o uso de 'admin' como proxy de "quem atende".
+function emitTicketCreated(req: Request, payload: object): void {
+  const io = (req as any).io;
+  if (!io) return;
+  io.to('admin').emit('ticket_created', { at: Date.now(), ...payload });
+}
+
 // ── POST /tickets — qualquer logado abre ────────────────────────────────────
 export const createTicket = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
@@ -67,14 +97,30 @@ export const createTicket = async (req: Request, res: Response) => {
   }
 
   try {
+    // O nome do solicitante sai na MESMA ida ao banco (CTE), não numa segunda query: o
+    // payload do socket precisa dele e o INSERT já sabe quem é. COALESCE(profile, email) é a
+    // convenção da casa pra nome de gente (mesma do getMyTickets/getTickets).
     const { rows } = await pool.query(
-      `INSERT INTO tickets (requester_id, title, description, priority)
-       VALUES ($1, $2, $3, $4) RETURNING id, display_no`,
+      `WITH novo AS (
+         INSERT INTO tickets (requester_id, title, description, priority)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, display_no, requester_id, title
+       )
+       SELECT n.id, n.display_no, n.title, COALESCE(p.name, u.email) AS requester_name
+       FROM novo n
+       JOIN users u ON u.id = n.requester_id
+       LEFT JOIN profiles p ON p.id = n.requester_id`,
       [userId, cleanTitle, cleanDesc, cleanPriority],
     );
     const ticket = rows[0];
     await createLog(userId, 'CRIAR_CHAMADO',
       { ticket_id: ticket.id, display_no: ticket.display_no, priority: cleanPriority }, getClientIp(req));
+    emitTicketCreated(req, {
+      ticketId: ticket.id,
+      display_no: ticket.display_no,
+      title: ticket.title,
+      requester_name: ticket.requester_name,
+    });
     res.status(201).json({ id: ticket.id, display_no: ticket.display_no });
   } catch (error: any) {
     console.error('Erro ao criar chamado:', error);
