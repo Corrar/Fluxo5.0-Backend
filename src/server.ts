@@ -24,6 +24,7 @@ import tasksRouter from './routes/tasks.routes';
 import ticketsRouter from './routes/tickets.routes';
 import devProjectsRouter from './routes/dev-projects.routes';
 import devDashboardRouter from './routes/dev-dashboard.routes';
+import devReposRouter from './routes/devRepos.routes';
 import assemblyRouter from './routes/assembly.routes';
 import printers3dRouter from './routes/printers3d.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
@@ -177,6 +178,10 @@ app.use('/dev-projects', devProjectsRouter);
 // dev-painel v1 (migration 015 — só a page_key): LEITURA agregada de tickets + dev_projects
 // numa chamada só, atrás de requirePermission('dev_dashboard'). Nenhum número sem SQL.
 app.use('/dev-dashboard', devDashboardRouter);
+// dev-repos v1 (migration 018): espelho local dos commits do GitHub + relatório por período.
+// Router inteiro atrás de requirePermission('dev_repos'). A LEITURA nunca toca a rede externa —
+// só a sync (botão) escreve; falha lá fora vira carimbo na tela, não tela quebrada.
+app.use('/dev-repos', devReposRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);
