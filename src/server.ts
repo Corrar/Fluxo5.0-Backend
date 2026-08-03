@@ -25,6 +25,8 @@ import ticketsRouter from './routes/tickets.routes';
 import devProjectsRouter from './routes/dev-projects.routes';
 import devDashboardRouter from './routes/dev-dashboard.routes';
 import devReposRouter from './routes/devRepos.routes';
+import devAreaRouter from './routes/devArea.routes';
+import devCostsRouter from './routes/devCosts.routes';
 import assemblyRouter from './routes/assembly.routes';
 import printers3dRouter from './routes/printers3d.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
@@ -182,6 +184,13 @@ app.use('/dev-dashboard', devDashboardRouter);
 // Router inteiro atrás de requirePermission('dev_repos'). A LEITURA nunca toca a rede externa —
 // só a sync (botão) escreve; falha lá fora vira carimbo na tela, não tela quebrada.
 app.use('/dev-repos', devReposRouter);
+// Área Dev v1 (migration 019): agenda (evento/tarefa), notas e snippets — ferramentas pessoais
+// do desenvolvedor, router inteiro atrás de requirePermission('dev_area').
+app.use('/dev-area', devAreaRouter);
+// Custos & Serviços v1 (migration 019): o que se paga hoje pra manter o sistema de pé. Chave
+// SEPARADA ('dev_custos') — agenda e despesa não se concedem juntas. O total mensal é
+// calculado no GET (mensal + anual/12 + variável), numa fonte de verdade só.
+app.use('/dev-costs', devCostsRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);

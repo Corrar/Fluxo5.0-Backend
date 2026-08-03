@@ -34,6 +34,7 @@
     "smoke:devprojects": "ts-node src/smokes/smoke_dev_projects.ts",
     "smoke:devdashboard": "ts-node src/smokes/smoke_dev_dashboard.ts",
     "smoke:devrepos": "ts-node src/smokes/smoke_devrepos.ts",
+    "smoke:devarea": "ts-node src/smokes/smoke_devarea_custos.ts",
     "smoke:pricing3d": "ts-node src/smokes/smoke_pricing3d.ts",
     "smoke:assembly": "ts-node src/smokes/smoke_assembly.ts",
     "smoke:security:rbac": "ts-node src/smokes/smoke_security_rbac.ts",

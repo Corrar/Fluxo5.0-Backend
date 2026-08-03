@@ -125,3 +125,27 @@ a raiz continua aqui.**
 Não é fix de uma linha: mudar quem carimba a data altera o contrato de um POST **com consumidor
 no ar** e muda o significado do histórico (passa a ser a hora do servidor, não a da máquina que
 produziu). Missão própria, com recon dos consumidores do campo `date` antes de qualquer troca.
+
+## Área Dev e Custos (019): três coisas que o design prometia e NÃO nasceram
+
+Registradas na clarificação do Bruno de 03/08/2026, na abertura da Fase 4. Nenhuma é
+esquecimento: as três nascem **quando houver fonte**, e nunca como número inventado.
+
+### Sync com Google Agenda — FORA
+No design a Área Dev tinha um botão de sincronizar com o Google Agenda, e ele era **simulado**:
+mexia só no estado da tela. Integração externa de verdade tem OAuth, refresh de token, conflito
+de edição dos dois lados e um modelo de "quem ganha" que ninguém decidiu. É **missão própria** —
+e, quando vier, segue o padrão do dev-repos: o Google é a FONTE, o nosso banco é o ESPELHO, e
+falha lá fora vira carimbo na tela, não tela quebrada.
+
+### Monitoramento vivo de uso (CPU/RAM/tokens) — FORA
+A tela de Custos do design mostrava consumo por serviço. **Não temos coletor**: nem agente nas
+máquinas, nem integração com o billing dos provedores. O que sobrou é `dev_costs.usage_note`,
+texto livre escrito por gente — honesto sobre ser uma ANOTAÇÃO e não uma medição. Uma barra de
+"72% de uso" sem coletor seria exatamente o tipo de número sem query atrás que a régua proíbe.
+
+### Histórico mensal / delta do Custos — FORA até existirem meses de dado
+`dev_costs` é a FOTO do que se paga hoje: uma linha por serviço, sem competência. "Subiu 32% no
+mês" exige pelo menos dois meses fechados, e a tabela nasceu agora — o primeiro gráfico seria
+ficção com aparência de dado. Quando houver meses, nasce a tabela de competência
+(`dev_cost_entries` ou equivalente) e o delta passa a ser derivado dela, não estimado.
