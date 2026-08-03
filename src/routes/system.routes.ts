@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate, requirePermission, requireAdmin } from '../middlewares/auth';
+import { getReportsBi } from '../controllers/reportsBi.controller';
 import { 
   getDashboardStats, 
   getManagerialReports, 
@@ -28,6 +29,11 @@ router.get('/reports/managerial', requirePermission('relatorios'), getManagerial
 router.get('/reports/general', requirePermission('relatorios'), getGeneralReports);
 router.get('/reports/available-dates', requirePermission('relatorios'), getAvailableDates);
 router.get('/transactions/recent', requirePermission('relatorios'), getRecentTransactions);
+// Painel BI (Fase 3a): os CINCO blocos agregados num período só — capital entrado/saído,
+// reposições e solicitações por status, e capital por setor. Mesma chave 'relatorios' das
+// irmãs: é o mesmo dado gerencial, com a mesma sensibilidade. Agregação toda em SQL — o
+// cliente não baixa linha para somar.
+router.get('/reports/bi', requirePermission('relatorios'), getReportsBi);
 
 // Logs — page_key 'logs' (hoje só admin) em vez do check inline: comportamento idêntico,
 // mas DB-driven — a tela de Permissões pode conceder auditoria a outro papel sem mexer em código.
