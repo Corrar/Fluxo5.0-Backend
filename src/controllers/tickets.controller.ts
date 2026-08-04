@@ -49,11 +49,20 @@ async function podeAtender(userId: string, role: string | undefined): Promise<bo
   return perm.rows.length > 0;
 }
 
-function emitTicket(req: Request, requesterId: string, payload: object, tambemAdmin = false): void {
+// `actorId` é OBRIGATÓRIO e vai no payload: sem ele o cliente não consegue cumprir a regra
+// "ator não se notifica" — o dono que comenta no próprio chamado está na sala de destino
+// (`user:${requesterId}`) e receberia o aviso da própria ação. Parâmetro exigido de propósito,
+// para que um call site novo não o esqueça em silêncio.
+//
+// ⚠ NÃO CONFUNDIR: `actorId` é QUEM AGIU (req.user.id — nos controllers deste arquivo a
+// variável local chama-se `requester`, o que é um nome infeliz). `requesterId` é o DONO DO
+// CHAMADO (ticket.requester_id). Nos comentários do próprio dono os dois coincidem; num
+// comentário do atendente, não. Trocar um pelo outro quebra a regra sem erro visível.
+function emitTicket(req: Request, requesterId: string, actorId: string, payload: object, tambemAdmin = false): void {
   const io = (req as any).io;
   if (!io) return;
   const alvo = io.to(`user:${requesterId}`);
-  (tambemAdmin ? alvo.to('admin') : alvo).emit('ticket_updated', { at: Date.now(), ...payload });
+  (tambemAdmin ? alvo.to('admin') : alvo).emit('ticket_updated', { at: Date.now(), actor_id: actorId, ...payload });
 }
 
 // Chamado NOVO acorda a FILA do atendente (decisão do Bruno, 31/07/2026). Até aqui o
@@ -74,10 +83,12 @@ function emitTicket(req: Request, requesterId: string, payload: object, tambemAd
 // NOMEADA. Saída no dia em que existir um segundo atendente: sala por PERMISSÃO (o handshake
 // do socket resolve 'chamados' com o mesmo critério do podeAtender e faz join numa sala
 // própria), aposentando o uso de 'admin' como proxy de "quem atende".
-function emitTicketCreated(req: Request, payload: object): void {
+// `actorId` obrigatório pelo mesmo motivo: o atendente da v1 É admin, então um admin que
+// abre o próprio chamado está na sala de destino e receberia o aviso da própria criação.
+function emitTicketCreated(req: Request, actorId: string, payload: object): void {
   const io = (req as any).io;
   if (!io) return;
-  io.to('admin').emit('ticket_created', { at: Date.now(), ...payload });
+  io.to('admin').emit('ticket_created', { at: Date.now(), actor_id: actorId, ...payload });
 }
 
 // ── POST /tickets — qualquer logado abre ────────────────────────────────────
@@ -115,7 +126,7 @@ export const createTicket = async (req: Request, res: Response) => {
     const ticket = rows[0];
     await createLog(userId, 'CRIAR_CHAMADO',
       { ticket_id: ticket.id, display_no: ticket.display_no, priority: cleanPriority }, getClientIp(req));
-    emitTicketCreated(req, {
+    emitTicketCreated(req, userId, {
       ticketId: ticket.id,
       display_no: ticket.display_no,
       title: ticket.title,
@@ -261,7 +272,7 @@ export const addComment = async (req: Request, res: Response) => {
 
     // Aviso-cortesia: o requester sempre; quando quem comentou FOI o requester, a sala
     // 'admin' também (ver assimetria documentada no topo).
-    emitTicket(req, ticket.requester_id,
+    emitTicket(req, ticket.requester_id, requester.id,
       { ticketId: id, display_no: ticket.display_no, event: 'comentario', status: ticket.status }, souDono);
 
     res.status(201).json({ id: cRes.rows[0].id, created_at: cRes.rows[0].created_at });
@@ -344,7 +355,7 @@ export const updateTicketStatus = async (req: Request, res: Response) => {
       { ticket_id: id, display_no: ticket.display_no, de: atual, para: alvo }, getClientIp(req), client);
     await client.query('COMMIT');
 
-    emitTicket(req, ticket.requester_id, { ticketId: id, display_no: ticket.display_no, event: 'status', status: alvo });
+    emitTicket(req, ticket.requester_id, requester.id, { ticketId: id, display_no: ticket.display_no, event: 'status', status: alvo });
     res.json({ success: true, status: alvo });
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch (e) { /* já rolou */ }
@@ -383,7 +394,7 @@ export const updateTicketPriority = async (req: Request, res: Response) => {
       { ticket_id: id, display_no: ticket.display_no, de: ticket.priority, para: priority }, getClientIp(req), client);
     await client.query('COMMIT');
 
-    emitTicket(req, ticket.requester_id, { ticketId: id, display_no: ticket.display_no, event: 'prioridade', priority });
+    emitTicket(req, ticket.requester_id, requester.id, { ticketId: id, display_no: ticket.display_no, event: 'prioridade', priority });
     res.json({ success: true, priority });
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch (e) { /* já rolou */ }
