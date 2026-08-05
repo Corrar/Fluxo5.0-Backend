@@ -102,9 +102,20 @@ export const register = async (req: Request, res: Response): Promise<Response | 
   const { email, password, name, role, sector } = req.body;
 
   // Validação na borda: nada de INSERT com campo faltando/quebrado.
+  //
+  // A identidade de acesso é `NNN@fluxoroyale.local` — o "código" que o operador digita no login é
+  // o local-part, e não existe coluna de código no banco (`users` só tem `email`). A regex genérica
+  // que estava aqui aceitava `joao@empresa.com` e criava conta que o login por código NÃO alcança:
+  // usuário que a tela nega e o sistema aceita. O front já monta o e-mail, mas CLIENTE NÃO É FONTE
+  // DE VERDADE — a checagem tem que existir aqui também.
+  // Falta a 5ª camada, o CHECK no banco: registrada como dívida (n).
   const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-    return res.status(400).json({ error: 'E-mail inválido.' });
+  const mCodigo = /^(\d{3})@fluxoroyale\.local$/.exec(cleanEmail);
+  const numCodigo = mCodigo ? parseInt(mCodigo[1], 10) : NaN;
+  if (!mCodigo || numCodigo < 1 || numCodigo > 999) {
+    return res.status(400).json({
+      error: 'Código de acesso inválido. O e-mail deve ser NNN@fluxoroyale.local, com três dígitos de 001 a 999.',
+    });
   }
   if (typeof password !== 'string' || password.length < 6) {
     return res.status(400).json({ error: 'A senha deve ter pelo menos 6 caracteres.' });
