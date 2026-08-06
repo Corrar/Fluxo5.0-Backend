@@ -150,6 +150,88 @@ mês" exige pelo menos dois meses fechados, e a tabela nasceu agora — o primei
 ficção com aparência de dado. Quando houver meses, nasce a tabela de competência
 (`dev_cost_entries` ou equivalente) e o delta passa a ser derivado dela, não estimado.
 
+## `requests.sector` carrega DOIS significados no mesmo campo
+
+Registrada em 06/08/2026, no recon da fase 2 da dívida (f). **Prioridade MÉDIA.**
+
+O campo é preenchido por dois emissores com semânticas **diferentes**:
+
+| Tela | O que grava | Natureza |
+|---|---|---|
+| **Meus Pedidos** (`pedidos.jsx`) | o setor de **quem pediu** | ORIGEM — é identidade |
+| **Encomendar 3D** (`pages_rest.jsx:331,378,543`) | um `<input>` que o usuário **digita**, default `"Produção 3D"` | DESTINO — dado de negócio |
+
+A fase 2 fechou só a metade que é identidade: o backend passou a **derivar** `profiles.sector` do
+token quando o corpo não manda, e Meus Pedidos parou de mandar. O 3D segue enviando o destino
+digitado, e o servidor não o sobrescreve — retrocompatível de propósito.
+
+**O que continua aberto**: enquanto `sector` for **texto livre aceito no corpo**, qualquer cliente
+grava o que quiser. Não há whitelist, não há CHECK, e a coluna é nullable dos dois lados
+(`requests.sector` e `profiles.sector`). Medido na validação em 06/08: das 16 solicitações, 10
+tinham `sector` diferente do setor do perfil do requester — **7 eram resíduo dos meus próprios
+smokes** (passei strings arbitrárias pela API), 1 de um smoke do 005 e **2 são do seed real**
+(`Elétrica` e `Manutenção`, ambas com requester `001`/Diretoria). Nenhuma veio do mecanismo da
+dívida (f) — todas vieram de um valor explícito no corpo, que é o comportamento projetado.
+
+**A decisão que fecha, e é de produto/schema — não de código:**
+- ou `sector` é **sempre origem** (deriva sempre, sai do contrato do POST) e o 3D ganha coluna
+  própria `destination_sector`;
+- ou é **sempre destino** (campo declarado) e a origem passa a vir só do `requester_id`, com as
+  telas lendo o setor pelo join em vez da coluna.
+
+Escolher é obrigatório antes de qualquer relatório que agrupe por setor: hoje um `GROUP BY sector`
+mistura "de onde veio" com "para onde foi", e o número sai sem significado único.
+
+Achado lateral do mesmo recon: `auth.controller.ts:44-52` cria perfil faltante **no login** com
+`sector` chumbado em `'Geral'` — é a origem do `Geral` de perfis que nunca foram cadastrados pela
+tela de Usuários.
+
+## Vocabulário de status de OP divergente entre 2.0 e 5.0 — BLOQUEIA A CARGA DE DADOS
+
+Registrada em 06/08/2026, no recon do filtro de OPs. **Prioridade ALTA**: não é dívida de código
+rodando errado hoje, é uma armadilha que só dispara no dia da migração — e nesse dia, em silêncio.
+
+**Os dois vocabulários, medidos:**
+
+| | ativo | encerrado | contagem |
+|---|---|---|---|
+| **2.0** (`ep-mute-feather`) | `pendente` | `concluido` | 18 + 24 |
+| **5.0** (`ep-summer-wave`) | `em_andamento` | `concluido` | 5 + 2 |
+
+No 2.0 **não existe OP planejada**: `pendente` É o estado de execução. No 5.0 `pendente` é o
+**DEFAULT da coluna** (`client_services.status`) e hoje nenhuma linha o usa. A mesma palavra
+significa "em execução" de um lado e "nunca começou" do outro.
+
+**Tradução obrigatória na carga**: `pendente` → `em_andamento`.
+
+**O que a cópia crua faria**: as 18 OPs ativas do 2.0 entrariam no 5.0 marcadas como `pendente`.
+Qualquer fluxo que filtre por igualdade com `em_andamento` passa a tratá-las como inexistentes —
+some OP viva de seletor, de relatório, de qualquer lista. Sem erro, sem log: a OP simplesmente
+não aparece.
+
+**A consequência inversa, igualmente séria**: se o 5.0 passar a receber linhas em `pendente` e
+algum código futuro ler `pendente` como "ainda não começou", o comportamento diverge em silêncio na
+direção oposta — OP tratada como planejada quando está em execução.
+
+**Por que o front já está protegido, e por que isso NÃO fecha a dívida**: o seletor de OP filtra por
+`!frIsOpConcluida(status)` — exclui o que acabou e mantém todo o resto, então sobrevive aos dois
+vocabulários. Isso protege a TELA, não o DADO: o banco continuaria com duas palavras para o mesmo
+estado, e a próxima query escrita por igualdade recria o furo.
+
+**DECISÃO PENDENTE DO BRUNO**: no 5.0, `pendente` continua sendo estado válido (OP planejada de
+verdade, distinta de em execução) ou **sai do vocabulário**? Se continuar, os dois significados
+coexistem no mesmo banco depois da carga e alguém vai confundir — e aí a tradução da carga precisa
+ser irreversível e documentada, não uma conversão que o próximo import desfaz. Se sair, o DEFAULT da
+coluna muda junto (hoje é `'pendente'`) e cabe um CHECK com a lista fechada.
+
+**Escopo**: script de carga (a tradução) + decisão de produto (o vocabulário) + eventual migration
+(DEFAULT e CHECK). **Não** é conserto de uma linha.
+
+Parente direta dos **guards fantasma**: `requests.controller.ts:157`, `stock.controller.ts:231` e
+`tasks.controller.ts:46,81,163,192` comparam com `'finalizada'`/`'encerrada'` — valores que não
+existem em nenhum dos dois bancos. Estão dormentes hoje; um vocabulário aberto (o
+`updateServiceStatus` grava sem whitelist) pode acordá-los.
+
 ## `DELETE /requests/:id` devolve 500 em estado bloqueado, não 400
 
 Medido no smoke de 06/08/2026, contra o Render: `DELETE` sobre uma solicitação já `rejeitado`

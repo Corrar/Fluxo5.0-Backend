@@ -99,8 +99,35 @@ export const createRequest = async (req: Request, res: Response) => {
     validatePositiveItems(items);
 
     // ---- Transação blindada: motor de estoque + auditoria no MESMO client ----
-    const { requestId, changedProducts } = await withTransaction(async (client) => {
+    const { requestId, changedProducts, setorFinal } = await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
+
+      // ⚠️ `requests.sector` CARREGA DOIS SIGNIFICADOS HOJE, e esta derivação só cobre UM:
+      //
+      //   • Meus Pedidos (front pedidos.jsx)  -> ORIGEM: o setor de QUEM pediu. É IDENTIDADE,
+      //     e identidade não viaja no corpo — o servidor a deriva do token. É o que fazemos aqui.
+      //   • Encomendar 3D (front pages_rest.jsx) -> DESTINO: um campo que o usuário DIGITA
+      //     ("para onde vai"), com default "Produção 3D". É dado de negócio legítimo, não
+      //     identidade, e por isso continua vindo no corpo e NÃO é sobrescrito.
+      //
+      // Quem for unificar isso precisa decidir se o destino vira COLUNA PRÓPRIA
+      // (`destination_sector`) e `sector` passa a ser sempre origem derivada, ou o contrário.
+      // Ver a dívida "requests.sector com dois significados no mesmo campo" no DIVIDAS.md.
+      //
+      // POR QUE A DERIVAÇÃO IMPORTA: antes, o front mandava `FRAuth.profile.sector` (memória)
+      // enquanto o interceptor mandava o token do localStorage. Numa divergência de sessão
+      // (dívida (f)) o pedido nascia com o SETOR de um usuário e o requester_id de OUTRO —
+      // dado errado gravado, não só exibido. Derivando das duas pontas do MESMO token, fecha.
+      //
+      // `profiles.sector` é NULLABLE e `requests.sector` também (medido: 0 perfis sem setor na
+      // validação, mas a coluna permite). Perfil sem setor grava NULL, e as telas já mostram
+      // '—' nesse caso (pages_admin/pedidos/conferencia/recebimento) — nunca um "Geral" inventado.
+      const setorDoCorpo = (typeof sector === 'string' && sector.trim()) ? sector.trim() : null;
+      let setorFinal = setorDoCorpo;
+      if (setorFinal === null) {
+        const perfil = await client.query('SELECT sector FROM profiles WHERE id = $1', [userId]);
+        setorFinal = perfil.rows[0]?.sector ?? null;
+      }
 
       // =========================================================================
       // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
@@ -166,7 +193,7 @@ export const createRequest = async (req: Request, res: Response) => {
       // =========================================================================
       const reqRes = await client.query(
         'INSERT INTO requests (requester_id, sector, status, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id',
-        [userId, sector, 'aberto', client_service_id]
+        [userId, setorFinal, 'aberto', client_service_id]
       );
       const requestId = reqRes.rows[0].id;
 
@@ -248,10 +275,10 @@ export const createRequest = async (req: Request, res: Response) => {
         }
       }
 
-      await createLog(userId, 'CRIAR_SOLICITACAO', { id_solicitacao: requestId, setor: sector, total_itens: items.length }, getClientIp(req), client);
+      await createLog(userId, 'CRIAR_SOLICITACAO', { id_solicitacao: requestId, setor: setorFinal, total_itens: items.length }, getClientIp(req), client);
 
       const changedProducts = sortedItems.map((it: any) => it.product_id).filter((id: any) => id && id !== 'custom');
-      return { requestId, changedProducts };
+      return { requestId, changedProducts, setorFinal };
     });
 
     // ---- Pós-commit: resposta + eventos socket + push (contrato idêntico ao 2.0) ----
@@ -267,7 +294,7 @@ export const createRequest = async (req: Request, res: Response) => {
     const { rows: fullReqRows } = await pool.query(fullReqQuery, [requestId]);
 
     if ((req as any).io) {
-      const notificationData = { id: `req-${requestId}-${Date.now()}`, message: `📢 Nova solicitação do setor: ${sector}`, action: 'Ver Pedidos', type: 'solicitacao' };
+      const notificationData = { id: `req-${requestId}-${Date.now()}`, message: `📢 Nova solicitação do setor: ${setorFinal}`, action: 'Ver Pedidos', type: 'solicitacao' };
       (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request_notification', notificationData);
 
       // 🟢 O front-end já captura 'new_request' e adiciona no topo da lista.
@@ -296,7 +323,7 @@ export const createRequest = async (req: Request, res: Response) => {
     const nomeSolicitante = fullReqRows[0]?.requester?.name || 'Usuário';
 
     const avisoOp = op_code ? `\nOP: ${op_code}` : `\nOP: Isento (EPI/Ferramenta/Insumo)`;
-    const mensagemPersonalizada = `Setor: ${sector}${avisoOp}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
+    const mensagemPersonalizada = `Setor: ${setorFinal}${avisoOp}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
 
     sendPushNotificationToRole('almoxarife', `Novo Pedido de ${nomeSolicitante}`, mensagemPersonalizada, '/requests');
 
