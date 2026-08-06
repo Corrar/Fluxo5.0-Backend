@@ -533,7 +533,14 @@ export const deleteRequest = async (req: Request, res: Response) => {
       if (status === 'rejeitado' || status === 'entregue' || status === 'devolvido') throw new Error('Não é possível cancelar no estado atual.');
 
       let changedProducts: any[] = [];
-      if (status === 'aberto' || status === 'aprovado') {
+      // ESTADOS COM RESERVA VIVA = exatamente os três que o guard acima deixa passar.
+      // 'conferido' TAMBÉM tem reserva presa: conferir é NO-OP de estoque (ver updateRequestStatus,
+      // ramo `status === 'conferido'`) — a reserva nasce no createRequest e só morre no consume da
+      // entrega ou no release daqui. Esta lista era ['aberto','aprovado'], então cancelar um
+      // 'conferido' por esta rota marcava 'rejeitado' e DEIXAVA A RESERVA PRESA: disponível a menos
+      // no saldo, sem caminho de liberação por nenhuma tela. O PUT /:id/status já libera nos três;
+      // aqui passa a fazer o mesmo, com o MESMO op_key (as duas rotas são idempotentes entre si).
+      if (status === 'aberto' || status === 'aprovado' || status === 'conferido') {
         // Puxa o is_3d para não tentar liberar reserva de algo que nunca foi reservado.
         const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
         for (const item of itemsRes.rows) {

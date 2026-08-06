@@ -149,3 +149,26 @@ texto livre escrito por gente — honesto sobre ser uma ANOTAÇÃO e não uma me
 mês" exige pelo menos dois meses fechados, e a tabela nasceu agora — o primeiro gráfico seria
 ficção com aparência de dado. Quando houver meses, nasce a tabela de competência
 (`dev_cost_entries` ou equivalente) e o delta passa a ser derivado dela, não estimado.
+
+## Cancelamento de solicitação não tem ownership — DECISÃO DE PRODUTO PENDENTE
+
+Registrada em 06/08/2026, ao ligar a exclusão real de solicitação nas duas telas do front.
+
+**O fato**: nem `deleteRequest` nem `updateRequestStatus` olham quem é o dono da solicitação.
+Os dois exigem cargo `admin` **ou** `almoxarife` (`SELECT role FROM profiles` no topo de cada
+um) e nada além disso. Consequências, as duas reais e nenhuma óbvia pela tela:
+
+1. Qualquer admin/almoxarife cancela a solicitação de **qualquer pessoa**. Não há "só o meu".
+2. O solicitante comum **não cancela nem o próprio pedido** — toma 403 no gate de cargo, pelas
+   duas rotas. O botão "Cancelar pedido" de Meus Pedidos era falso desde que nasceu (mexia só
+   no estado da tela); ao ligá-lo de verdade ele passou a aparecer **só** para admin/almoxarife,
+   que é a única plateia que o backend atende hoje.
+
+`audit_log` grava quem cancelou (`REJEITAR_SOLICITACAO` com `motivo`), então o rastro existe —
+mas **nenhuma tela mostra esse rastro**, e o solicitante vê o pedido virar "Recusado" sem saber
+que foi outra pessoa.
+
+**Não é bug até o Bruno decidir**: pode ser intencional (o almoxarifado gerencia a fila e cancela
+o que for preciso) ou pode ser furo (cada um cancela o seu, o almoxarifado recusa com motivo).
+São desenhos diferentes, não graus do mesmo. Saída, se virar furo: `requester_id = userId` como
+alternativa ao gate de cargo em `deleteRequest`, e exibir o autor do cancelamento no drawer.

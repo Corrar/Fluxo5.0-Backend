@@ -44,8 +44,15 @@ router.put('/:id/status', requirePermission('solicitacoes:edit'), updateRequestS
 // 🟢 NOVA ROTA ADICIONADA: Vincula a URL ao controlador de Devolução Parcial com a devida permissão
 router.post('/:id/partial-return', requirePermission('solicitacoes:edit'), partialReturnRequest);
 
-// 🗑️ Excluir / Cancelar um pedido
-// Permite ao utilizador apagar o próprio pedido (Nota: o controller valida se o status ainda é 'pendente')
+// 🗑️ Cancelar um pedido (NÃO apaga: o controller faz UPDATE para status 'rejeitado')
+//
+// O que este comentário dizia antes era FALSO nos dois pontos, e a UI foi desenhada em cima disso:
+//  - "permite ao utilizador apagar o próprio pedido" — NÃO HÁ CHECAGEM DE OWNERSHIP. O controller
+//    exige cargo admin OU almoxarife e mais nada: qualquer um dos dois cancela o pedido de qualquer
+//    pessoa. O solicitante comum não cancela nem o próprio (toma 403 no cargo).
+//  - "o controller valida se o status ainda é 'pendente'" — o guard é uma BLOCKLIST, não 'pendente':
+//    barra 'rejeitado'/'entregue'/'devolvido' e aceita 'aberto', 'aprovado' E 'conferido'.
+// Ver a dívida "ownership no cancelamento de solicitação" em DIVIDAS.md.
 router.delete('/:id', requirePermission('minhas_solicitacoes:delete'), deleteRequest);
 
 export default router;
