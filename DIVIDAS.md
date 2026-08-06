@@ -150,6 +150,25 @@ mês" exige pelo menos dois meses fechados, e a tabela nasceu agora — o primei
 ficção com aparência de dado. Quando houver meses, nasce a tabela de competência
 (`dev_cost_entries` ou equivalente) e o delta passa a ser derivado dela, não estimado.
 
+## `DELETE /requests/:id` devolve 500 em estado bloqueado, não 400
+
+Medido no smoke de 06/08/2026, contra o Render: `DELETE` sobre uma solicitação já `rejeitado`
+responde **HTTP 500** com o corpo `{"error":"Não é possível cancelar no estado atual."}` — a
+mensagem certa com o status errado.
+
+**Causa**: o guard de estado em `deleteRequest` lança `new Error('Não é possível cancelar no
+estado atual.')`, um `Error` comum. O `catch` só trata `StockError` e a sentinela `__NOT_FOUND__`;
+tudo o mais cai no `res.status(500)`. O `PUT /:id/status` faz certo no mesmo caso — lança a
+sentinela `TRANSICAO_INVALIDA:` e o catch converte em 400 (medido no mesmo smoke).
+
+**Impacto**: baixo hoje. A UI de cancelamento usa o `PUT` (que responde 400 corretamente), e a
+rota `DELETE` exige `minhas_solicitacoes:delete`, chave que nenhum papel tem — na prática só o
+admin passa, pelo bypass. O dano é de diagnóstico: 500 diz "o servidor quebrou" para uma recusa
+de regra de negócio, e polui qualquer alerta que conte 5xx.
+
+**Escopo**: uma linha — trocar por uma sentinela e converter no catch, exatamente como o `PUT`
+já faz. **Prioridade**: BAIXA.
+
 ## Cancelamento de solicitação não tem ownership — DECISÃO DE PRODUTO PENDENTE
 
 Registrada em 06/08/2026, ao ligar a exclusão real de solicitação nas duas telas do front.
