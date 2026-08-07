@@ -188,8 +188,11 @@ export const createRequest = async (req: Request, res: Response) => {
         const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
         if (opCheck.rows.length === 0) throw new Error("OP_NAO_ENCONTRADA");
 
+        // Guard REAL desde a 021. Comparava 'finalizada'/'encerrada' — palavras que nunca
+        // existiram em client_services (os valores reais sempre foram em_andamento/concluido),
+        // então nunca disparou: pedido contra OP encerrada passava e reservava estoque nela.
         const opStatus = opCheck.rows[0].status;
-        if (opStatus === 'finalizada' || opStatus === 'encerrada') throw new Error("OP_FINALIZADA");
+        if (opStatus === 'concluido') throw new Error("OP_FINALIZADA");
 
         client_service_id = opCheck.rows[0].id;
       } else if (requiresOp) {

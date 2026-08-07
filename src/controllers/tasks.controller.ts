@@ -5,6 +5,14 @@ import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 
+// ── O GUARD DE OP ENCERRADA (migration 021) ────────────────────────────────────────────────
+// Os quatro guards deste arquivo (create/update de tarefa e de tarefa da elétrica) comparavam
+// 'finalizada'/'encerrada' — palavras que NUNCA existiram em client_services, cujos valores
+// reais sempre foram em_andamento/concluido. Nunca dispararam: a mensagem "Essa OP ja foi
+// finalizada" era código morto desde que nasceu. Com o vocabulário fechado pela 021, o terminal
+// tem UMA palavra e a comparação é uma só.
+const OP_ENCERRADA = 'concluido';
+
 // --- TAREFAS GERAIS (KANBAN) ---
 export const getTasks = async (req: Request, res: Response) => {
   try {
@@ -43,7 +51,7 @@ export const createTask = async (req: Request, res: Response) => {
     
     const opCheck = await pool.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
     if (opCheck.rows.length === 0) return res.status(404).json({ error: 'OP não encontrada no sistema. Verifique o número digitado.' });
-    if (opCheck.rows[0].status === 'finalizada' || opCheck.rows[0].status === 'encerrada') return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
+    if (opCheck.rows[0].status === OP_ENCERRADA) return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
     
     const client_service_id = opCheck.rows[0].id;
     // ----------------------------------------
@@ -78,7 +86,7 @@ export const updateTask = async (req: Request, res: Response) => {
     if (op_code !== undefined) {
       const opCheck = await pool.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
       if (opCheck.rows.length === 0) return res.status(404).json({ error: 'OP não encontrada no sistema.' });
-      if (opCheck.rows[0].status === 'finalizada' || opCheck.rows[0].status === 'encerrada') return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
+      if (opCheck.rows[0].status === OP_ENCERRADA) return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
       
       fields.push(`client_service_id = $${idx++}`);
       values.push(opCheck.rows[0].id);
@@ -160,7 +168,7 @@ export const createEletricaTask = async (req: Request, res: Response) => {
     
     const opCheck = await pool.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
     if (opCheck.rows.length === 0) return res.status(404).json({ error: 'OP não encontrada no sistema. Verifique o número digitado.' });
-    if (opCheck.rows[0].status === 'finalizada' || opCheck.rows[0].status === 'encerrada') return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
+    if (opCheck.rows[0].status === OP_ENCERRADA) return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
     
     const client_service_id = opCheck.rows[0].id;
 
@@ -189,7 +197,7 @@ export const updateEletricaTask = async (req: Request, res: Response) => {
     if (op_code !== undefined) {
       const opCheck = await pool.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
       if (opCheck.rows.length === 0) return res.status(404).json({ error: 'OP não encontrada no sistema.' });
-      if (opCheck.rows[0].status === 'finalizada' || opCheck.rows[0].status === 'encerrada') return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
+      if (opCheck.rows[0].status === OP_ENCERRADA) return res.status(400).json({ error: 'Essa OP ja foi finalizada, verifique a OP correta' });
       
       fields.push(`client_service_id = $${idx++}`);
       values.push(opCheck.rows[0].id);

@@ -252,8 +252,13 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
         const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
         if (opCheck.rows.length === 0) throw new Error("OP_NAO_ENCONTRADA");
 
+        // Guard REAL desde a 021 — e este é o que segura DINHEIRO. Comparava
+        // 'finalizada'/'encerrada', valores que nunca existiram em client_services, então nunca
+        // disparou: saída manual contra OP 'concluido' consumia estoque, criava separation
+        // amarrada à OP e fazia o total_cost dela (Σ saídas concluídas − devoluções) voltar a
+        // subir DEPOIS de encerrada, sem aviso em tela nenhuma.
         const opStatus = opCheck.rows[0].status;
-        if (opStatus === 'finalizada' || opStatus === 'encerrada') throw new Error("OP_FINALIZADA");
+        if (opStatus === 'concluido') throw new Error("OP_FINALIZADA");
 
         client_service_id = opCheck.rows[0].id;
       } else if (requiresOp) {

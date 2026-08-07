@@ -98,12 +98,33 @@ export const deleteClient = async (req: Request, res: Response) => {
   }
 };
 
+// ── O VOCABULÁRIO DE STATUS DA OP (migration 021) ──────────────────────────────────────────
+// FECHADO em dois valores. Esta lista é a MESMA do CHECK `client_services_status_chk`, e as duas
+// têm que andar juntas: quem mexer aqui mexe na migration, e vice-versa. A borda existe para dar
+// 400 com mensagem legível; o CHECK existe para o caminho que não passa por aqui (script de
+// carga, psql). Nenhum dos dois substitui o outro.
+const OP_STATUS_VALIDOS = ['em_andamento', 'concluido'] as const;
+
+// Palavras que o front antigo (e só ele) manda. Mantidas de propósito: o consumidor no ar ainda
+// as usa em algum caminho e traduzi-las é retrocompatibilidade barata. A normalização roda ANTES
+// da whitelist — 'finalizada' entra, vira 'concluido' e passa; 'banana' entra e toma 400.
+const OP_STATUS_LEGADO: Record<string, string> = {
+  finalizada: 'concluido',
+  done: 'concluido',
+  progress: 'em_andamento',
+};
+
 export const createService = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { op_code, description } = req.body;
     if (!op_code) return res.status(400).json({ error: 'O código da OP é obrigatório.' });
-    const query = `INSERT INTO client_services (client_id, op_code, description) VALUES ($1, $2, $3) RETURNING *`;
+    // `status` EXPLÍCITO, e não herdado do DEFAULT da coluna. O INSERT antigo omitia a coluna, e
+    // como o DEFAULT era 'pendente', TODA OP criada pela tela nascia num estado que o resto do
+    // sistema não reconhecia (o front a exibia como "Em andamento" pelo fallback). A 021 conserta
+    // o DEFAULT, mas depender de DEFAULT foi a causa raiz — dizer o valor aqui é o que impede a
+    // dívida de renascer no próximo INSERT que alguém escrever.
+    const query = `INSERT INTO client_services (client_id, op_code, description, status) VALUES ($1, $2, $3, 'em_andamento') RETURNING *`;
     const result = await pool.query(query, [id, op_code, description]);
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
@@ -115,15 +136,44 @@ export const createService = async (req: Request, res: Response) => {
 export const updateServiceStatus = async (req: Request, res: Response) => {
   try {
     const { serviceId } = req.params;
-    let { status } = req.body;
+    const bruto = req.body?.status;
 
-    // Correção: Transforma o texto que vem do Frontend para o padrão esperado no Banco de Dados
-    if (status === 'finalizada' || status === 'done') status = 'concluido';
-    if (status === 'progress') status = 'em_andamento';
+    // 1. AUSÊNCIA é 400, não NULL no banco. Antes, corpo sem `status` chegava como undefined ao
+    //    parâmetro do UPDATE, o node-postgres o convertia em null e a coluna (nullable) aceitava:
+    //    a OP ficava sem status nenhum e seguia sendo exibida como "Em andamento". Recusar na
+    //    borda é o conserto; o NOT NULL da 021 é a rede embaixo.
+    if (bruto === undefined || bruto === null || (typeof bruto === 'string' && bruto.trim() === '')) {
+      return res.status(400).json({ error: 'O status da OP é obrigatório.' });
+    }
+    if (typeof bruto !== 'string') {
+      return res.status(400).json({ error: 'Status inválido. Use: em_andamento ou concluido.' });
+    }
 
-    await pool.query('UPDATE client_services SET status = $1 WHERE id = $2', [status, serviceId]);
+    // 2. Normalização legada (comportamento preservado), depois whitelist.
+    const limpo = bruto.trim();
+    const status = OP_STATUS_LEGADO[limpo] ?? limpo;
+
+    if (!(OP_STATUS_VALIDOS as readonly string[]).includes(status)) {
+      return res.status(400).json({ error: 'Status inválido. Use: em_andamento ou concluido.' });
+    }
+
+    const r = await pool.query('UPDATE client_services SET status = $1 WHERE id = $2', [status, serviceId]);
+
+    // 3. rowCount 0 é 404. O `{ success: true }` incondicional de antes respondia "deu certo" para
+    //    um serviceId que não existe — a tela recarregava, nada mudava, e ninguém sabia por quê.
+    if (r.rowCount === 0) return res.status(404).json({ error: 'OP não encontrada.' });
+
     res.json({ success: true });
   } catch (error: any) {
+    // serviceId que não é UUID: o Postgres devolve 22P02 (invalid_text_representation) antes de
+    // comparar com linha nenhuma. Semanticamente é o mesmo caso do rowCount 0 — não existe OP com
+    // esse identificador — e merece a mesma resposta, não um 500 que sugere servidor quebrado.
+    if (error?.code === '22P02') return res.status(404).json({ error: 'OP não encontrada.' });
+    // BACKSTOP do CHECK da 021. Só chega aqui se a whitelist acima e o CHECK divergirem — ou seja,
+    // se alguém mexer num dos dois sem o outro. É recusa de regra, e 500 mentiria sobre a causa.
+    if (error?.code === '23514' && error?.constraint === 'client_services_status_chk') {
+      return res.status(400).json({ error: 'Status inválido. Use: em_andamento ou concluido.' });
+    }
     res.status(500).json({ error: 'Erro ao atualizar o status da OP: ' + error.message });
   }
 };

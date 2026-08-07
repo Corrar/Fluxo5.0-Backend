@@ -10,8 +10,9 @@
 //     2. current_database() conferido contra a declaração (o banco dizendo quem é).
 //   Sem as duas o smoke morre antes de tocar em qualquer coisa. Recusa `ep-mute-feather` sempre.
 //
-// ⚠ CLEANUP CIRÚRGICO na ordem das FKs, tudo por ID criado aqui: razão → stock → demandas →
-//   solicitações → produtos → OP → cliente. `audit_logs` NÃO é limpo (o livro é o livro).
+// ⚠ DESTRUICAO ESCOPADA DE DADOS DE TESTE (disciplina C — ver src/smokes/_cleanup.ts): apaga
+//   linha de `stock_ledger`, VIOLACAO CONSCIENTE de append-only, escopo assertado a propria
+//   execucao e DELETE por id conferido. Morre com a missao B. `audit_logs` NAO e tocado.
 //
 // ── AS PROVAS (i a xii da missão I-a) ────────────────────────────────────────────────────────
 //   i    b80d14c6 reproduzida: reserve(5) → ajuste(−4) → rejeição → release(1); a órfã não nasce.
@@ -25,7 +26,8 @@
 //   ix   idempotência: repetir cada mutação não move saldo nem cria linha no razão.
 //   x    REGRESSÃO não-3D: a fórmula deles (quantity_delivered ?? quantity_requested) intocada.
 //   xi   migration 020: backfill bate com o razão para solicitação viva e dá 0 para terminal.
-//   xii  release-orfas-3d em dry-run: plano = exatamente 4 releases (7/1/1/1), zero escrita.
+//   xii  release-orfas-3d em dry-run, ESTADO-AGNOSTICO: com orfas o plano bate com o medido;
+//        sem orfas, "0 aplicaveis" e o verde e os releases no razao provam a limpeza. Zero escrita.
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -33,6 +35,7 @@ dotenv.config();
 import { Pool } from 'pg';
 import { spawn, ChildProcess } from 'child_process';
 import net from 'net';
+import { destruicaoEscopadaDeDadosDeTeste, formatarContagem } from './_cleanup';
 
 const SENHA_SEED = 'Teste@123';
 const ADMIN = '001@fluxoroyale.local';
@@ -500,8 +503,35 @@ async function main(): Promise<void> {
     check(terminaisSujos.rows[0].n === 0, '(xi) nenhuma solicitação terminal com qty_reserved <> 0', `sujos=${terminaisSujos.rows[0].n}`);
 
     // =====================================================================
-    console.log('\n── (xii) release-orfas-3d: dry-run ───────────────────────');
+    console.log('\n── (xii) release-orfas-3d: dry-run (estado-agnóstico) ─────');
     // =====================================================================
+    // REESCRITA 07/08/2026. A versão original cravava "4/4 órfã(s) aplicável(is) — 10 unidade(s)"
+    // e "a órfã ed06c220 segue presa com 7". Era FIXTURE, não prova: no dia em que o
+    // release-orfas-3d rodou pra valer (o GO das órfãs, 07/08 19:06, `reason` "Correção lote I-a"),
+    // a asserção virou falsa POR FORA e o smoke ficou vermelho no repo sem nada estar quebrado.
+    // Smoke vermelho permanente treina a ignorar vermelho — então a prova passa a derivar o
+    // esperado do BANCO e a valer nos dois estados:
+    //   órfãs existem  -> o plano do dry-run bate com a contagem/unidades que nós medimos;
+    //   zero órfãs     -> "0 aplicáveis" É o verde, e o razão tem que CONTER os releases que
+    //                     fizeram a limpeza (senão "zero órfãs" poderia significar "nunca houve
+    //                     reserva", que é uma coisa completamente diferente de "foi liberada").
+    // Em ambos os estados o dry-run tem que declarar zero escrita e não mover uma unidade.
+
+    // O conjunto de órfãs pela MESMA definição do script: item 3D de solicitação TERMINAL com
+    // saldo de reserva > 0 no razão. Derivado, nunca hardcoded.
+    const ORFAS_SQL = `
+      SELECT ri.id, ri.request_id,
+             COALESCE((SELECT SUM(l.delta_reserved) FROM stock_ledger l
+                        WHERE l.op_key LIKE 'request:'||ri.request_id||':item:'||ri.id||':%'),0) AS saldo
+        FROM request_items ri
+        JOIN products p ON p.id = ri.product_id
+        JOIN requests r ON r.id = ri.request_id
+       WHERE p.is_3d = true AND r.status IN ('rejeitado','entregue','devolvido')`;
+    const orfasAntes = await pool.query(`SELECT * FROM (${ORFAS_SQL}) x WHERE x.saldo > 0`);
+    const nOrfas = orfasAntes.rowCount ?? 0;
+    const unidadesOrfas = orfasAntes.rows.reduce((a: number, r: any) => a + num(r.saldo), 0);
+    console.log(`  estado medido no banco: ${nOrfas} órfã(s), ${unidadesOrfas} unidade(s) presas.`);
+
     const dry = await new Promise<string>((resolve) => {
       const p = spawn(process.execPath, ['-r', 'ts-node/register', 'src/scripts/release-orfas-3d.ts'], {
         env: { ...process.env }, cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
@@ -511,35 +541,95 @@ async function main(): Promise<void> {
       p.stderr?.on('data', (b) => { out += b.toString(); });
       p.on('exit', () => resolve(out));
     });
-    check(dry.includes('4/4 órfã(s) aplicável(is) — 10 unidade(s)'), '(xii) plano = 4 órfãs, 10 unidades', dry.split('\n').filter((l) => l.includes('aplicável')).join('') || 'linha não encontrada');
+    const linhaPlano = dry.split('\n').filter((l) => l.includes('aplicável')).join('').trim();
+
+    // Invariantes que valem nos DOIS estados.
     check(dry.includes('DRY-RUN: nada foi escrito'), '(xii) dry-run declarou zero escrita', 'marcador ausente');
-    const orfasAindaPresas = await pool.query(
-      `SELECT COALESCE(SUM(l.delta_reserved),0) n FROM stock_ledger l
-        WHERE l.op_key LIKE 'request:ed06c220-1bb7-4358-91e5-fa6f565663f0:item:%'`);
-    check(num(orfasAindaPresas.rows[0].n) === 7, '(xii) órfã segue presa (o dry-run não escreveu)', String(orfasAindaPresas.rows[0].n));
+
+    if (nOrfas > 0) {
+      // Estado "há sujeira": o plano tem que bater com o que medimos, unidade por unidade.
+      check(
+        linhaPlano.includes(`${nOrfas} unidade`) || linhaPlano.includes(`— ${unidadesOrfas} unidade`),
+        `(xii) o plano do dry-run bate com as ${nOrfas} órfã(s) / ${unidadesOrfas} unidade(s) medidas`,
+        linhaPlano || 'linha de plano não encontrada');
+      check(new RegExp(`\\b${nOrfas}\\b`).test(linhaPlano),
+        `(xii) o plano cita a contagem medida (${nOrfas})`, linhaPlano || 'linha não encontrada');
+    } else {
+      // Estado "já limpo": zero aplicáveis É o verde...
+      check(/\b0\/0\b|\b0 órfã|0 aplicável|— 0 unidade/.test(linhaPlano),
+        '(xii) sem órfãs, o plano declara 0 aplicáveis — e isso É o verde', linhaPlano || 'linha não encontrada');
+      // ...mas só vale como prova de LIMPEZA se o razão contiver os releases que a fizeram.
+      // Para todo item 3D terminal que UM DIA reservou, tem que existir linha de liberação.
+      const liberacoes = await pool.query(`
+        SELECT count(*)::int reservaram,
+               count(*) FILTER (WHERE tem_release)::int com_release
+          FROM (
+            SELECT ri.id,
+                   EXISTS (SELECT 1 FROM stock_ledger l
+                            WHERE l.op_key LIKE 'request:'||ri.request_id||':item:'||ri.id||':%'
+                              AND l.delta_reserved > 0) AS reservou,
+                   EXISTS (SELECT 1 FROM stock_ledger l
+                            WHERE l.op_key LIKE 'request:'||ri.request_id||':item:'||ri.id||':%'
+                              AND l.delta_reserved < 0) AS tem_release
+              FROM request_items ri
+              JOIN products p ON p.id = ri.product_id
+              JOIN requests r ON r.id = ri.request_id
+             WHERE p.is_3d = true AND r.status IN ('rejeitado','entregue','devolvido')
+          ) y WHERE y.reservou`);
+      const { reservaram, com_release } = liberacoes.rows[0];
+      check(reservaram > 0,
+        '(xii) existe histórico de reserva 3D em solicitação terminal (senão "zero órfãs" não prova nada)',
+        `itens que reservaram=${reservaram}`);
+      check(reservaram === com_release,
+        `(xii) TODO item 3D terminal que reservou tem release no razão — a limpeza está registrada (${com_release}/${reservaram})`,
+        `com release=${com_release} de ${reservaram}`);
+    }
+
+    // O dry-run não move nada, em qualquer estado.
+    const orfasDepois = await pool.query(`SELECT * FROM (${ORFAS_SQL}) x WHERE x.saldo > 0`);
+    const unidadesDepois = orfasDepois.rows.reduce((a: number, r: any) => a + num(r.saldo), 0);
+    check((orfasDepois.rowCount ?? 0) === nOrfas && unidadesDepois === unidadesOrfas,
+      '(xii) o dry-run não moveu uma unidade (estado idêntico antes e depois)',
+      `antes ${nOrfas}/${unidadesOrfas}, depois ${orfasDepois.rowCount}/${unidadesDepois}`);
 
   } finally {
-    // ── CLEANUP CIRÚRGICO, na ordem das FKs, tudo por id criado aqui ────────
-    try {
-      if (requestsCriadas.length) {
-        await pool.query(`DELETE FROM demands_3d WHERE request_id = ANY($1::uuid[])`, [requestsCriadas]);
-        await pool.query(`DELETE FROM op_returns WHERE client_service_id = $1`, [opId || null]);
-        await pool.query(`DELETE FROM requests WHERE id = ANY($1::uuid[])`, [requestsCriadas]); // request_items via CASCADE
-      }
-      if (produtosCriados.length) {
+    // ── DESTRUIÇÃO ESCOPADA DE DADOS DE TESTE (disciplina C) ────────────────
+    // Era "cleanup cirúrgico": nome que descrevia o cuidado e escondia o ato. Isto APAGA linha de
+    // `stock_ledger` — violação consciente de append-only, com escopo assertado à própria execução
+    // (ver src/smokes/_cleanup.ts) e DELETE por id conferido. Antes, o passo do razão era um
+    // `DELETE ... WHERE product_id = ANY(...)` solto no meio de um try único, sem contagem
+    // logada — foi essa forma que virou incidente em 07/08/2026. Morre com a missão B.
+    const destruicao = await destruicaoEscopadaDeDadosDeTeste(pool, {
+      marca: stamp,
+      produtos: produtosCriados,
+      etapas: [
+        ['demands_3d', `DELETE FROM demands_3d WHERE request_id = ANY($1::uuid[])`, [requestsCriadas]],
+        ['op_returns', `DELETE FROM op_returns WHERE client_service_id = $1`, [opId || null]],
+        ['requests',   `DELETE FROM requests WHERE id = ANY($1::uuid[])`, [requestsCriadas]], // request_items via CASCADE
         // xml_items: a entrada de estoque (POST /stock/entries) grava o item da nota. FK sem
         // cascade — precisa sair antes do produto.
-        await pool.query(`DELETE FROM xml_items WHERE product_id = ANY($1::uuid[])`, [produtosCriados]);
-        await pool.query(`DELETE FROM stock_ledger WHERE product_id = ANY($1::uuid[])`, [produtosCriados]);
-        await pool.query(`DELETE FROM stock WHERE product_id = ANY($1::uuid[])`, [produtosCriados]);
-        await pool.query(`DELETE FROM products WHERE id = ANY($1::uuid[])`, [produtosCriados]);
-      }
-      if (opId) await pool.query(`DELETE FROM client_services WHERE id = $1`, [opId]);
-      if (clienteId) await pool.query(`DELETE FROM clients WHERE id = $1`, [clienteId]);
-      const sobra = await pool.query(`SELECT (SELECT count(*)::int FROM requests) r, (SELECT count(*)::int FROM products WHERE sku LIKE '9.99.%') p`);
-      console.log(`\n  cleanup cirúrgico: ${requestsCriadas.length} solicitação(ões) e ${produtosCriados.length} produto(s) removidos. Restam requests=${sobra.rows[0].r}, produtos da faixa 9.99.%=${sobra.rows[0].p}.`);
+        ['xml_items',  `DELETE FROM xml_items WHERE product_id = ANY($1::uuid[])`, [produtosCriados]],
+        ['stock',      `DELETE FROM stock WHERE product_id = ANY($1::uuid[])`, [produtosCriados]],
+        ['products',   `DELETE FROM products WHERE id = ANY($1::uuid[])`, [produtosCriados]],
+        ['client_services', `DELETE FROM client_services WHERE id = $1`, [opId || null]],
+        ['clients',    `DELETE FROM clients WHERE id = $1`, [clienteId || null]],
+      ],
+    });
+    console.log(`\n  destruição escopada: ${formatarContagem(destruicao)}`);
+    console.log(`  razão apagado nesta execução (violação consciente, escopo próprio): ${destruicao.razaoApagado} linha(s).`);
+    check(destruicao.ok, 'destruição escopada: escopo conferido e todas as etapas OK', destruicao.motivo || destruicao.falhas.join(' | '));
+    if (!destruicao.ok) console.error('  ⚠', destruicao.motivo, destruicao.falhas.join(' | '));
+    try {
+      const sobra = await pool.query(`SELECT (SELECT count(*)::int FROM requests) r,
+        (SELECT count(*)::int FROM products WHERE sku LIKE '9.99.%') p,
+        (SELECT count(*)::int FROM stock_ledger l WHERE NOT EXISTS
+          (SELECT 1 FROM products x WHERE x.id = l.product_id)) orfas`);
+      const s = sobra.rows[0];
+      console.log(`  restam: requests=${s.r}, produtos da faixa 9.99.%=${s.p}.`);
+      check(s.orfas === 0, 'destruição escopada: nenhuma linha de razão órfã de produto', `órfãs=${s.orfas}`);
     } catch (e: any) {
-      console.error('  ⚠ cleanup falhou:', e?.message ?? e);
+      console.error('  ⚠ contagem de resíduo falhou:', e?.message ?? e);
+      failures.push('contagem de resíduo falhou');
     }
     await pool.end();
     if (servidor) {
