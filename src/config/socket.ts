@@ -107,6 +107,32 @@ export const emitStockState = (items: StockStatePayload[]): void => {
   io.emit('stock_state', { at: Date.now(), items });
 };
 
+/**
+ * Aviso de que o SALDO de um ou mais produtos mudou. Um caminho único para os dois mundos:
+ *
+ *   - com request (`req.io`, injetado no server.ts:119) — controllers;
+ *   - SEM request — o cron de expiração, que não tem `req` nenhum e por isso era mudo. Aqui ele
+ *     cai no `io` do módulo, o mesmo que o `emitStockState` acima já usa.
+ *
+ * `if (!io) return` (mesma disciplina do emitStockState): num smoke/teste sem socket inicializado
+ * a emissão é no-op em vez de derrubar a operação de estoque — avisar a tela nunca pode ser mais
+ * importante do que a transação que acabou de comitar.
+ *
+ * Payload `{ changedProducts }` — o mesmo dos emits que o requests.controller já fazia, para que
+ * uma tela de saldo consiga tratar TODOS os caminhos com um handler só e ainda dê para fazer
+ * patch cirúrgico (em vez de recarregar tudo).
+ *
+ * SEMPRE pós-commit: a tela não pode ser avisada de um saldo que a transação ainda pode desfazer.
+ */
+export const emitStockChanged = (changedProducts: Array<string | null | undefined>, reqIo?: unknown): void => {
+  const alvo = (reqIo as typeof io) ?? io;
+  if (!alvo) return;
+  // dedup + descarta nulos (item custom/sem produto não move estoque e não deve entrar no aviso)
+  const produtos = Array.from(new Set(changedProducts.filter((p): p is string => !!p)));
+  if (produtos.length === 0) return;
+  alvo.emit('stock_updated', { changedProducts: produtos });
+};
+
 /** Emissão autoritativa de um recurso de fluxo (separação/solicitação) já com a nova version. */
 export const emitResourceState = (
   resource: 'separation' | 'request',

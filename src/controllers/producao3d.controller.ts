@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { pool, query, withTransaction } from '../db';
 import { StockService, StockError } from '../services/stock.service';
+import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 // ==========================================
@@ -110,6 +111,8 @@ const normText = (v: any): string | null => {
 };
 
 export const updateDemandStatus = async (req: Request, res: Response) => {
+  // Saldo alterado nesta operação (conclusão de demanda = receive + reserve). Emitido só após o commit.
+  const produtosTocados: Array<string | null> = [];
   const { id } = req.params;
   const { status, reason } = req.body;
   const userId = (req as any).user.id;
@@ -143,6 +146,7 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
       if (status === 'Concluída') {
         const quantity = Number(cur.rows[0].quantity);
         const productId = cur.rows[0].product_id;
+        produtosTocados.push(productId);   // p/ o stock_updated pós-commit
         const requestId = cur.rows[0].request_id;
 
         if (productId) {
@@ -175,6 +179,10 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
         }
       }
     });
+
+    // A conclusão da demanda dá receive + reserve no pooled e NÃO avisava ninguém — este
+    // controller não tinha emit nenhum. A Vitrine 3D e as telas de saldo dependiam do F5.
+    emitStockChanged(produtosTocados, (req as any).io);
 
     res.json({ success: true });
   } catch (error: any) {
@@ -290,6 +298,7 @@ const PRODUCTION_SELECT = `id, product_id as "partId", demand_id as "demandId", 
   total_minutes as "totalMinutes", filament_grams as "filamentGrams", date, operator_id as operator`;
 
 export const createProduction = async (req: Request, res: Response) => {
+  let produtoTocadoCreate: string | null = null;   // emitido só após o commit
   const { partId, demandId, quantity, totalMinutes, filamentGrams, date } = req.body;
   const operatorId = (req as any).user?.id || null;
   const qty = Number(quantity);
@@ -334,6 +343,7 @@ export const createProduction = async (req: Request, res: Response) => {
       await StockService.receive(client, partId, warehouseId, POOLED_OP_ID, qty, {
         refType: 'production_3d', refId: prod.id, userId: operatorId, opKey, reason,
       });
+      produtoTocadoCreate = partId;   // p/ o stock_updated pós-commit
 
       // PÓS-CHECK de corrida (só com header): se o razão desta op_key aponta p/ OUTRA produção, um POST
       // concorrente idêntico venceu o crédito enquanto o receive daqui caiu no alreadyApplied (no-op, sem
@@ -351,6 +361,9 @@ export const createProduction = async (req: Request, res: Response) => {
 
       return prod;
     });
+
+    // Peça impressa ENTRA no físico e a Vitrine 3D nunca era avisada.
+    emitStockChanged([produtoTocadoCreate], (req as any).io);
 
     return res.status(201).json(result);
   } catch (error: any) {
@@ -376,6 +389,7 @@ export const createProduction = async (req: Request, res: Response) => {
 };
 
 export const deleteProduction = async (req: Request, res: Response) => {
+  let produtoTocadoDelete: string | null = null;   // emitido só após o commit
   const { id } = req.params;
   const operatorId = (req as any).user?.id || null;
 
@@ -395,6 +409,7 @@ export const deleteProduction = async (req: Request, res: Response) => {
       // a produção NÃO é apagada (fim do GREATEST(...,0) que pisava em 0 silenciosamente). op_key
       // content-addressed no id estável -> idempotente mesmo numa corrida.
       if (productId && qty > 0) {
+        produtoTocadoDelete = productId;
         await StockService.reverseReceive(client, productId, warehouseId, POOLED_OP_ID, qty, {
           refType: 'production_3d', refId: id, userId: operatorId,
           opKey: `production:${id}:reverse:${qty}`,
@@ -408,6 +423,9 @@ export const deleteProduction = async (req: Request, res: Response) => {
         [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id: productId, quantity: qty, reason: 'Correção: Apagou registo de Produção 3D' })],
       );
     });
+
+    // Reverter a entrada REDUZ on_hand — movimento de saldo tão real quanto a entrada.
+    emitStockChanged([produtoTocadoDelete], (req as any).io);
 
     return res.json({ success: true });
   } catch (error: any) {

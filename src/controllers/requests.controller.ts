@@ -1,7 +1,8 @@
 // src/controllers/requests.controller.ts
 
 import { Request, Response } from 'express';
-import { pool, withTransaction } from '../db';
+import { pool, query as dbQuery, withTransaction } from '../db';
+import { emitStockChanged } from '../config/socket';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { sendPushNotificationToRole } from '../utils/notifications';
@@ -49,7 +50,10 @@ export const getRequests = async (req: Request, res: Response) => {
           WHERE ri.request_id IN (SELECT id FROM FilteredRequests) GROUP BY ri.request_id
       ) ri_agg ON ri_agg.request_id = r.id ORDER BY r.created_at DESC;
     `;
-    const { rows } = await pool.query(query);
+    // RETRY explícito: a query começa com WITH e o auto-detect do db.ts (isReadOnlyStatement,
+    // só SELECT/…) não a marca como retentável — e isto passava por `pool.query` CRU, fora do
+    // wrapper inteiro. Leitura idempotente ⇒ {retryable:true} cobre o cold start do Neon.
+    const { rows } = await dbQuery(query, [], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar solicitações' }); }
 };
@@ -86,7 +90,10 @@ export const getMyRequests = async (req: Request, res: Response) => {
           WHERE ri.request_id IN (SELECT id FROM FilteredRequests) GROUP BY ri.request_id
       ) ri_agg ON ri_agg.request_id = r.id ORDER BY r.created_at DESC;
     `;
-    const { rows } = await pool.query(query, [userId]);
+    // RETRY explícito: a query começa com WITH e o auto-detect do db.ts (isReadOnlyStatement,
+    // só SELECT/…) não a marca como retentável — e isto passava por `pool.query` CRU, fora do
+    // wrapper inteiro. Leitura idempotente ⇒ {retryable:true} cobre o cold start do Neon.
+    const { rows } = await dbQuery(query, [userId], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar minhas solicitações' }); }
 };
@@ -333,6 +340,16 @@ export const createRequest = async (req: Request, res: Response) => {
     if (error instanceof StockError) {
       return res.status(400).json({ error: `Erro Técnico: ${error.message}` });
     }
+    // Perdedor de CORRIDA: duas chamadas idênticas em paralelo. A 2ª passou o `alreadyApplied`
+    // do motor ANTES de a 1ª comitar e bateu no índice único da op_key. O withTransaction já fez
+    // ROLLBACK -> NADA duplicou e o saldo é o do vencedor; devolver 500 mentiria sobre um estado
+    // que está correto. Este era o único controller de estoque sem esta rede (os outros seis já
+    // a tinham). Cirúrgico: outro 23505 (constraint diferente) segue para o tratamento normal,
+    // para não mascarar bug real.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'request_create_idempotent_conflict', detail: error?.detail ?? null }));
+      return res.json({ success: true, idempotent: true });
+    }
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
     if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP ja foi finalizada, verifique a OP correta" });
@@ -532,6 +549,16 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    // Perdedor de CORRIDA: duas chamadas idênticas em paralelo. A 2ª passou o `alreadyApplied`
+    // do motor ANTES de a 1ª comitar e bateu no índice único da op_key. O withTransaction já fez
+    // ROLLBACK -> NADA duplicou e o saldo é o do vencedor; devolver 500 mentiria sobre um estado
+    // que está correto. Este era o único controller de estoque sem esta rede (os outros seis já
+    // a tinham). Cirúrgico: outro 23505 (constraint diferente) segue para o tratamento normal,
+    // para não mascarar bug real.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'request_status_idempotent_conflict', detail: error?.detail ?? null }));
+      return res.json({ success: true, idempotent: true });
+    }
     if (typeof error?.message === 'string' && error.message.startsWith('VALIDACAO_QTD:')) {
       return res.status(400).json({ error: error.message.slice('VALIDACAO_QTD:'.length) });
     }
@@ -605,6 +632,16 @@ export const deleteRequest = async (req: Request, res: Response) => {
     res.json({ success: true, message: 'Pedido cancelado.' });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    // Perdedor de CORRIDA: duas chamadas idênticas em paralelo. A 2ª passou o `alreadyApplied`
+    // do motor ANTES de a 1ª comitar e bateu no índice único da op_key. O withTransaction já fez
+    // ROLLBACK -> NADA duplicou e o saldo é o do vencedor; devolver 500 mentiria sobre um estado
+    // que está correto. Este era o único controller de estoque sem esta rede (os outros seis já
+    // a tinham). Cirúrgico: outro 23505 (constraint diferente) segue para o tratamento normal,
+    // para não mascarar bug real.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'request_delete_idempotent_conflict', detail: error?.detail ?? null }));
+      return res.json({ success: true, idempotent: true });
+    }
     if (error.message === '__NOT_FOUND__') return res.status(404).json({ error: 'Não encontrada.' });
     res.status(500).json({ error: error.message });
   }
@@ -615,6 +652,7 @@ export const deleteRequest = async (req: Request, res: Response) => {
 // =========================================================================
 
 export const partialReturnRequest = async (req: Request, res: Response) => {
+  const produtosDevolvidos: string[] = [];   // saldo alterado; emitido pós-commit
   const { id } = req.params; // ID do Request
   const userId = (req as any).user.id;
   const { returns } = req.body; // Array: [{ request_item_id, quantity_to_return }]
@@ -655,6 +693,7 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
 
         // 2. Devolve ao stock físico pelo motor (se não for 3D)
         if (item.product_id && !item.is_3d && returnQty > 0) {
+          produtosDevolvidos.push(item.product_id);
           await StockService.receive(client, item.product_id, warehouseId, POOLED_OP_ID, returnQty, {
             refType: 'request', refId: id, userId,
             opKey: `request:${id}:item:${ret.request_item_id}:receive:${alreadyReturned + returnQty}`,
@@ -679,10 +718,24 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
       (req as any).io.emit('refresh_requests');
       (req as any).io.emit('refresh_stock');
     }
+    // 'refresh_stock' é o evento CRU do 2.0, sem payload: quem o escutasse teria de recarregar
+    // tudo. Ele fica (contrato antigo), mas ao lado sai o 'stock_updated' com changedProducts,
+    // igual a todos os outros caminhos — assim uma tela de saldo trata TUDO com um handler só.
+    emitStockChanged(produtosDevolvidos, (req as any).io);
 
     res.json({ success: true, message: "Devolução parcial processada com sucesso!" });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    // Perdedor de CORRIDA: duas chamadas idênticas em paralelo. A 2ª passou o `alreadyApplied`
+    // do motor ANTES de a 1ª comitar e bateu no índice único da op_key. O withTransaction já fez
+    // ROLLBACK -> NADA duplicou e o saldo é o do vencedor; devolver 500 mentiria sobre um estado
+    // que está correto. Este era o único controller de estoque sem esta rede (os outros seis já
+    // a tinham). Cirúrgico: outro 23505 (constraint diferente) segue para o tratamento normal,
+    // para não mascarar bug real.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'request_return_idempotent_conflict', detail: error?.detail ?? null }));
+      return res.json({ success: true, idempotent: true });
+    }
     res.status(500).json({ error: error.message || 'Erro ao processar devolução parcial' });
   }
 };

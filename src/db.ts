@@ -8,6 +8,65 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// ── GUARD DE BOOT: o 5.0 NUNCA fala com a produção do 2.0 ────────────────────
+// `ep-mute-feather` é o compute Neon da produção 2.0. Nenhum código deste repositório tem
+// negócio nesse host: o 5.0 roda contra o seu próprio banco (staging/produção 5.0). Se a URL
+// apontar para lá, o processo MORRE ANTES de o pool existir — não há caminho para uma query
+// escapar, porque a conexão nunca chega a ser configurada.
+//
+// POR QUE ISTO EXISTE: `dotenv.config()` acima injeta o .env do repositório em qualquer
+// processo que importe este módulo — script, smoke, job, sessão de auditoria. Durante a
+// auditoria de estoque um processo local subiu com o .env do repo carregado e só não escreveu
+// no banco errado por sorte de precedência de variável. Sorte não é controle: o guard é.
+//
+// Vale para QUALQUER processo (o server, os smokes, qualquer `ts-node`), porque mora no db.ts
+// e todo mundo passa por aqui para obter o pool.
+const HOST_PROIBIDO = 'ep-mute-feather';
+const urlDoBanco = process.env.DATABASE_URL ?? '';
+
+// Host SEM credencial, para poder aparecer em log: de `<esquema>://<user>:<pass>@HOST:5432/db`
+// devolve só `HOST:5432`. Se a URL não casar, devolve o marcador em vez de vazar a string crua.
+const hostDaUrl = (url: string): string =>
+  (url.includes('@') ? url.replace(/^.*@/, '').replace(/[/?].*$/, '') : '') || '(host não extraído)';
+
+if (urlDoBanco.includes(HOST_PROIBIDO)) {
+  // Nunca imprime a URL: ela carrega credencial. Só o host, que é o que importa diagnosticar.
+  console.error(
+    `\n🛑 BOOT RECUSADO — DATABASE_URL aponta para a PRODUÇÃO 2.0 (${HOST_PROIBIDO}).\n` +
+    `   host: ${hostDaUrl(urlDoBanco)}\n` +
+    `   O Fluxo 5.0 não opera nesse banco. Corrija a DATABASE_URL e suba de novo.\n`,
+  );
+  process.exit(78);   // 78 = EX_CONFIG (sysexits): erro de configuração, não de código.
+}
+
+// ── GUARD POSITIVO (opt-in): FR_EXPECT_DB_HOST ───────────────────────────────
+// O guard acima é uma LISTA NEGRA de um item só: protege a produção 2.0 e mais nada. Ele não
+// cobre a falha que já mordeu duas vezes em dois dias — "herdei o .env em silêncio": um script,
+// smoke ou harness sobe sem DATABASE_URL, o `dotenv.config()` injeta o .env do repositório, e o
+// processo vai falar com um banco REAL achando que está num efêmero. Ninguém percebe, porque
+// nada está errado do ponto de vista do guard negativo: o host é legítimo — só não é o que o
+// autor do script tinha em mente.
+//
+// Aqui a intenção deixa de ser implícita. Quem sabe em que banco quer estar DECLARA:
+//     FR_EXPECT_DB_HOST=frhig  node script.js
+// e o processo recusa subir se a URL efetiva não contiver essa string. É uma trava de mesa —
+// declaro o alvo antes de agir, e a divergência vira erro alto em vez de escrita silenciosa.
+//
+// OPT-IN PURO: variável ausente = comportamento byte-a-byte o de hoje. Produção (Render) e dev
+// não mudam em nada; quem quiser a rede, seta. Substring, não igualdade, para servir tanto ao
+// nome do banco (`frhig`) quanto ao host completo (`ep-summer-wave-...aws.neon.tech`).
+const hostEsperado = (process.env.FR_EXPECT_DB_HOST ?? '').trim();
+if (hostEsperado && !urlDoBanco.includes(hostEsperado)) {
+  console.error(
+    `\n🛑 BOOT RECUSADO — DATABASE_URL não bate com FR_EXPECT_DB_HOST.\n` +
+    `   esperado (contendo): ${hostEsperado}\n` +
+    `   encontrado (host):   ${hostDaUrl(urlDoBanco)}\n` +
+    `   Alguém declarou um banco e o processo recebeu outro — normalmente é o .env do repo\n` +
+    `   sendo herdado em silêncio. Corrija a DATABASE_URL (ou a expectativa) e suba de novo.\n`,
+  );
+  process.exit(78);
+}
+
 // ── Timeouts (via env, com defaults) ─────────────────────────────────────────
 // connect: sobe p/ 20s dando margem ao WAKE do compute Neon (auto-suspend serverless).
 // query/statement: 15s por tentativa — NÃO subimos pra 60s (isso troca "erro rápido"

@@ -6,6 +6,7 @@ import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
+import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 import {
   registerPendingReturns,
@@ -92,6 +93,16 @@ export const updateStock = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { quantity_on_hand, quantity_reserved } = req.body;
 
+  // Âncora de idempotência OPCIONAL (mesma disciplina de manualWithdrawal/registerEntries):
+  // quando o cliente manda `X-Idempotency-Key`, ela entra na op_key e dois PUTs idênticos viram
+  // um só. Sem header, a op_key content-addressed (`stock:<id>:adjust:<valor>`) já dá a
+  // convergência — agora de verdade, porque o StockService.adjust passou a CONSULTAR a chave.
+  // Só string; header repetido (array) ou vazio → ausente.
+  const rawIdemUpd = req.headers['x-idempotency-key'];
+  const idemKeyUpd = typeof rawIdemUpd === 'string' && rawIdemUpd.trim() ? rawIdemUpd.trim() : null;
+  const sufixoIdem = idemKeyUpd ? `:idem:${idemKeyUpd}` : '';
+  let produtoAfetado: string | null = null;   // preenchido DENTRO da transação, emitido depois do commit
+
   try {
     const userCheck = await pool.query('SELECT role, sector FROM profiles WHERE id = $1', [userId]);
     const isMaster = userCheck.rows[0]?.role === 'admin' || userCheck.rows[0]?.role === 'almoxarife';
@@ -126,7 +137,7 @@ export const updateStock = async (req: Request, res: Response) => {
       if (quantity_on_hand !== undefined) {
         await StockService.adjust(client, product_id, warehouse_id, op_id, Number(quantity_on_hand), {
           refType: 'stock_adjust', refId: id, userId,
-          opKey: `stock:${id}:adjust:${Number(quantity_on_hand)}`,
+          opKey: `stock:${id}:adjust:${Number(quantity_on_hand)}${sufixoIdem}`,
           reason: 'Ajuste manual de inventário',
         });
       }
@@ -137,21 +148,35 @@ export const updateStock = async (req: Request, res: Response) => {
         const delta = target - curReserved;
         if (delta > 0) {
           await StockService.reserve(client, product_id, warehouse_id, op_id, delta, {
-            refType: 'stock_adjust', refId: id, userId, opKey: `stock:${id}:reserveadj:${target}`, reason: 'Ajuste manual de reserva',
+            refType: 'stock_adjust', refId: id, userId, opKey: `stock:${id}:reserveadj:${target}${sufixoIdem}`, reason: 'Ajuste manual de reserva',
           });
         } else if (delta < 0) {
           await StockService.release(client, product_id, warehouse_id, op_id, -delta, {
-            refType: 'stock_adjust', refId: id, userId, opKey: `stock:${id}:releaseadj:${target}`, reason: 'Ajuste manual de reserva',
+            refType: 'stock_adjust', refId: id, userId, opKey: `stock:${id}:releaseadj:${target}${sufixoIdem}`, reason: 'Ajuste manual de reserva',
           });
         }
       }
 
       await createLog(userId, 'UPDATE_STOCK', { stock_id: id, old_qty: curOnHand, new_qty: quantity_on_hand }, getClientIp(req), client);
+      produtoAfetado = product_id;
     });
+
+    // Ajuste manual MOVE SALDO e era mudo: nenhuma tela ficava sabendo. Mesmo payload dos emits
+    // já existentes ({ changedProducts }), para as telas de saldo poderem tratar todos os
+    // caminhos com um handler só.
+    emitStockChanged([produtoAfetado], (req as any).io);
 
     res.json({ success: true });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    // Corrida: dois PUTs idênticos em paralelo. O 1º comitou; o 2º passou o `alreadyApplied`
+    // ANTES do commit dele e bateu no índice único da op_key. O withTransaction já fez ROLLBACK
+    // -> nada duplicou, o saldo é o do vencedor. Responde idempotente. Cirúrgico de propósito:
+    // outro 23505 (constraint diferente) RE-LANÇA para não mascarar bug real.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      console.warn(JSON.stringify({ event: 'stock_adjust_idempotent_conflict', stock_id: id }));
+      return res.json({ success: true, idempotent: true });
+    }
     res.status(500).json({ error: 'Erro ao ajustar estoque' });
   }
 };
@@ -298,6 +323,10 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
 
       await createLog(userId, 'MANUAL_WITHDRAWAL', { separationId, sector }, getClientIp(req), client);
     });
+
+    // Saída manual baixa FÍSICO e era muda. Cobre os dois ramos (idempotente e legado): a lista
+    // de produtos vem do corpo, que é a mesma dos consume() acima.
+    emitStockChanged((items ?? []).map((i: any) => i?.product_id), (req as any).io);
 
     res.status(201).json({ success: true });
   } catch (error: any) {
@@ -459,6 +488,8 @@ export const conferReturn = async (req: Request, res: Response) => {
       await createLog(userId, 'OP_RETURN_CONFER', { request_id: id, conferred_qty: r.conferredQty }, getClientIp(req), client);
       return r;
     });
+    // Conferir devolução dá RECEIVE no pooled (returns.service:241) — crédito de saldo que era mudo.
+    emitStockChanged([(result as any)?.request?.product_id], (req as any).io);
     res.status(201).json({
       success: true,
       message: 'Devolução conferida e creditada ao estoque.',
@@ -617,6 +648,11 @@ export const registerEntries = async (req: Request, res: Response) => {
         type: 'entrada'
       });
     }
+    // A entrada por NF é a maior movimentação de saldo do almoxarifado e só avisava 'compras'
+    // com uma notificação de UX — nenhuma tela de SALDO era avisada.
+    // Fonte = as chaves do `byProduct`, o MESMO agrupamento que alimentou os receive() (e não a
+    // lista crua de `entries`, que pode repetir o mesmo produto em linhas diferentes da NF).
+    emitStockChanged([...byProduct.keys()], (req as any).io);
 
     res.status(201).json({ success: true, message: 'Entradas registadas com sucesso.' });
   } catch (error: any) {

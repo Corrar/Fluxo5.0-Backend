@@ -1,9 +1,10 @@
 import { Request, Response } from 'express';
-import { pool, withTransaction } from '../db';
+import { pool, query as dbQuery, withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
+import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 // Guard de status da separação. Erro TIPADO para o catch mapear HTTP sem cair no 500 genérico:
@@ -22,13 +23,15 @@ class SeparationGuardError extends Error {
 
 export const getSeparations = async (req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(`
+    // RETRY explícito: era `pool.query` CRU, fora do wrapper do db.ts — origem conhecida do 500
+    // intermitente desta fila no cold start do Neon. Leitura idempotente ⇒ retentável.
+    const { rows } = await dbQuery(`
       SELECT s.*,
         (SELECT json_agg(json_build_object('id', si.id, 'product_id', si.product_id, 'quantity', si.quantity, 'qty_requested', si.qty_requested, 'observation', si.observation, 'products', json_build_object('name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price, 'stock', json_build_object('quantity_on_hand', COALESCE(st.quantity_on_hand, 0), 'quantity_reserved', COALESCE(st.quantity_reserved, 0)))))
          FROM separation_items si JOIN products p ON si.product_id = p.id LEFT JOIN stock st ON p.id = st.product_id WHERE si.separation_id = s.id) as items,
         (SELECT json_agg(json_build_object('id', sr.id, 'product_id', sr.product_id, 'quantity', sr.quantity, 'status', sr.status, 'product_name', p.name)) FROM separation_returns sr JOIN products p ON sr.product_id = p.id WHERE sr.separation_id = s.id) as returns
       FROM separations s ORDER BY s.created_at DESC
-    `);
+    `, [], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar separações' }); }
 };
@@ -66,6 +69,9 @@ export const createSeparation = async (req: Request, res: Response) => {
 };
 
 export const authorizeSeparation = async (req: Request, res: Response) => {
+  // Produtos cujo SALDO mudou nesta operação. Preenchido DENTRO da transação, emitido só
+  // DEPOIS do commit — a tela não pode ser avisada de saldo que ainda pode ser desfeito.
+  const produtosTocados: string[] = [];
   const { id } = req.params;
   const { items, action } = req.body;
   const userId = (req as any).user.id;
@@ -99,6 +105,7 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
           if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida.");
 
           const productId = oldItem.rows[0].product_id;
+          if (productId) produtosTocados.push(productId);   // p/ o stock_updated pós-commit
           const diff = newQty - oldQty;
           await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
@@ -146,6 +153,9 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
     });
 
     if ((req as any).io) (req as any).io.emit('separations_update');
+    // 'separations_update' fala da SEPARAÇÃO; nenhuma tela de saldo o escuta. O estoque
+    // mudou aqui (consume/release/receive) e precisa do seu próprio aviso.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (error: any) {
     // Idempotência sob concorrência: se dois 'entregar' escaparem do alreadyApplied() do razão,
@@ -171,6 +181,9 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
 };
 
 export const deleteSeparation = async (req: Request, res: Response) => {
+  // Produtos cujo SALDO mudou nesta operação. Preenchido DENTRO da transação, emitido só
+  // DEPOIS do commit — a tela não pode ser avisada de saldo que ainda pode ser desfeito.
+  const produtosTocados: string[] = [];
   const { id } = req.params;
   const userId = (req as any).user.id;
   try {
@@ -187,6 +200,7 @@ export const deleteSeparation = async (req: Request, res: Response) => {
       for (const item of itemsRes.rows) {
         const qty = parseFloat(item.quantity || 0);
         if (item.product_id && qty > 0) {
+          produtosTocados.push(item.product_id);
           await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
             refType: 'separation', refId: id, userId,
             opKey: `separation:${id}:item:${item.id}:release:cancel`,
@@ -200,6 +214,9 @@ export const deleteSeparation = async (req: Request, res: Response) => {
     });
 
     if ((req as any).io) (req as any).io.emit('separations_update');
+    // 'separations_update' fala da SEPARAÇÃO; nenhuma tela de saldo o escuta. O estoque
+    // mudou aqui (consume/release/receive) e precisa do seu próprio aviso.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
@@ -208,6 +225,9 @@ export const deleteSeparation = async (req: Request, res: Response) => {
 
 // 🛠️ Editar Pedido (updateSeparation)
 export const updateSeparation = async (req: Request, res: Response) => {
+  // Produtos cujo SALDO mudou nesta operação. Preenchido DENTRO da transação, emitido só
+  // DEPOIS do commit — a tela não pode ser avisada de saldo que ainda pode ser desfeito.
+  const produtosTocados: string[] = [];
   const { id } = req.params;
   const { client_name, production_order, destination, items, client_service_id } = req.body;
   const userId = (req as any).user.id;
@@ -233,6 +253,7 @@ export const updateSeparation = async (req: Request, res: Response) => {
         if (!newProductIds.includes(old.product_id)) {
           const qty = parseFloat(old.quantity || 0);
           if (qty > 0 && old.product_id) {
+            produtosTocados.push(old.product_id);
             await StockService.release(client, old.product_id, warehouseId, POOLED_OP_ID, qty, {
               refType: 'separation', refId: id, userId,
               opKey: `separation:${id}:item:${old.id}:release:edit`,
@@ -257,6 +278,9 @@ export const updateSeparation = async (req: Request, res: Response) => {
     });
 
     if ((req as any).io) (req as any).io.emit('separations_update');
+    // 'separations_update' fala da SEPARAÇÃO; nenhuma tela de saldo o escuta. O estoque
+    // mudou aqui (consume/release/receive) e precisa do seu próprio aviso.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
@@ -290,6 +314,9 @@ export const createReturn = async (req: Request, res: Response) => {
 
 // 🛡️ Aprovar ou Rejeitar a Devolução (Almoxarifado)
 export const updateReturnStatus = async (req: Request, res: Response) => {
+  // Produtos cujo SALDO mudou nesta operação. Preenchido DENTRO da transação, emitido só
+  // DEPOIS do commit — a tela não pode ser avisada de saldo que ainda pode ser desfeito.
+  const produtosTocados: string[] = [];
   const { returnId } = req.params;
   const { status } = req.body;
   const userId = (req as any).user.id;
@@ -310,6 +337,7 @@ export const updateReturnStatus = async (req: Request, res: Response) => {
 
       // Se aprovado, devolve a quantidade ao stock físico pelo motor (receive)
       if (status === 'aprovado' && ret.product_id && parseFloat(ret.quantity) > 0) {
+        produtosTocados.push(ret.product_id);
         await StockService.receive(client, ret.product_id, warehouseId, POOLED_OP_ID, parseFloat(ret.quantity), {
           refType: 'separation_return', refId: returnId, userId,
           opKey: `separation_return:${returnId}:receive`,
@@ -321,6 +349,9 @@ export const updateReturnStatus = async (req: Request, res: Response) => {
     });
 
     if ((req as any).io) (req as any).io.emit('separations_update');
+    // 'separations_update' fala da SEPARAÇÃO; nenhuma tela de saldo o escuta. O estoque
+    // mudou aqui (consume/release/receive) e precisa do seu próprio aviso.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (error: any) {
     res.status(400).json({ error: error.message });

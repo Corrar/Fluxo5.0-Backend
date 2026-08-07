@@ -89,7 +89,10 @@ export const getManagerialReports = async (req: Request, res: Response) => {
     const statusPieQuery = `SELECT COALESCE(purchase_status, 'pendente') as name, COUNT(*) as value FROM products WHERE active = true GROUP BY purchase_status`;
 
     const topProducts = await pool.query(topProductsQuery);
-    const history = await pool.query(historyQuery);
+    // RETRY explícito: a query começa com WITH e o auto-detect do db.ts (isReadOnlyStatement,
+    // só SELECT/…) não a marca como retentável — e isto passava por `pool.query` CRU, fora do
+    // wrapper inteiro. Leitura idempotente ⇒ {retryable:true} cobre o cold start do Neon.
+    const history = await dbQuery(historyQuery, [], { retryable: true });
     const statusPie = await pool.query(statusPieQuery);
 
     res.json({ topProducts: topProducts.rows, history: history.rows, purchaseStatus: statusPie.rows });

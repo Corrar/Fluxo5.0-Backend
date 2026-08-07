@@ -1,6 +1,7 @@
 import { withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { StockService } from '../services/stock.service';
+import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 
 // Varredura de expiração — extraída do setInterval para ser testável (smoke chama direto).
@@ -14,7 +15,10 @@ import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 //     mascarando furo. O UPDATE cru antigo varria TODAS as linhas do produto (sem warehouse/op_id),
 //     liberava itens 3D nunca reservados por inteiro e não deixava rastro no razão.
 export const runExpireRequestsSweep = async (): Promise<number> => {
-  return withTransaction(async (client) => {
+  // Produtos cujo saldo o cron liberou. Preenchido dentro da transação; emitido DEPOIS que ela
+  // fecha — ver o emit no fim desta função.
+  const produtosTocados: string[] = [];
+  const total = await withTransaction(async (client) => {
     const { rows: expiredRequests } = await client.query(`
       SELECT id FROM requests
       WHERE status IN ('aberto', 'aprovado')
@@ -35,6 +39,7 @@ export const runExpireRequestsSweep = async (): Promise<number> => {
         if (item.product_id && !item.is_3d) {
           const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
           if (finalQty > 0) {
+            produtosTocados.push(item.product_id);
             await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
               refType: 'request', refId: req.id, userId: null,
               opKey: `request:${req.id}:item:${item.id}:release`,
@@ -49,6 +54,14 @@ export const runExpireRequestsSweep = async (): Promise<number> => {
     }
     return expiredRequests.length;
   });
+
+  // O cron não tem `req`, então nunca teve como usar o `req.io` que os controllers usam — era o
+  // único caminho de estoque estruturalmente impedido de avisar a tela. `emitStockChanged` cai no
+  // `io` do módulo (o mesmo do emitStockState), e é no-op se o socket não subiu (smoke/teste).
+  // FORA da transação de propósito: liberar reserva e avisar não podem estar no mesmo destino —
+  // um erro de socket não pode desfazer um release já comitado.
+  emitStockChanged(produtosTocados);
+  return total;
 };
 
 export const startExpireRequestsJob = () => {

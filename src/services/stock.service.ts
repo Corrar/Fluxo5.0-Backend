@@ -179,9 +179,19 @@ export const StockService = {
     return persist(client, productId, warehouseId, opId, 'receive', { onHand: cur.onHand + qty, reserved: cur.reserved }, { dOnHand: qty, dReserved: 0 }, refs);
   },
 
-  /** Ajuste para valor ABSOLUTO de saldo físico (inventário). Delta calculado SOB TRAVA. */
+  /**
+   * Ajuste para valor ABSOLUTO de saldo físico (inventário). Delta calculado SOB TRAVA.
+   *
+   * IDEMPOTÊNCIA (alinhado com reserve/release/consume/receive/reverseReceive): era o ÚNICO
+   * mutador sem o guard `alreadyApplied`. Ele já RECEBIA e GRAVAVA `op_key`, mas nunca a
+   * consultava — então repetir o mesmo ajuste convergia no saldo (é absoluto, não acumula) e
+   * mesmo assim tentava gravar a chave de novo no razão, colidindo com `uq_stock_ledger_opkey`
+   * e devolvendo 23505 (que virava 500 na rota, ver stock.controller.updateStock).
+   * Com o guard, a repetição é um no-op silencioso e devolve o snapshot corrente.
+   */
   async adjust(client: PoolClient, productId: string, warehouseId: string, opId: string | null, newOnHand: number, refs: StockRefs = {}): Promise<StockSnapshot> {
     if (!Number.isFinite(newOnHand) || newOnHand < 0) throw new StockError('QTD_INVALIDA', `Saldo alvo inválido (${newOnHand}).`, productId, warehouseId, opId);
+    if (await alreadyApplied(client, refs.opKey)) { const c = await ensureAndLock(client, productId, warehouseId, opId); return snapshot(productId, warehouseId, opId, c.onHand, c.reserved); }
     const cur = await ensureAndLock(client, productId, warehouseId, opId);
     if (newOnHand < cur.reserved) throw new StockError('AJUSTE_ABAIXO_RESERVA', `Saldo alvo (${newOnHand}) menor que o reservado (${cur.reserved}).`, productId, warehouseId, opId);
     return persist(client, productId, warehouseId, opId, 'adjust', { onHand: newOnHand, reserved: cur.reserved }, { dOnHand: newOnHand - cur.onHand, dReserved: 0 }, refs);
