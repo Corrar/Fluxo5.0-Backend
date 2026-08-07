@@ -9,6 +9,7 @@ import { sendPushNotificationToRole } from '../utils/notifications';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { liberarReserva3D, abaterQtyReservada, qtyReservadaDoItem } from '../services/requests3d';
 
 // Unidades que aceitam quantidade fracionada (metro, litro, quilo). Qualquer outra → inteiro
 // (default seguro para unidades novas/desconhecidas). Espelha DECIMAL_UNITS do front (conferencia.jsx).
@@ -218,13 +219,12 @@ export const createRequest = async (req: Request, res: Response) => {
         const customName = isCustom ? item.custom_name : null;
         const priority = item.priority || 'Média'; // Lê a prioridade do frontend
 
-        // Regista o item ANTES da reserva para termos o id (op_key idempotente por item).
-        const itemRes = await client.query(
-          'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-          [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null]
-        );
-        const itemId = itemRes.rows[0].id;
-
+        // O produto é lido ANTES do INSERT do item (antes esta leitura vinha depois). Duas razões:
+        // `qty_reserved` passa a nascer JUNTO com a linha — a coluna é o que todas as saídas vão
+        // liberar, e um item que existe sem ela é um item que já nasce mentindo sobre o que
+        // segura; e a recusa de 3D fracionário acontece antes de qualquer escrita.
+        let is3D = false;
+        let available = 0;
         if (productId) {
           // is_3d + disponível na linha pooled do ALMOX
           const productCheck = await client.query(
@@ -234,26 +234,46 @@ export const createRequest = async (req: Request, res: Response) => {
             [productId, warehouseId]
           );
 
-          const available = parseFloat(productCheck.rows[0]?.available || 0);
-          const is3D = productCheck.rows[0]?.is_3d || false;
+          available = parseFloat(productCheck.rows[0]?.available || 0);
+          is3D = productCheck.rows[0]?.is_3d || false;
+        }
 
+        const qtdPedida = parseFloat(String(item.quantity));
+
+        // PEÇA 3D É INTEIRA. Ela é impressa uma a uma, e `demands_3d.quantity` é INTEGER: pedir
+        // 2,5 gravaria 2 na demanda (truncamento do INTEGER) e reservaria 2,5 no saldo — meia peça
+        // que ninguém consegue produzir nem entregar, e uma diferença de 0,5 sem dono. O 3D não
+        // tem unidade decimal legítima (as decimais são M/L/KG, ver DECIMAL_UNITS), então isto é
+        // recusa de borda, não regra de tipo — a coluna segue NUMERIC para servir aos não-3D.
+        if (is3D && (!Number.isFinite(qtdPedida) || !Number.isInteger(qtdPedida))) {
+          throw new Error(`QTD_3D_FRACIONARIA:${item.quantity}`);
+        }
+
+        // Quanto ESTE item vai segurar no pooled. 3D leva o que houver na prateleira (o que faltar
+        // vai para a fábrica); não-3D leva tudo, e o motor recusa a criação inteira se faltar.
+        const reservedQty = !productId ? 0
+          : is3D ? Math.min(qtdPedida, Math.max(available, 0))
+          : (qtdPedida > 0 ? qtdPedida : 0);
+
+        // Regista o item ANTES da reserva para termos o id (op_key idempotente por item).
+        const itemRes = await client.query(
+          'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service, qty_reserved) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+          [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null, reservedQty]
+        );
+        const itemId = itemRes.rows[0].id;
+
+        if (productId) {
           // LÓGICA INTELIGENTE: ESTOQUE + FÁBRICA 3D
           if (is3D) {
-            let missingQty = item.quantity;
-            let reservedQty = 0;
+            const missingQty = qtdPedida - reservedQty;
 
             // 1. Se tem pelo menos 1 no estoque, reserva logo essa quantidade (pelo motor)
-            if (available > 0) {
-              reservedQty = Math.min(item.quantity, available);
-              missingQty = item.quantity - reservedQty;
-
-              if (reservedQty > 0) {
-                await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, reservedQty, {
-                  refType: 'request', refId: requestId, userId,
-                  opKey: `request:${requestId}:item:${itemId}:reserve`,
-                  reason: 'Reserva na criação (3D — parte já em estoque)',
-                });
-              }
+            if (reservedQty > 0) {
+              await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, reservedQty, {
+                refType: 'request', refId: requestId, userId,
+                opKey: `request:${requestId}:item:${itemId}:reserve`,
+                reason: 'Reserva na criação (3D — parte já em estoque)',
+              });
             }
 
             // 2. Se FALTAR peças, vai para a fábrica produzir
@@ -262,17 +282,20 @@ export const createRequest = async (req: Request, res: Response) => {
 
               const notesInfo = `⚠️ RESUMO DO PEDIDO:\n- A Produzir: ${missingQty} un.\n- Já em Estoque: ${reservedQty} un.\n- Total Solicitado: ${item.quantity} un.\n\n📝 OBSERVAÇÕES:\n${item.observation || 'Nenhuma'}`;
 
+              // `request_item_id` (migration 020) é o RATEIO POR ITEM: sem ele a demanda aponta só
+              // para a solicitação, e duas linhas do MESMO produto no mesmo pedido geram duas
+              // demandas indistinguíveis — a conclusão não saberia a qual item creditar a peça.
               await client.query(
-                `INSERT INTO demands_3d (product_id, request_id, quantity, op_number, priority, notes)
-                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                [productId, requestId, missingQty, kanbanOpNumber, priority, notesInfo]
+                `INSERT INTO demands_3d (product_id, request_id, request_item_id, quantity, op_number, priority, notes)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [productId, requestId, itemId, missingQty, kanbanOpNumber, priority, notesInfo]
               );
             }
           }
           // LÓGICA NORMAL PARA PRODUTOS NÃO 3D
           else {
-            if (item.quantity > 0) {
-              await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, item.quantity, {
+            if (reservedQty > 0) {
+              await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, reservedQty, {
                 refType: 'request', refId: requestId, userId,
                 opKey: `request:${requestId}:item:${itemId}:reserve`,
                 reason: 'Reserva na criação da solicitação',
@@ -349,6 +372,12 @@ export const createRequest = async (req: Request, res: Response) => {
     if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
       console.warn(JSON.stringify({ event: 'request_create_idempotent_conflict', detail: error?.detail ?? null }));
       return res.json({ success: true, idempotent: true });
+    }
+    // Peça 3D com quantidade fracionária — recusa de borda do lote I-a. Sentinela própria (e não
+    // uma mensagem solta) para a tela poder tratar e o smoke poder asserir sem casar por texto.
+    if (typeof error?.message === 'string' && error.message.startsWith('QTD_3D_FRACIONARIA:')) {
+      const qtd = error.message.slice('QTD_3D_FRACIONARIA:'.length);
+      return res.status(400).json({ error: `Peça 3D é sempre em unidades inteiras — quantidade inválida (${qtd}).` });
     }
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
@@ -455,35 +484,86 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
                     reason: 'Ajuste de quantidade (reduz reserva)',
                   });
                 }
+
+                // ESPELHA o movimento em qty_reserved. Esta porta SEMPRE mexeu na reserva do item
+                // 3D (nunca teve guard `!is_3d` — é a porta que, medida no recon, liberou 4 das 5
+                // unidades da solicitação b80d14c6 e deixou 1 órfã). A semântica de estoque fica
+                // IDÊNTICA; o que muda é a coluna passar a acompanhar, senão a rejeição seguinte
+                // liberaria um valor que o ajuste já tinha devolvido.
+                //
+                // GREATEST(...,0): o delta vem de `quantity_delivered` (o que se conferiu), não da
+                // reserva do item — num 3D com reserva PARCIAL o ajuste pode pedir mais do que o
+                // item segura. O saldo aguenta (o motor aplica min(qty, reserved)), a coluna não
+                // pode ir a negativo (CHECK da 020). O clamp é o estado seguro enquanto as duas
+                // fórmulas (3D e não-3D) não forem unificadas — lote de reconciliação.
+                await client.query(
+                  'UPDATE request_items SET qty_reserved = GREATEST(qty_reserved + $1::numeric, 0) WHERE id = $2',
+                  [delta, adj.id],
+                );
               }
             }
           }
         }
       }
 
-      const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1 ORDER BY ri.product_id', [id]);
+      const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, ri.qty_reserved, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1 ORDER BY ri.product_id', [id]);
 
       // Status: Entregue -> consume (baixa físico + libera a reserva correspondente).
       // Entrega vem SÓ depois de 'conferido' (a transição já bloqueia aberto/aprovado→entregue); mantemos
       // 'aprovado' no guard por defesa/coerência, mas na prática só 'conferido' chega aqui.
       if (status === 'entregue' && (currentStatus === 'aprovado' || currentStatus === 'conferido')) {
         for (const item of itemsRes.rows) {
-          if (item.product_id && !item.is_3d) { // Só baixa físico se NÃO FOR 3D
-            const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-            if (finalQty > 0) {
-              await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
-                refType: 'request', refId: id, userId,
-                opKey: `request:${id}:item:${item.id}:consume`,
-                reason: 'Entrega da solicitação',
+          if (!item.product_id) continue;
+          const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
+          if (finalQty <= 0) continue;
+
+          if (item.is_3d) {
+            // O 3D SÓ SAI SE A PEÇA EXISTE. `qty_reserved` é o que este item efetivamente segura
+            // no pooled — parte veio da prateleira na criação, parte da conclusão da demanda. Se
+            // for menor que o que se vai entregar, a peça não foi produzida (ou a demanda foi
+            // recusada) e o consume ou estouraria FURO_ESTOQUE ou comeria a reserva de OUTRO
+            // pedido. Recusa explícita, com sentinela própria, antes de tocar em saldo.
+            const reservada = qtyReservadaDoItem(item);
+            if (reservada < finalQty) {
+              throw new Error(`ENTREGA_3D_SEM_PECA:${item.id}:${reservada}:${finalQty}`);
+            }
+            await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
+              refType: 'request', refId: id, userId,
+              opKey: `request:${id}:item:${item.id}:consume`,
+              reason: 'Entrega da solicitação (peça 3D)',
+            });
+            // O consumido deixa de estar reservado. O que sobrar é EXCEDENTE — peça produzida a
+            // mais, ou conferência que reduziu a quantidade depois da produção — e volta a ser
+            // estoque livre pela fórmula única (o `sobra` já É o qty_reserved do momento).
+            const sobra = await abaterQtyReservada(client, item.id, finalQty);
+            if (sobra > 0) {
+              await liberarReserva3D(client, { ...item, qty_reserved: sobra }, {
+                requestId: id, userId, warehouseId,
+                reason: 'Entrega da solicitação (libera excedente 3D não entregue)',
               });
             }
+          } else {
+            await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
+              refType: 'request', refId: id, userId,
+              opKey: `request:${id}:item:${item.id}:consume`,
+              reason: 'Entrega da solicitação',
+            });
+            await abaterQtyReservada(client, item.id, finalQty);
           }
         }
       }
       // Status: Rejeitado -> release (devolve a reserva). Pode vir de aberto/aprovado/conferido.
       else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado' || currentStatus === 'conferido')) {
         for (const item of itemsRes.rows) {
-          if (item.product_id && !item.is_3d) { // Só devolve reserva se NÃO FOR 3D
+          if (!item.product_id) continue;
+          if (item.is_3d) {
+            // PORTA 4 — o guard `!is_3d` caiu aqui. Era ele que prendia as 10 unidades medidas no
+            // recon (d): a solicitação virava 'rejeitado' e a reserva do item 3D ficava sem
+            // caminho de liberação em tela nenhuma. Fórmula única: libera qty_reserved.
+            await liberarReserva3D(client, item, {
+              requestId: id, userId, warehouseId, reason: 'Rejeição da solicitação (peça 3D)',
+            });
+          } else {
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
             if (finalQty > 0) {
               await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
@@ -491,6 +571,7 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
                 opKey: `request:${id}:item:${item.id}:release`,
                 reason: 'Rejeição da solicitação',
               });
+              await abaterQtyReservada(client, item.id, finalQty);
             }
           }
         }
@@ -498,7 +579,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
       // Status: Devolvido (voltou para a prateleira) -> receive
       else if (status === 'devolvido' && currentStatus === 'entregue') {
         for (const item of itemsRes.rows) {
-          if (item.product_id && !item.is_3d) { // Só volta para prateleira se NÃO FOR 3D
+          // PORTA 5 — guard `!is_3d` caiu: peça 3D devolvida volta ao físico como qualquer outra.
+          // Sem isto ela sumiria do estoque (saiu no consume da entrega e não voltaria nunca), que
+          // é o oposto de "3D é estoque físico completo". Mesma âncora dos não-3D.
+          if (item.product_id) {
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
             if (finalQty > 0) {
               await StockService.receive(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
@@ -566,6 +650,15 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
       const [, de, para] = error.message.split(':');
       return res.status(400).json({ error: `Transição inválida: ${de} → ${para}.` });
     }
+    // Entrega de peça 3D sem peça: a reserva do item não cobre o que se quer entregar (produção
+    // não concluída, demanda recusada, ou conferência acima do produzido). 400 com os dois
+    // números, porque quem está na tela precisa saber QUANTO falta — não só que faltou.
+    if (typeof error?.message === 'string' && error.message.startsWith('ENTREGA_3D_SEM_PECA:')) {
+      const [, , reservada, pedida] = error.message.split(':');
+      return res.status(400).json({
+        error: `Peça 3D ainda não produzida: reservado ${reservada}, entrega pede ${pedida}. Conclua a demanda na Fábrica 3D ou ajuste a quantidade conferida.`,
+      });
+    }
     res.status(500).json({ error: error.message || 'Erro ao atualizar status' });
   }
 };
@@ -595,10 +688,21 @@ export const deleteRequest = async (req: Request, res: Response) => {
       // no saldo, sem caminho de liberação por nenhuma tela. O PUT /:id/status já libera nos três;
       // aqui passa a fazer o mesmo, com o MESMO op_key (as duas rotas são idempotentes entre si).
       if (status === 'aberto' || status === 'aprovado' || status === 'conferido') {
-        // Puxa o is_3d para não tentar liberar reserva de algo que nunca foi reservado.
-        const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
+        // Puxa o is_3d porque as duas famílias liberam por fórmulas DIFERENTES neste lote: o 3D
+        // pela reserva real do item (qty_reserved), o resto pela quantidade conferida/pedida.
+        // (Antes o is_3d servia para PULAR o 3D — "algo que nunca foi reservado". Era falso: a
+        // criação reserva a parte que já está na prateleira, e era isso que ficava preso.)
+        const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, ri.qty_reserved, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
         for (const item of itemsRes.rows) {
-          if (item.product_id && !item.is_3d) {
+          if (!item.product_id) continue;
+          if (item.is_3d) {
+            // PORTA 6 — guard `!is_3d` caiu. Mesma op_key da rejeição e do cron, de propósito: as
+            // três portas agora chegam ao MESMO número (qty_reserved), então a chave compartilhada
+            // deduplica corrida real em vez de mascarar divergência de fórmula.
+            await liberarReserva3D(client, item, {
+              requestId: id, userId, warehouseId, reason: 'Cancelamento da solicitação (peça 3D)',
+            });
+          } else {
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
             if (finalQty > 0) {
               await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
@@ -606,6 +710,7 @@ export const deleteRequest = async (req: Request, res: Response) => {
                 opKey: `request:${id}:item:${item.id}:release`,
                 reason: 'Cancelamento da solicitação',
               });
+              await abaterQtyReservada(client, item.id, finalQty);
             }
           }
         }
@@ -674,8 +779,10 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
       for (const ret of returns) {
         if (ret.quantity_to_return <= 0) continue;
 
+        // `is_3d` saiu do SELECT: a devolução parcial trata as duas famílias igual desde que o
+        // guard caiu, e coluna lida sem uso sugeriria uma distinção que não existe mais aqui.
         const itemCheck = await client.query(
-          'SELECT ri.product_id, ri.quantity_delivered, ri.quantity_requested, ri.quantity_returned, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.id = $1',
+          'SELECT ri.product_id, ri.quantity_delivered, ri.quantity_requested, ri.quantity_returned FROM request_items ri WHERE ri.id = $1',
           [ret.request_item_id]
         );
 
@@ -691,8 +798,12 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
         // 1. Atualiza o item do pedido com a nova quantidade devolvida
         await client.query('UPDATE request_items SET quantity_returned = COALESCE(quantity_returned, 0) + $1 WHERE id = $2', [returnQty, ret.request_item_id]);
 
-        // 2. Devolve ao stock físico pelo motor (se não for 3D)
-        if (item.product_id && !item.is_3d && returnQty > 0) {
+        // 2. Devolve ao stock físico pelo motor.
+        // PORTA 7 — guard `!is_3d` caiu. Era a mais perversa das seis: a devolução parcial de peça
+        // 3D já gravava em `op_returns` (passo 3, abatendo o custo da OP) mas NÃO devolvia a peça
+        // ao físico — o dinheiro voltava e a peça sumia. Agora a contrapartida física existe, com
+        // a mesma âncora content-addressed dos não-3D.
+        if (item.product_id && returnQty > 0) {
           produtosDevolvidos.push(item.product_id);
           await StockService.receive(client, item.product_id, warehouseId, POOLED_OP_ID, returnQty, {
             refType: 'request', refId: id, userId,

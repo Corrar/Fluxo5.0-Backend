@@ -3,6 +3,7 @@ import { pool, query, withTransaction } from '../db';
 import { StockService, StockError } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { creditarProducaoNoItem } from '../services/requests3d';
 
 // ==========================================
 // 1. CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -123,7 +124,9 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
     await withTransaction(async (client) => {
       // GUARD DE RE-CONCLUSÃO: trava a LINHA da demanda ANTES de qualquer escrita -> consistente sob
       // concorrência (2 conclusões paralelas serializam aqui). Padrão do replenishments (4479760).
-      const cur = await client.query('SELECT status, request_id, quantity, product_id FROM demands_3d WHERE id = $1 FOR UPDATE', [id]);
+      // request_item_id (migration 020) entra no SELECT para o crédito por ITEM abaixo — é o
+      // rateio que diz QUAL linha da solicitação esta peça satisfaz.
+      const cur = await client.query('SELECT status, request_id, quantity, product_id, request_item_id FROM demands_3d WHERE id = $1 FOR UPDATE', [id]);
       if (cur.rows.length === 0) throw new Error('DEMANDA_NAO_ENCONTRADA');
       const atual = cur.rows[0].status;
       if (status === 'Concluída' && atual === 'Concluída') throw new Error('DEMANDA_JA_CONCLUIDA');
@@ -165,6 +168,24 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
             opKey: `demand:${id}:conclude:reserve:${quantity}`,
             reason: 'Reserva da peça 3D produzida para a solicitação',
           });
+
+          // 3. CRÉDITO NO ITEM (lote I-a). O reserve acima prende a peça no SALDO; este passo diz
+          //    a QUEM ela pertence. `qty_reserved` é o que a entrega exige e o que a rejeição
+          //    libera — sem o crédito, a peça produzida ficaria reservada e invisível para o item,
+          //    e a entrega recusaria uma peça que está na prateleira. A resolução do item (vínculo
+          //    direto, fallback por produto, excedente) vive em services/requests3d.
+          const itemCreditado = await creditarProducaoNoItem(client, {
+            requestId, productId, requestItemId: cur.rows[0].request_item_id ?? null, qty: quantity,
+          });
+          if (!itemCreditado) {
+            // Demanda sem solicitação, ou solicitação sem linha do produto: a peça entra no físico
+            // e fica reservada sem dono. Não é silencioso — é exatamente o formato de órfã que
+            // este lote veio matar, e precisa aparecer no log se algum dia acontecer.
+            console.warn(JSON.stringify({
+              event: 'demand3d_conclude_sem_item', demand_id: id,
+              request_id: requestId ?? null, product_id: productId, quantity,
+            }));
+          }
 
           // Auditoria oficial (INALTERADA).
           await client.query(
