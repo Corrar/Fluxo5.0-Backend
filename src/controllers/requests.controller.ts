@@ -9,7 +9,7 @@ import { sendPushNotificationToRole } from '../utils/notifications';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
-import { liberarReserva3D, abaterQtyReservada, qtyReservadaDoItem } from '../services/requests3d';
+import { liberarReserva3D, abaterQtyReservada, qtyReservadaDoItem, cancelarDemandasDaRequest } from '../services/requests3d';
 
 // Unidades que aceitam quantidade fracionada (metro, litro, quilo). Qualquer outra → inteiro
 // (default seguro para unidades novas/desconhecidas). Espelha DECIMAL_UNITS do front (conferencia.jsx).
@@ -578,6 +578,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
             }
           }
         }
+        // A REJEIÇÃO MANUAL PASSA A MATAR AS DEMANDAS VIVAS (item 4). Antes só o DELETE cancelava:
+        // rejeitar pelo painel deixava a fábrica imprimindo peça para um pedido recusado. Mesma
+        // função das outras duas portas — ver cancelarDemandasDaRequest.
+        await cancelarDemandasDaRequest(client, { requestId: id, userId, origem: 'rejeicao_manual' });
       }
       // Status: Devolvido (voltou para a prateleira) -> receive
       else if (status === 'devolvido' && currentStatus === 'entregue') {
@@ -722,8 +726,12 @@ export const deleteRequest = async (req: Request, res: Response) => {
 
       await client.query("UPDATE requests SET status = 'rejeitado', rejection_reason = 'Cancelado pelo usuário/sistema' WHERE id = $1", [id]);
 
-      // Se havia cópia no Kanban 3D pendente, cancela também.
-      await client.query("UPDATE demands_3d SET status = 'Cancelada' WHERE request_id = $1 AND status != 'Concluída'", [id]);
+      // Se havia cópia no Kanban 3D pendente, cancela também — agora pela FUNÇÃO ÚNICA (item 4),
+      // que é a mesma da rejeição manual e do cron. O UPDATE inline que vivia aqui era o único dos
+      // três caminhos que cancelava, e usava `status != 'Concluída'`: com `status` NULL isso avalia
+      // UNKNOWN e a demanda escapava. A função usa IS DISTINCT FROM e ainda deixa rastro em audit,
+      // que o inline não deixava.
+      await cancelarDemandasDaRequest(client, { requestId: id, userId, origem: 'cancelamento' });
 
       await createLog(userId, 'CANCELAR_SOLICITACAO', { id_solicitacao: id, status_anterior: status }, getClientIp(req), client);
       return { changedProducts };

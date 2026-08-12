@@ -17,10 +17,12 @@
 // ── AS PROVAS (i a xii da missão I-a) ────────────────────────────────────────────────────────
 //   i    b80d14c6 reproduzida: reserve(5) → ajuste(−4) → rejeição → release(1); a órfã não nasce.
 //   ii   criação parcial: reserve(disp), qty_reserved=disp, demanda com o resto E request_item_id.
-//   iii  conclusão da demanda: receive+reserve e o CRÉDITO no item (qty_reserved sobe).
+//   iii  conclusão da demanda: receive+reserve e o CRÉDITO no item (qty_reserved sobe) — e, desde
+//        o lote I-b, o status da solicitação fica INTOCADO.
 //   iv   entrega com reserva suficiente: consume(efetiva), colunas zeradas.
 //   v    entrega com reserva INSUFICIENTE: 400 sentinela e saldo intocado.
-//   vi   entrega parcial com excedente: consume(4) + release(1).
+//   vi   entrega parcial com excedente: consume(4) + release(1) — SEM o passo de reconferir, que
+//        era conserto de efeito colateral e morreu no lote I-b (ver o bloco na prova).
 //   vii  cancelamento (porta 6) e cron de expiração (porta 8) liberam qty_reserved.
 //   viii devolvido (porta 5) e devolução parcial (porta 7): peça 3D volta ao físico.
 //   ix   idempotência: repetir cada mutação não move saldo nem cria linha no razão.
@@ -265,6 +267,21 @@ async function main(): Promise<void> {
     const mudarStatus = (requestId: string, body: object) =>
       call('PUT', `/requests/${requestId}/status`, { token: tk, body });
 
+    // ATUALIZADO NO LOTE I-b: concluir demanda deixou de ser um salto.
+    // A whitelist de transição (TRANSICOES_DEMANDA em producao3d.controller) fechou o caminho
+    // 'Em análise' → 'Concluída' num pulo só. Não é atrito artificial do smoke: é o que o front
+    // sempre fez — o botão do Kanban avança UM degrau por vez (P3_DEMSTATUS[...].next em
+    // producao3d.jsx), então este helper passa a percorrer o mesmo caminho que o operador percorre.
+    // O que a whitelist mata é o pulo que a TELA nunca ofereceu e a API aceitava: Rejeitada →
+    // Concluída, a porta de crédito de peça que ninguém imprimiu.
+    const concluirDemanda = async (demandId: string) => {
+      for (const passo of ['Aceita', 'Em desenvolvimento', 'Concluída']) {
+        const r = await call('PUT', `/producao-3d/demands/${demandId}/status`, { token: tk, body: { status: passo } });
+        if (r.status !== 200) return r;   // devolve o primeiro erro — quem chama assere em cima dele
+      }
+      return { status: 200, data: { success: true } };
+    };
+
     const pI = await criarPeca3D('I');    await entrada(pI, 12);
     const pII = await criarPeca3D('II');  await entrada(pII, 3);
     const pV = await criarPeca3D('V');    await entrada(pV, 3);
@@ -322,18 +339,28 @@ async function main(): Promise<void> {
     // =====================================================================
     console.log('\n── (iii) conclusão da demanda credita o item ─────────────');
     // =====================================================================
-    const concl = await call('PUT', `/producao-3d/demands/${demII.id}/status`, { token: tk, body: { status: 'Concluída' } });
+    const statusAntesConcl = await statusDe(rII.data.id);
+    const concl = await concluirDemanda(demII.id);
     const itII2 = (await itensDe(rII.data.id))[0];
     const sII2 = await saldo(pII);
     check(concl.status === 200, '(iii) conclusão aceita', `HTTP ${concl.status}`);
     check(sII2.oh === 5, '(iii) receive: on_hand 3 → 5', `on_hand=${sII2.oh}`);
     check(sII2.res === 5, '(iii) reserve: reserved 3 → 5', `reserved=${sII2.res}`);
     check(num(itII2.qty_reserved) === 5, '(iii) CRÉDITO NO ITEM: qty_reserved 3 → 5', String(itII2.qty_reserved));
+    // LOTE I-b: a solicitação estava 'aberto' e CONTINUA 'aberto'. A conclusão não promove mais
+    // aberto→aprovado pelas costas do gate humano (era o atalho que pulava a definição de
+    // quantidades no painel de conferência).
+    check(statusAntesConcl === 'aberto' && await statusDe(rII.data.id) === 'aberto',
+      '(iii) status da solicitação INTOCADO pela conclusão (aberto → aberto)',
+      `${statusAntesConcl} → ${await statusDe(rII.data.id)}`);
 
     // =====================================================================
     console.log('\n── (iv) entrega com reserva suficiente ───────────────────');
     // =====================================================================
-    // A conclusão devolveu a solicitação a 'aprovado' (comportamento do lote I-b, intocado aqui).
+    // ATUALIZADO NO LOTE I-b: a conclusão NÃO devolve mais a solicitação a 'aprovado'. Ela ficou
+    // em 'aberto' (prova iii acima), então a aprovação humana acontece aqui, explícita — que é
+    // exatamente o ponto: aprovar é onde o almoxarife define as quantidades, e agora ninguém pula.
+    await mudarStatus(rII.data.id, { status: 'aprovado' });
     await mudarStatus(rII.data.id, { status: 'conferido' });
     const entII = await mudarStatus(rII.data.id, { status: 'entregue' });
     const itII3 = (await itensDe(rII.data.id))[0];
@@ -370,13 +397,26 @@ async function main(): Promise<void> {
     // Confere 4 ANTES da produção: sem reserva no produto, o ajuste não move saldo nem coluna.
     await mudarStatus(rVI.data.id, { status: 'conferido', adjusted_items: [{ id: itVI0.id, quantity_delivered: 4 }] });
     const demVI = await demandaDe(rVI.data.id);
-    await call('PUT', `/producao-3d/demands/${demVI.id}/status`, { token: tk, body: { status: 'Concluída' } });
+    await concluirDemanda(demVI.id);
     const itVI1 = (await itensDe(rVI.data.id))[0];
     const sVI1 = await saldo(pVI);
     check(num(itVI1.qty_reserved) === 5, '(vi) produção creditou 5 no item', String(itVI1.qty_reserved));
     check(sVI1.oh === 5 && sVI1.res === 5, '(vi) saldo: 5 produzidas e reservadas', `oh=${sVI1.oh} res=${sVI1.res}`);
-    // Re-confere (aprovado→conferido) sem ajuste: mantém quantity_delivered=4.
-    await mudarStatus(rVI.data.id, { status: 'conferido' });
+
+    // ── O ATRITO QUE MORREU NO LOTE I-b ──────────────────────────────────────────────────────
+    // Aqui existia um `mudarStatus(rVI, {status:'conferido'})` com o comentário "Re-confere
+    // (aprovado→conferido) sem ajuste". Ele não era parte do cenário: era CONSERTO de um efeito
+    // colateral. A conclusão da demanda jogava a solicitação de volta para 'aprovado', e sem
+    // reconferir a entrega não saía. O smoke tinha CODIFICADO o atrito — e um smoke que codifica
+    // o defeito passa a defendê-lo: mudar o comportamento para melhor deixaria o smoke vermelho.
+    //
+    // Agora 'conferido' FICA conferido (item 1), então a entrega sai direto. Se este passo
+    // voltasse, ele mesmo seria a falha: 'conferido' → 'conferido' não está no TRANSICOES de
+    // requests.controller e tomaria 400.
+    check(await statusDe(rVI.data.id) === 'conferido',
+      '(vi) conferido CONTINUA conferido depois da conclusão — sem reconferir',
+      String(await statusDe(rVI.data.id)));
+
     const entVI = await mudarStatus(rVI.data.id, { status: 'entregue' });
     const itVI2 = (await itensDe(rVI.data.id))[0];
     const sVI2 = await saldo(pVI);

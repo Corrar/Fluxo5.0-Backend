@@ -97,6 +97,64 @@ export async function abaterQtyReservada(client: PoolClient, itemId: string, qty
 }
 
 /**
+ * MORTE DA SOLICITAÇÃO -> MORTE DAS DEMANDAS VIVAS DELA (lote I-b, item 4).
+ *
+ * POR QUE EXISTE, e por que num lugar só: quando uma solicitação morre (rejeição manual,
+ * cancelamento ou expiração pelo cron), as demandas dela ficavam VIVAS no Kanban da fábrica. Duas
+ * consequências, as duas medidas no recon (D9): a fábrica continuava imprimindo peça para pedido
+ * que não existe mais, e concluir aquela demanda depois voltava a mexer no pedido morto. O item 1
+ * deste lote fecha o segundo (conclusão não ressuscita nada), mas só este passo fecha o primeiro —
+ * e é o único que impede a fábrica de gastar filamento à toa.
+ *
+ * Dos três caminhos, só o DELETE cancelava, com um UPDATE inline. Três chamadores e um comportamento
+ * exigem um corpo de código só: era assim que o guard `!is_3d` sobrevivia em duas portas e não na
+ * terceira, antes do lote I-a. Mesma lição, mesma forma.
+ *
+ * CONCLUÍDA NUNCA SE CANCELA: a peça existe, está impressa e já entrou no físico. Cancelar seria
+ * trocar o rótulo de um fato. Ela fica como está — e, com a solicitação morta, a conclusão que a
+ * creditou já a deixou em estoque LIVRE (ver REQUEST_VIVA em producao3d.controller).
+ *
+ * O chamador já deve estar com a linha de `requests` travada (FOR UPDATE) — os três estão. Isto
+ * fixa a ordem de lock solicitação -> demanda, a MESMA que updateDemandStatus usa, que é o que
+ * impede deadlock entre concluir uma demanda e matar a solicitação dela.
+ *
+ * Devolve os ids cancelados (vazio = nada a fazer), para o chamador logar/decidir.
+ */
+export async function cancelarDemandasDaRequest(
+  client: PoolClient,
+  params: { requestId: string; userId: string | null; origem: string },
+): Promise<string[]> {
+  const { requestId, userId, origem } = params;
+
+  const { rows } = await client.query<{ id: string }>(
+    `UPDATE demands_3d SET status = 'Cancelada'
+      WHERE request_id = $1 AND status IS DISTINCT FROM 'Concluída'
+      RETURNING id`,
+    [requestId],
+  );
+  const ids = rows.map((r) => r.id);
+  if (ids.length === 0) return [];
+
+  // IS DISTINCT FROM, não <>: `status` é NULLABLE e sem CHECK nesta tabela, e `status <> 'Concluída'`
+  // avalia NULL -> UNKNOWN -> a linha NÃO entraria no UPDATE. Uma demanda de status NULL ficaria
+  // viva para sempre, exatamente o caso que este passo existe para matar. (A nulidade da coluna é
+  // dívida de schema REPORTADA neste lote — aqui o código se defende dela.)
+
+  // UMA linha de auditoria com a lista, não uma por demanda: o fato auditável é "a solicitação
+  // morreu e levou estas demandas junto", e ele é um só. `origem` diz QUAL das três portas foi —
+  // sem isso, o rastro não distingue rejeição manual de expiração automática.
+  await client.query(
+    `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+    [userId, 'CANCELAR_DEMANDA_3D', JSON.stringify({
+      request_id: requestId, demand_ids: ids, quantidade: ids.length, origem,
+      motivo: 'solicitação encerrada — demandas vivas canceladas junto',
+    })],
+  );
+
+  return ids;
+}
+
+/**
  * Conclusão da demanda 3D: credita a peça produzida ao ITEM de solicitação que a esperava.
  *
  * POR QUE PRECISA EXISTIR: a conclusão já dava `receive` + `reserve` no pooled. A reserva ficava

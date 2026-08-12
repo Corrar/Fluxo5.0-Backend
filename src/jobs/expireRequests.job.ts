@@ -3,7 +3,7 @@ import { createLog } from '../utils/logger';
 import { StockService } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
-import { liberarReserva3D, abaterQtyReservada } from '../services/requests3d';
+import { liberarReserva3D, abaterQtyReservada, cancelarDemandasDaRequest } from '../services/requests3d';
 
 // Varredura de expiração — extraída do setInterval para ser testável (smoke chama direto).
 // ESPELHO do handler de rejeição manual (updateRequestStatus, status='rejeitado'):
@@ -20,9 +20,11 @@ import { liberarReserva3D, abaterQtyReservada } from '../services/requests3d';
 //     mascarando furo. O UPDATE cru antigo varria TODAS as linhas do produto (sem warehouse/op_id),
 //     liberava itens 3D nunca reservados por inteiro e não deixava rastro no razão.
 //
-// ⚠ O QUE ESTE LOTE NÃO FAZ (lote I-b): expirar a solicitação continua NÃO cancelando a demanda
-// 3D viva no Kanban. Concluí-la depois volta a creditar peça e a mexer no status da solicitação.
-// Fora de escopo aqui de propósito — está mapeado e tem lote próprio.
+// A DÍVIDA QUE ESTE CABEÇALHO APONTAVA MORREU no lote I-b, nos dois lados que ela tinha:
+//   - expirar agora CANCELA as demandas 3D vivas da solicitação (cancelarDemandasDaRequest, a
+//     mesma função da rejeição manual e do cancelamento — item 4);
+//   - concluir uma demanda não mexe mais em status de solicitação NENHUM (item 1), então não há
+//     mais como uma expiração ser desfeita pelas costas.
 export const runExpireRequestsSweep = async (): Promise<number> => {
   // Produtos cujo saldo o cron liberou. Preenchido dentro da transação; emitido DEPOIS que ela
   // fecha — ver o emit no fim desta função.
@@ -68,6 +70,12 @@ export const runExpireRequestsSweep = async (): Promise<number> => {
         }
       }
       await client.query(`UPDATE requests SET status = 'rejeitado', rejection_reason = 'Expirado pelo sistema (Timeout 15 dias)' WHERE id = $1`, [req.id]);
+
+      // PORTA 9 (item 4): a expiração também mata as demandas vivas. `userId: null` porque é o
+      // servidor agindo, igual ao createLog abaixo. A linha da solicitação já está travada pelo
+      // FOR UPDATE SKIP LOCKED do SELECT acima — ordem solicitação -> demanda, a mesma dos outros
+      // dois caminhos e a mesma de updateDemandStatus.
+      await cancelarDemandasDaRequest(client, { requestId: req.id, userId: null, origem: 'expiracao_cron' });
       // Nota: usamos '127.0.0.1' porque é o próprio servidor a fazer a ação
       await createLog(null, 'TIMEOUT_REQUEST', { requestId: req.id, reason: 'Expiração automática' }, '127.0.0.1', client);
     }

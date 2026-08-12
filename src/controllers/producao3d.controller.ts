@@ -102,6 +102,46 @@ export const getDemands = async (req: Request, res: Response) => {
 
 // Status de recusa do Kanban 3D (o front mapeia 'rejeitada' -> este valor em P3_DEM_FRONT2BACK).
 const DEMAND_STATUS_REJEITADA = 'Rejeitada';
+
+// ── WHITELIST DE TRANSIÇÃO DA DEMANDA (lote I-b, item 3) ─────────────────────────────────────
+// Irmã do TRANSICOES de requests.controller, e pelo mesmo motivo: sem ela o PUT aceita QUALQUER
+// pulo. O pulo que importa é `Rejeitada -> Concluída` — a porta de crédito indevido: a fábrica
+// recusa a peça, alguém arrasta o card de volta pra "Concluída" e o sistema credita estoque de
+// uma peça que ninguém imprimiu. Não era hipótese: só os guards de re-conclusão existiam
+// (Concluída->Concluída e Cancelada->Concluída), e Rejeitada passava reto.
+//
+// As chaves são o vocabulário EXATO que o front envia (P3_DEM_FRONT2BACK em producao3d.jsx) e o
+// mesmo que o DEFAULT da coluna grava ('Em análise'). Acentos incluídos de propósito: comparar
+// sem acento seria inventar um segundo vocabulário.
+const TRANSICOES_DEMANDA: Record<string, string[]> = {
+  'Em análise':         ['Aceita', 'Rejeitada', 'Cancelada'],
+  'Aceita':             ['Em desenvolvimento', 'Rejeitada', 'Cancelada'],
+  // 'Rejeitada' SAI de 'Em desenvolvimento' por decisão do arquiteto (08/08/2026), e o motivo é
+  // de TELA: o botão "Recusar" do Kanban aparece em todo card não-terminal, inclusive na coluna
+  // Produzindo (producao3d.jsx:545). Fechar esta saída transformaria um botão que funciona num
+  // 400. O escape que restaria — "Excluir demanda", que leva a 'Cancelada' — NÃO coleta motivo,
+  // e o motivo é justamente o que a recusa existe para registrar. Peça que falhou na impressão é
+  // recusa legítima, não cancelamento administrativo.
+  'Em desenvolvimento': ['Concluída', 'Rejeitada', 'Cancelada'],
+  // TERMINAIS. Concluída moveu estoque; Rejeitada/Cancelada encerraram a peça. Nenhum destino.
+  'Concluída':          [],
+  'Rejeitada':          [],
+  'Cancelada':          [],
+};
+
+// ⚠ `demands_3d.status` é NULLABLE e SEM CHECK — o mesmo furo que a migration 021 fechou em
+// client_services.status. Não há migration neste lote (decisão do arquiteto), então a whitelist
+// é a única trava e ela é FAIL-CLOSED: status atual fora do vocabulário (inclusive NULL) recusa a
+// transição em vez de adivinhar. Adivinhar 'Em análise' para um NULL seria inventar estado, e é
+// exatamente assim que 'pendente' sobreviveu anos em client_services. Nenhuma linha NULL pode
+// NASCER (o DEFAULT cobre o INSERT e daqui em diante todo UPDATE passa por esta lista); a demanda
+// travada continua cancelável pelo DELETE, que não consulta esta tabela. Dívida REPORTADA.
+
+// Status de SOLICITAÇÃO que ainda espera a peça — os únicos em que a conclusão RESERVA.
+// Fechado por INCLUSÃO, nunca por exclusão: status novo/desconhecido cai no lado "morta", que
+// deixa a peça em estoque livre. Errar para o lado livre é recuperável (a peça está na
+// prateleira); errar para o lado reservado cria órfã sem dono, que é o defeito que este lote mata.
+const REQUEST_VIVA = new Set(['aberto', 'aprovado', 'conferido']);
 // Teto defensivo do texto livre (a coluna é TEXT, sem limite no banco).
 const DEMAND_TEXT_MAX = 2000;
 // Normaliza texto livre vindo do body: string vazia/whitespace/não-string -> null (não grava '').
@@ -122,6 +162,28 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
 
   try {
     await withTransaction(async (client) => {
+      // ORDEM DE LOCK: SOLICITAÇÃO ANTES DA DEMANDA — e isto é obrigatório, não estilo.
+      // A partir do item 4 deste lote a morte da solicitação CANCELA as demandas vivas dela, ou
+      // seja aquele caminho trava request e depois escreve em demands_3d. Se aqui travássemos a
+      // demanda primeiro e a solicitação depois, os dois caminhos formariam um ciclo clássico e o
+      // Postgres mataria um dos dois com 40P01 sob concorrência real. Travando na MESMA ordem nos
+      // dois lados, o ciclo não existe.
+      // `request_id` é imutável na vida da demanda (escrito no INSERT do createRequest e nunca
+      // atualizado), então lê-lo SEM trava para decidir o que travar é seguro.
+      const pre = await client.query('SELECT request_id FROM demands_3d WHERE id = $1', [id]);
+      if (pre.rows.length === 0) throw new Error('DEMANDA_NAO_ENCONTRADA');
+      const requestIdPre = pre.rows[0].request_id;
+
+      // Status da solicitação NO MOMENTO DA CONCLUSÃO — é ele que decide se a peça nasce
+      // reservada ou livre. Travado junto: sem o FOR UPDATE, uma rejeição concorrente poderia
+      // comitar entre esta leitura e o reserve, e a peça ficaria reservada para uma solicitação
+      // que acabou de morrer — a órfã do cruzamento §5, de novo, só que por corrida.
+      let statusSolicitacao: string | null = null;
+      if (requestIdPre) {
+        const r = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [requestIdPre]);
+        statusSolicitacao = r.rows[0]?.status ?? null;
+      }
+
       // GUARD DE RE-CONCLUSÃO: trava a LINHA da demanda ANTES de qualquer escrita -> consistente sob
       // concorrência (2 conclusões paralelas serializam aqui). Padrão do replenishments (4479760).
       // request_item_id (migration 020) entra no SELECT para o crédito por ITEM abaixo — é o
@@ -129,8 +191,20 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
       const cur = await client.query('SELECT status, request_id, quantity, product_id, request_item_id FROM demands_3d WHERE id = $1 FOR UPDATE', [id]);
       if (cur.rows.length === 0) throw new Error('DEMANDA_NAO_ENCONTRADA');
       const atual = cur.rows[0].status;
+      // Os dois guards específicos vêm ANTES da whitelist de propósito: a whitelist também barraria
+      // estes dois casos (Concluída e Cancelada são terminais), mas com a mensagem genérica. Quem
+      // re-arrasta um card já concluído merece ouvir "já concluída", não "transição inválida".
       if (status === 'Concluída' && atual === 'Concluída') throw new Error('DEMANDA_JA_CONCLUIDA');
       if (status === 'Concluída' && atual === 'Cancelada') throw new Error('DEMANDA_CANCELADA');
+
+      // WHITELIST DE TRANSIÇÃO (item 3). Roda depois do FOR UPDATE (verdade travada) e antes de
+      // qualquer escrita — mesmo lugar e mesmo motivo do TRANSICOES de requests.controller.
+      if (typeof atual !== 'string' || !(atual in TRANSICOES_DEMANDA)) {
+        throw new Error(`DEMANDA_STATUS_DESCONHECIDO:${atual === null ? 'NULL' : String(atual)}`);
+      }
+      if (!TRANSICOES_DEMANDA[atual].includes(status)) {
+        throw new Error(`TRANSICAO_DEMANDA_INVALIDA:${atual}:${status}`);
+      }
 
       // UPDATE do status movido pra DEPOIS do guard (antes rodava antes do check).
       // rejection_reason só é TOCADA na transição p/ 'Rejeitada' — nos demais status a coluna fica
@@ -142,6 +216,22 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
           'UPDATE demands_3d SET status = $1, rejection_reason = $2 WHERE id = $3',
           [status, rejectionReason, id],
         );
+        // AUDIT DA RECUSA — não existia. A recusa gravava `rejection_reason` na própria demanda e
+        // mais nada: quem recusou e quando ficava fora do livro. A conclusão auditava, o
+        // cancelamento passou a auditar neste lote, e a recusa era o terceiro desfecho, mudo.
+        // Ganha peso agora que 'Em desenvolvimento' → 'Rejeitada' abriu: recusar peça JÁ EM
+        // PRODUÇÃO descarta trabalho e filamento, e é o tipo de ato que precisa de dono no livro.
+        // `status_anterior` é o que distingue "a fábrica não aceitou o pedido" de "a peça falhou
+        // na impressora" — dois fatos diferentes que sem isto teriam o mesmo registro.
+        await client.query(
+          `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+          [userId, 'REJEITAR_DEMANDA_3D', JSON.stringify({
+            demand_id: id,
+            request_id: requestIdPre ?? null,
+            status_anterior: atual,
+            motivo: rejectionReason,
+          })],
+        );
       } else {
         await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
       }
@@ -149,41 +239,78 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
       if (status === 'Concluída') {
         const quantity = Number(cur.rows[0].quantity);
         const productId = cur.rows[0].product_id;
-        produtosTocados.push(productId);   // p/ o stock_updated pós-commit
         const requestId = cur.rows[0].request_id;
 
         if (productId) {
+          produtosTocados.push(productId);   // p/ o stock_updated pós-commit
           const warehouseId = await resolveWarehouseId(client, userId);
-          // 1. Peça impressa ENTRA no físico. receive PRIMEIRO (aumenta disponível + cria a linha LAZY se faltar).
-          //    op_key content-addressed: re-concluir com a mesma qty = no-op idempotente (fim da dupla entrada).
+
+          // A PERGUNTA QUE DECIDE TUDO: a solicitação ainda espera esta peça?
+          // Viva  -> a peça nasce PRESA para ela (receive + reserve + crédito no item).
+          // Morta -> a peça é real e entra no físico, mas não pertence a ninguém: receive puro,
+          //          estoque LIVRE. Reservar para uma solicitação encerrada é exatamente como
+          //          nascem as órfãs do cruzamento (§5) — reserva no pooled sem porta de saída,
+          //          porque a rejeição/cancelamento/expiração daquela solicitação JÁ passaram.
+          //          Com esta regra a órfã fica impossível POR CONSTRUÇÃO, não por limpeza.
+          const solicitacaoViva = !!requestId && REQUEST_VIVA.has(String(statusSolicitacao));
+
+          // 1. Peça impressa ENTRA no físico — SEMPRE, viva ou morta a solicitação. A peça existe:
+          //    negar a entrada seria perder estoque real. receive PRIMEIRO (aumenta disponível +
+          //    cria a linha LAZY se faltar). op_key content-addressed: re-concluir com a mesma qty
+          //    = no-op idempotente (fim da dupla entrada).
           await StockService.receive(client, productId, warehouseId, POOLED_OP_ID, quantity, {
             refType: 'demand_3d', refId: id, userId,
             opKey: `demand:${id}:conclude:receive:${quantity}`,
             reason: 'Produção 3D concluída (entrada no estoque)',
           });
-          // 2. SEGURA a peça produzida p/ a request 'aprovado' que a aguarda (decisão A). reserve DEPOIS
-          //    (o receive já garantiu disponível). Sem isto, a peça viraria estoque livre -> furo na entrega.
-          await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, quantity, {
-            refType: 'demand_3d', refId: id, userId,
-            opKey: `demand:${id}:conclude:reserve:${quantity}`,
-            reason: 'Reserva da peça 3D produzida para a solicitação',
-          });
 
-          // 3. CRÉDITO NO ITEM (lote I-a). O reserve acima prende a peça no SALDO; este passo diz
-          //    a QUEM ela pertence. `qty_reserved` é o que a entrega exige e o que a rejeição
-          //    libera — sem o crédito, a peça produzida ficaria reservada e invisível para o item,
-          //    e a entrega recusaria uma peça que está na prateleira. A resolução do item (vínculo
-          //    direto, fallback por produto, excedente) vive em services/requests3d.
-          const itemCreditado = await creditarProducaoNoItem(client, {
-            requestId, productId, requestItemId: cur.rows[0].request_item_id ?? null, qty: quantity,
-          });
-          if (!itemCreditado) {
-            // Demanda sem solicitação, ou solicitação sem linha do produto: a peça entra no físico
-            // e fica reservada sem dono. Não é silencioso — é exatamente o formato de órfã que
-            // este lote veio matar, e precisa aparecer no log se algum dia acontecer.
+          if (solicitacaoViva) {
+            // 2. SEGURA a peça produzida p/ a solicitação que a aguarda. reserve DEPOIS (o receive
+            //    já garantiu disponível). Sem isto, a peça viraria estoque livre -> furo na entrega.
+            await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, quantity, {
+              refType: 'demand_3d', refId: id, userId,
+              opKey: `demand:${id}:conclude:reserve:${quantity}`,
+              reason: 'Reserva da peça 3D produzida para a solicitação',
+            });
+
+            // 3. CRÉDITO NO ITEM (lote I-a). O reserve acima prende a peça no SALDO; este passo diz
+            //    a QUEM ela pertence. `qty_reserved` é o que a entrega exige e o que a rejeição
+            //    libera — sem o crédito, a peça produzida ficaria reservada e invisível para o item,
+            //    e a entrega recusaria uma peça que está na prateleira. A resolução do item (vínculo
+            //    direto, fallback por produto, excedente) vive em services/requests3d.
+            const itemCreditado = await creditarProducaoNoItem(client, {
+              requestId, productId, requestItemId: cur.rows[0].request_item_id ?? null, qty: quantity,
+            });
+            if (!itemCreditado) {
+              // Solicitação viva mas sem linha daquele produto: a peça entra no físico e fica
+              // reservada sem dono. Não é silencioso — é o formato de órfã que este lote veio
+              // matar, e precisa aparecer no log se algum dia acontecer.
+              console.warn(JSON.stringify({
+                event: 'demand3d_conclude_sem_item', demand_id: id,
+                request_id: requestId ?? null, product_id: productId, quantity,
+              }));
+            }
+          } else {
+            // PEÇA EM ESTOQUE LIVRE. `qty_reserved` fica INTOCADO de propósito: a solicitação
+            // morta já liberou o que segurava (pelas portas 4/6/8 do lote I-a) e somar aqui
+            // ressuscitaria a reserva que aquelas portas acabaram de desfazer.
+            // Audit ESTRUTURADO — este é o caminho que antes não existia e que, quando o operador
+            // olhar o estoque, explica por que a peça está livre em vez de reservada.
+            await client.query(
+              `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+              [userId, 'ENTRADA_ESTOQUE_3D_LIVRE', JSON.stringify({
+                motivo: 'demanda concluída para solicitação encerrada — peça em estoque livre',
+                demand_id: id,
+                request_id: requestId ?? null,
+                request_status: statusSolicitacao,
+                product_id: productId,
+                quantity,
+              })],
+            );
             console.warn(JSON.stringify({
-              event: 'demand3d_conclude_sem_item', demand_id: id,
-              request_id: requestId ?? null, product_id: productId, quantity,
+              event: 'demand3d_conclude_solicitacao_encerrada', demand_id: id,
+              request_id: requestId ?? null, request_status: statusSolicitacao,
+              product_id: productId, quantity,
             }));
           }
 
@@ -194,10 +321,19 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
           );
         }
 
-        // INALTERADO: marca a solicitação vinculada como aprovada.
-        if (requestId) {
-          await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1`, [requestId]);
-        }
+        // A RESSURREIÇÃO MORREU AQUI (item 1). Existia um `UPDATE requests SET status='aprovado'`
+        // neste ponto, sem olhar em que estado a solicitação estava. Ele fazia duas coisas erradas:
+        //  1. RESSUSCITAVA solicitação REJEITADA/cancelada/expirada — o card voltava a 'aprovado'
+        //     depois de morto, e a peça era reservada para um pedido que ninguém mais esperava;
+        //  2. PROMOVIA 'aberto' -> 'aprovado' pelas costas do gate humano. Aprovar não é carimbo:
+        //     é onde o almoxarife define as QUANTIDADES no painel de conferência. O atalho pulava
+        //     essa decisão e a solicitação chegava na entrega com quantidade que ninguém conferiu.
+        // A conclusão da demanda NÃO MEXE MAIS em status de solicitação — nenhum, em hipótese
+        // nenhuma. Ela move ESTOQUE; quem move o estado do pedido é quem tem autoridade sobre ele.
+        //
+        // O atrito que isto poderia criar já foi resolvido pelo lote I-a: 'conferido' FICA
+        // conferido, e o excedente produzido além do conferido sai na ENTREGA, pela liberação de
+        // excedente. Concluir não obriga mais a reconferir.
       }
     });
 
@@ -211,6 +347,16 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
     if (error.message === 'DEMANDA_NAO_ENCONTRADA') return res.status(404).json({ error: 'Demanda não encontrada.' });
     if (error.message === 'DEMANDA_JA_CONCLUIDA') return res.status(400).json({ error: 'Demanda já concluída.' });
     if (error.message === 'DEMANDA_CANCELADA') return res.status(400).json({ error: 'Demanda cancelada.' });
+    // Sentinelas da whitelist (item 3). Nomeiam DE e PARA — quem está na tela precisa saber qual
+    // movimento foi recusado, não só que "deu erro".
+    if (typeof error?.message === 'string' && error.message.startsWith('TRANSICAO_DEMANDA_INVALIDA:')) {
+      const [, de, para] = error.message.split(':');
+      return res.status(400).json({ error: `Transição inválida da demanda: ${de} → ${para}.` });
+    }
+    if (typeof error?.message === 'string' && error.message.startsWith('DEMANDA_STATUS_DESCONHECIDO:')) {
+      const atual = error.message.slice('DEMANDA_STATUS_DESCONHECIDO:'.length);
+      return res.status(400).json({ error: `Demanda em status fora do vocabulário ("${atual}") — nenhuma transição é possível. Cancele a demanda ou corrija o dado.` });
+    }
     // Rede de segurança de concorrência: 2 conclusões paralelas com a MESMA op_key batem no índice único.
     // O withTransaction fez ROLLBACK -> nada duplicou; resposta idempotente (espelha o 4479760).
     if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
@@ -270,9 +416,15 @@ export const deleteDemand = async (req: Request, res: Response) => {
       if (cur.rows.length === 0) throw new Error('DEMANDA_NAO_ENCONTRADA');
       const atual = cur.rows[0].status;
 
-      // Concluída MOVEU ESTOQUE (receive + reserve no updateDemandStatus). Cancelar aqui só trocaria
-      // o rótulo e deixaria o saldo creditado sem contrapartida. A reversão correta é o
-      // DELETE /producao-3d/productions/:id, que passa pelo reverseReceive e recusa se já foi consumido.
+      // Concluída MOVEU ESTOQUE (receive, e reserve quando a solicitação estava viva — ver
+      // updateDemandStatus). Cancelar aqui só trocaria o rótulo e deixaria o saldo creditado sem
+      // contrapartida.
+      // ⚠ ATUALIZADO NO LOTE I-b: este comentário mandava reverter pelo
+      // DELETE /producao-3d/productions/:id. Aquela porta agora RECUSA (400) produção de demanda
+      // concluída, justamente porque o crédito passou a ser da conclusão e o histórico dela é
+      // imutável. Ou seja: HOJE NÃO EXISTE porta de reversão de demanda concluída, e é melhor
+      // dizer isso do que apontar para uma que responde 400. Criar essa porta é decisão de
+      // produto (o que fazer com a peça já impressa e já no físico), não detalhe de implementação.
       if (atual === 'Concluída') throw new Error('DEMANDA_CONCLUIDA');
       if (atual === 'Cancelada') throw new Error('DEMANDA_JA_CANCELADA');
 
@@ -286,7 +438,7 @@ export const deleteDemand = async (req: Request, res: Response) => {
     return res.json({ success: true });
   } catch (error: any) {
     if (error.message === 'DEMANDA_NAO_ENCONTRADA') return res.status(404).json({ error: 'Demanda não encontrada.' });
-    if (error.message === 'DEMANDA_CONCLUIDA') return res.status(400).json({ error: 'Demanda concluída não pode ser cancelada — a peça já entrou no estoque. Apague o registro de produção para reverter.' });
+    if (error.message === 'DEMANDA_CONCLUIDA') return res.status(400).json({ error: 'Demanda concluída não pode ser cancelada — a peça já entrou no estoque.' });
     if (error.message === 'DEMANDA_JA_CANCELADA') return res.status(400).json({ error: 'Demanda já cancelada.' });
     console.error(JSON.stringify({ event: 'demand3d_cancel_error', id, err_code: error?.code ?? null, err_msg: String(error?.message ?? '').slice(0, 300) }));
     return res.status(500).json({ error: 'Erro ao cancelar demanda 3D' });
@@ -318,18 +470,38 @@ export const getProductions = async (req: Request, res: Response) => {
 const PRODUCTION_SELECT = `id, product_id as "partId", demand_id as "demandId", quantity,
   total_minutes as "totalMinutes", filament_grams as "filamentGrams", date, operator_id as operator`;
 
+// ── PONTO ÚNICO DE CRÉDITO (lote I-b, item 2) ────────────────────────────────────────────────
+// A DUPLA CONTAGEM: registrar produção de uma demanda dava `receive`, e concluir aquela mesma
+// demanda dava OUTRO `receive`. O fluxo normal do Kanban é exatamente esse — o operador registra o
+// que imprimiu e depois arrasta o card para "Concluída" — então a peça entrava DUAS VEZES no
+// físico. Não era corrida nem caso de borda: era o caminho feliz.
+//
+// A REGRA, agora com um dono só: quem credita é a CONCLUSÃO DA DEMANDA.
+//   - produção COM demand_id  -> só histórico, ZERO movimento de estoque;
+//   - produção SEM demand_id  -> produção livre, receive normal (não há conclusão que a credite).
+// O critério é "existe uma conclusão que vai creditar esta peça?", e é por isso que o vínculo
+// (demand_id) é o discriminador certo, e não o tipo da peça ou quem registrou.
 export const createProduction = async (req: Request, res: Response) => {
   let produtoTocadoCreate: string | null = null;   // emitido só após o commit
   const { partId, demandId, quantity, totalMinutes, filamentGrams, date } = req.body;
   const operatorId = (req as any).user?.id || null;
   const qty = Number(quantity);
+  // Vínculo normalizado UMA vez: o resto da função pergunta a ele, não ao body.
+  const demandaVinculada: string | null = demandId || null;
 
   // X-Idempotency-Key (opcional): string não-vazia → âncora ESTÁVEL (idempotência cross-request).
   // array (header repetido) / ausente / vazio → tratado como ausente.
   const idemRaw = req.headers['x-idempotency-key'];
   const idemKey = typeof idemRaw === 'string' && idemRaw.trim() ? idemRaw.trim() : null;
   // op_key content-addressed. Com header, é conhecido ANTES do INSERT (permite o pré-check no razão).
-  const idemOpKey = idemKey ? `production:idem:${idemKey}:product:${partId}:receive:${qty}` : null;
+  //
+  // ⚠ SÓ NO CAMINHO LIVRE. A idempotência cross-request desta rota é ancorada no RAZÃO (o
+  // stock_ledger é quem lembra que a op_key já passou). Produção vinculada a demanda não escreve
+  // no razão a partir deste lote, logo não tem onde ancorar: repetir o POST com o mesmo header
+  // grava DUAS linhas de histórico. Consequência aceita e declarada, não esquecida — o que se
+  // duplica é registro de histórico, não saldo, e o saldo era o que a duplicidade custava caro.
+  // Fechar isso exigiria unique key própria em productions_3d, que é schema — fora deste lote.
+  const idemOpKey = idemKey && !demandaVinculada ? `production:idem:${idemKey}:product:${partId}:receive:${qty}` : null;
 
   try {
     const result = await withTransaction(async (client) => {
@@ -351,16 +523,35 @@ export const createProduction = async (req: Request, res: Response) => {
       const prodRes = await client.query(
         `INSERT INTO productions_3d (product_id, demand_id, quantity, operator_id, total_minutes, filament_grams, date)
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${PRODUCTION_SELECT}`,
-        [partId, demandId || null, qty, operatorId, totalMinutes, filamentGrams, date],
+        [partId, demandaVinculada, qty, operatorId, totalMinutes, filamentGrams, date],
       );
       const prod = prodRes.rows[0];
 
+      const reason = demandaVinculada ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
+
+      if (demandaVinculada) {
+        // VINCULADA A DEMANDA -> ZERO movimento de estoque. Só o registro de histórico acima.
+        // O crédito desta peça é da conclusão da demanda (updateDemandStatus), e é lá que ele
+        // acontece UMA vez. Registrar aqui de novo era a dupla contagem.
+        // `produtoTocadoCreate` fica null de propósito: sem movimento de saldo, não há
+        // `stock_updated` a emitir — avisar as telas de um saldo que não mudou é ruído que
+        // treina a ignorar o evento.
+        await client.query(
+          `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
+          [operatorId, 'REGISTRO_PRODUCAO_3D', JSON.stringify({
+            product_id: partId, quantity: qty, demand_id: demandaVinculada, reason,
+            nota: 'apenas histórico — o crédito no estoque é da conclusão da demanda',
+          })],
+        );
+        return prod;
+      }
+
+      // PRODUÇÃO LIVRE — daqui para baixo é o caminho de sempre, INALTERADO.
       // Sem header: fallback content-addressed pelo id FRESCO — NÃO dá idempotência cross-request
       // (cada POST = id novo = op_key nova = novo crédito). Documentado; use o header para blindar retry.
       const opKey = idemOpKey ?? `production:${prod.id}:receive:${qty}`;
-      const reason = demandId ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
 
-      // Produção LIVRE: só receive, SEM reserve (a reserva p/ request vive no updateDemandStatus).
+      // Só receive, SEM reserve (a reserva p/ request vive no updateDemandStatus).
       await StockService.receive(client, partId, warehouseId, POOLED_OP_ID, qty, {
         refType: 'production_3d', refId: prod.id, userId: operatorId, opKey, reason,
       });
@@ -420,16 +611,44 @@ export const deleteProduction = async (req: Request, res: Response) => {
 
       // FOR UPDATE: trava a linha da produção -> 2 deletes paralelos serializam (o 2º acha a linha já
       // apagada -> 404). Antes era SELECT sem trava: dois deletes subtraíam 2×.
-      const prodRes = await client.query('SELECT product_id, quantity FROM productions_3d WHERE id = $1 FOR UPDATE', [id]);
+      const prodRes = await client.query('SELECT product_id, quantity, demand_id FROM productions_3d WHERE id = $1 FOR UPDATE', [id]);
       if (prodRes.rows.length === 0) throw new Error('PRODUCAO_NAO_ENCONTRADA');
       const productId = prodRes.rows[0].product_id;
       const qty = Number(prodRes.rows[0].quantity);
+      const demandaVinculada: string | null = prodRes.rows[0].demand_id ?? null;
 
-      // Reverte a ENTRADA pelo MOTOR: reduz só on_hand, guard on_hand-qty >= reserved. Se o saldo já
-      // foi consumido/reservado, reverseReceive lança SALDO_INSUFICIENTE_REVERSAO -> tx faz ROLLBACK ->
-      // a produção NÃO é apagada (fim do GREATEST(...,0) que pisava em 0 silenciosamente). op_key
-      // content-addressed no id estável -> idempotente mesmo numa corrida.
-      if (productId && qty > 0) {
+      // A REVERSÃO SEGUE O CRÉDITO (item 2). Como quem credita passou a ser a conclusão da demanda,
+      // apagar uma produção VINCULADA não pode mais reverter estoque — ela nunca creditou nada.
+      // Reverter aqui subtrairia uma entrada que esta linha não fez, que é a dupla contagem de
+      // volta, só que com o sinal trocado.
+      let statusDemanda: string | null = null;
+      if (demandaVinculada) {
+        // FOR UPDATE: serializa contra uma conclusão em voo — sem a trava, este delete poderia ler
+        // "Em desenvolvimento", decidir que é seguro, e comitar enquanto a conclusão credita.
+        // Ordem produção -> demanda; a conclusão trava solicitação -> demanda e não toca produções,
+        // então não há ciclo entre os dois caminhos.
+        const dem = await client.query('SELECT status FROM demands_3d WHERE id = $1 FOR UPDATE', [demandaVinculada]);
+        statusDemanda = dem.rows[0]?.status ?? null;
+      }
+
+      if (demandaVinculada && statusDemanda === 'Concluída') {
+        // O crédito pertence à CONCLUSÃO, e o histórico do que foi impresso é imutável depois dela.
+        // Deixar apagar aqui abriria duas mentiras: o estoque creditado ficaria sem o registro que
+        // o explica, e quem quisesse desfazer o crédito acharia que desfez — sem ter desfeito.
+        // A porta de reversão de uma demanda concluída não é esta; é decisão de produto que não
+        // existe hoje, e inventá-la aqui seria pior do que recusar.
+        throw new Error('PRODUCAO_DE_DEMANDA_CONCLUIDA');
+      }
+
+      if (demandaVinculada) {
+        // Demanda NÃO concluída: esta produção nunca creditou (item 2) -> delete livre, sem
+        // reverseReceive. Nada a devolver ao físico porque nada entrou por aqui.
+      } else if (productId && qty > 0) {
+        // PRODUÇÃO LIVRE — caminho INALTERADO.
+        // Reverte a ENTRADA pelo MOTOR: reduz só on_hand, guard on_hand-qty >= reserved. Se o saldo já
+        // foi consumido/reservado, reverseReceive lança SALDO_INSUFICIENTE_REVERSAO -> tx faz ROLLBACK ->
+        // a produção NÃO é apagada (fim do GREATEST(...,0) que pisava em 0 silenciosamente). op_key
+        // content-addressed no id estável -> idempotente mesmo numa corrida.
         produtoTocadoDelete = productId;
         await StockService.reverseReceive(client, productId, warehouseId, POOLED_OP_ID, qty, {
           refType: 'production_3d', refId: id, userId: operatorId,
@@ -439,9 +658,19 @@ export const deleteProduction = async (req: Request, res: Response) => {
       }
 
       await client.query('DELETE FROM productions_3d WHERE id = $1', [id]);
+      // A AÇÃO AUDITADA SEGUE O QUE DE FATO ACONTECEU. Só o caminho livre move saldo, então só ele
+      // grava 'SAIDA_ESTOQUE_3D'. Gravar saída de estoque no delete de uma produção vinculada
+      // (que não reverteu nada) poluiria a auditoria com movimento que não existiu — e a auditoria
+      // vale justamente por não ter linha que não corresponde a fato.
       await client.query(
         `INSERT INTO audit_logs (user_id, action, details) VALUES ($1, $2, $3)`,
-        [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id: productId, quantity: qty, reason: 'Correção: Apagou registo de Produção 3D' })],
+        demandaVinculada
+          ? [operatorId, 'REMOVER_REGISTRO_PRODUCAO_3D', JSON.stringify({
+              product_id: productId, quantity: qty, demand_id: demandaVinculada,
+              demand_status: statusDemanda,
+              reason: 'Correção: apagou registro de produção vinculada (não creditava estoque — sem reversão)',
+            })]
+          : [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id: productId, quantity: qty, reason: 'Correção: Apagou registo de Produção 3D' })],
       );
     });
 
@@ -452,6 +681,9 @@ export const deleteProduction = async (req: Request, res: Response) => {
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
     if (error.message === 'PRODUCAO_NAO_ENCONTRADA') return res.status(404).json({ error: 'Produção não encontrada.' });
+    if (error.message === 'PRODUCAO_DE_DEMANDA_CONCLUIDA') {
+      return res.status(400).json({ error: 'Produção de demanda já concluída não pode ser apagada — a peça foi creditada no estoque pela conclusão da demanda, e este registro é o histórico dela.' });
+    }
     if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
       console.warn(JSON.stringify({ event: 'production3d_delete_idempotent_conflict', id, detail: error?.detail ?? null }));
       return res.json({ success: true });
