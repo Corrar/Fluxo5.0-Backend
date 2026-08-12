@@ -57,3 +57,23 @@ psql "$DATABASE_URL" -f src/migrations/005_profiles_warehouse.sql
 
 ## Porta
 HTTP em **`3000`** — configurável via a variável `PORT`.
+
+## No ar (validação)
+
+| | |
+|---|---|
+| **API** | `https://fluxo5-0-backend-r49g.onrender.com` |
+| **Front** | `https://fluxo-royale50.vercel.app` |
+| **Portão de deploy** | `GET /health` → `{"ok":true,"sha":"<commit>"}` |
+
+> ⚠️ **`https://fluxo5-0-backend.onrender.com` (sem o sufixo `-r49g`) é CARCAÇA.** O serviço
+> antigo foi suspenso e substituído por um novo em 12/08/2026; o host velho continua de pé
+> respondendo HTML `Service Suspended`. Isso **não** é sinal de deploy quebrado — é o host
+> errado. URL antiga em doc, memória ou curl decorado engana exatamente assim.
+>
+> **Se a URL mudar de novo:** a fonte da verdade é a URL cozida no bundle servido do front —
+> baixar `https://fluxo-royale50.vercel.app`, extrair o `src` de `/assets/index-*.js`, baixar
+> e `grep onrender.com`. Documentação envelhece; o bundle publicado é o que o front chama.
+> Como é build time, **trocar a env no Vercel só vale após REDEPLOY do front**.
+
+Passo a passo de deploy em `RENDER_DEPLOY.md`; checklist de go-live em `DEPLOY_GOLIVE.md`.

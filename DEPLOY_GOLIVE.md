@@ -12,6 +12,24 @@
 
 ---
 
+## ⚠ Portão de deploy — bater na URL CERTA
+
+**URL viva: `https://fluxo5-0-backend-r49g.onrender.com`** (medida 12/08/2026).
+O portão é `GET /health`, que devolve `{"ok":true,"sha":"<commit>"}` — comparar o `sha`
+com o commit que se quer no ar.
+
+**O host antigo `https://fluxo5-0-backend.onrender.com` (sem sufixo) continua de pé
+respondendo HTML `Service Suspended` — não é deploy quebrado, é carcaça.** Aquele serviço
+foi suspenso e substituído por um NOVO (daí o sufixo), não reativado. Bater no antigo e ler
+"suspenso" como "a API caiu" é o erro que este aviso existe para evitar.
+
+**Se a URL mudar de novo, o método canônico é:** baixar `https://fluxo-royale50.vercel.app`,
+extrair o `src` do bundle em `/assets/index-*.js`, baixar e `grep onrender.com`. A URL cozida
+no bundle servido é o que o front de fato chama — doc envelhece, bundle publicado não.
+(E como é cozida em build time: **trocar env no Vercel exige REDEPLOY do front pra valer.**)
+
+---
+
 ## 0) AUDITORIA (rode em PROD, READ-ONLY) — a lista definitiva do que falta
 
 ```sql
@@ -110,7 +128,11 @@ Transporte Socket.IO era fail-open até `949e870` — go-live obrigatoriamente c
 Antes desse commit, o handler `join_room` aceitava qualquer sala vinda de socket **sem token**
 (inclusive `admin`), e token inválido degradava em silêncio para anônimo. Um cliente sem nenhuma
 credencial recebia `new_request_notification`, `new_request` e `new_audit_log` — o livro de auditoria
-em tempo real, com IP de admin. Conferir o SHA no ar por `GET /health` antes de liberar.
+em tempo real, com IP de admin. Conferir o SHA no ar antes de liberar — **na URL viva**:
+
+```bash
+curl -s https://fluxo5-0-backend-r49g.onrender.com/health   # -> {"ok":true,"sha":"<commit>"}
+```
 
 ---
 

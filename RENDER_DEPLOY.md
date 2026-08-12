@@ -71,8 +71,29 @@ openssl rand -hex 48
 
 ## 3) [BRUNO] Pegar a URL do Render
 
-Ao terminar o deploy, o Render gera uma URL, ex.: **`https://fluxo-backend.onrender.com`**. Anote.
-Teste rápido no navegador/curl: `GET https://…onrender.com/` deve responder (não CORS-bloqueado; GET simples).
+> ### ⚠ URL VIVA HOJE: `https://fluxo5-0-backend-r49g.onrender.com`
+>
+> Medida em **12/08/2026** — `GET /health` → `{"ok":true,"sha":"68a4a49"}`.
+>
+> **O host antigo `https://fluxo5-0-backend.onrender.com` (sem sufixo) CONTINUA DE PÉ e
+> responde HTML `Service Suspended`. Isso NÃO é deploy quebrado — é carcaça.** Aquele
+> serviço foi suspenso e o religamento veio como serviço NOVO, não como reativação; por
+> isso o host ganhou sufixo. Quem bater no antigo lê "suspenso" e conclui, errado, que a
+> API caiu.
+>
+> **Método canônico para descobrir a URL viva** (vale mais que esta linha, que envelhece):
+> baixar `https://fluxo-royale50.vercel.app`, extrair o `src` do bundle em
+> `/assets/index-*.js`, baixar esse arquivo e `grep onrender.com`. A URL **cozida no
+> bundle servido** é a que o front realmente chama — documentação e memória envelhecem,
+> o bundle publicado não. Foi assim que esta URL foi encontrada.
+>
+> Corolário: a URL é cozida em **build time**. Trocar a env no Vercel **só vale depois de
+> um REDEPLOY do front** — env nova sem redeploy é bundle velho apontando pra carcaça.
+
+Ao terminar o deploy, o Render gera uma URL, ex.: **`https://fluxo-backend.onrender.com`**
+(isto é EXEMPLO da doc original, não o serviço — a URL real é a do box acima). Anote.
+Teste rápido no navegador/curl: `GET https://…onrender.com/health` deve responder com o
+`sha` do commit deployado (é o portão de deploy da casa).
 
 ---
 
@@ -83,7 +104,7 @@ Teste rápido no navegador/curl: `GET https://…onrender.com/` deve responder (
 
    | Nome | Valor |
    |---|---|
-   | `VITE_API_URL` | a URL do Render do passo 3 (ex.: `https://fluxo-backend.onrender.com`) |
+   | `VITE_API_URL` | a URL do Render do passo 3 — **hoje `https://fluxo5-0-backend-r49g.onrender.com`** |
 
    > **É esta a env que o front usa** pra achar a API — no REST (`lib/api.js` → `import.meta.env.VITE_API_URL`)
    > **e** no realtime (`lib/socket.js`, que faz `.replace('/api','')` na mesma URL). Sem ela, o front cai em
