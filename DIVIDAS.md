@@ -398,7 +398,36 @@ de regra de negócio, e polui qualquer alerta que conte 5xx.
 **Escopo**: uma linha — trocar por uma sentinela e converter no catch, exatamente como o `PUT`
 já faz. **Prioridade**: BAIXA.
 
-## Cancelamento de solicitação não tem ownership — DECISÃO DE PRODUTO PENDENTE
+## ~~Cancelamento de solicitação não tem ownership~~ — DECIDIDA 08/08/2026 (decisão (b))
+
+**DECISÃO DO BRUNO: modelo RECEPTOR-CANCELA, ratificado.** O comportamento atual está CORRETO e
+fica como está — **zero linha de código muda por esta decisão**.
+
+O desenho, dito por inteiro: quem cancela solicitação é quem a RECEBE (admin/almoxarife). O
+solicitante que errou o pedido **avisa pelo WhatsApp** e o almoxarifado cancela. Não é contorno
+nem gambiarra — é o fluxo real da casa, e o sistema estava certo ao espelhá-lo. A alternativa
+("cada um cancela o seu") foi considerada e RECUSADA: o pedido entra numa fila que o almoxarifado
+já está trabalhando, e deixar o solicitante puxar item de dentro dela pelas costas de quem separa
+é pior do que a ligação de WhatsApp.
+
+Isto encerra as duas consequências registradas abaixo — as duas seguem verdadeiras, e as duas são
+**intencionais**, não furos:
+
+1. admin/almoxarife cancela a solicitação de qualquer pessoa → **é o modelo**, não um vazamento.
+2. o solicitante comum não cancela nem o próprio → **é o modelo**. O botão "Cancelar pedido" de
+   Meus Pedidos aparecer só para admin/almoxarife é o comportamento certo, não um bug de gate.
+
+**Medido, não presumido**: o comportamento descrito abaixo foi conferido contra o código na data da
+decisão. A saída proposta na época (`requester_id = userId` como alternativa ao gate de cargo) fica
+DESCARTADA — não implementar.
+
+**Fica em aberto, e é outra coisa**: o solicitante vê o pedido virar "Recusado" sem saber quem o
+recusou. O `audit_log` grava (`REJEITAR_SOLICITACAO` com motivo), mas nenhuma tela mostra. Isso é
+dívida de EXIBIÇÃO, não de permissão, e não bloqueia esta decisão.
+
+---
+
+O registro original, de 06/08/2026, preservado abaixo porque é ele que a decisão ratifica:
 
 Registrada em 06/08/2026, ao ligar a exclusão real de solicitação nas duas telas do front.
 

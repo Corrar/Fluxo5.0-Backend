@@ -52,7 +52,10 @@ router.post('/:id/partial-return', requirePermission('solicitacoes:edit'), parti
 //    pessoa. O solicitante comum não cancela nem o próprio (toma 403 no cargo).
 //  - "o controller valida se o status ainda é 'pendente'" — o guard é uma BLOCKLIST, não 'pendente':
 //    barra 'rejeitado'/'entregue'/'devolvido' e aceita 'aberto', 'aprovado' E 'conferido'.
-// Ver a dívida "ownership no cancelamento de solicitação" em DIVIDAS.md.
+// DECISÃO RATIFICADA 08/08/2026 — modelo RECEPTOR-CANCELA. Os dois fatos acima não são furos: são
+// o desenho. Quem cancela é quem recebe (admin/almoxarife); o solicitante que errou avisa pelo
+// WhatsApp e o almoxarifado cancela. O gate de cargo sem ownership FICA — não implementar
+// `requester_id = userId` aqui. Ver a entrada DECIDIDA em DIVIDAS.md.
 router.delete('/:id', requirePermission('minhas_solicitacoes:delete'), deleteRequest);
 
 export default router;
