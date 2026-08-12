@@ -43,7 +43,8 @@
     "smoke:returns:perop": "ts-node src/smokes/smoke_returns_perop_source.ts",
     "smoke:requests3d": "ts-node src/smokes/smoke_requests_3d.ts",
     "smoke:opstatus": "ts-node src/smokes/smoke_op_status.ts",
-    "smoke:demandas3d": "ts-node src/smokes/smoke_demandas_3d.ts"
+    "smoke:demandas3d": "ts-node src/smokes/smoke_demandas_3d.ts",
+    "smoke:teto": "ts-node src/smokes/smoke_teto_conferencia.ts"
   },
   "devDependencies": {
     "@types/web-push": "^3.6.4",

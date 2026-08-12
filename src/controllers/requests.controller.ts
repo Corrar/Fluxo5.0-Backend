@@ -451,6 +451,31 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
             if (!Number.isFinite(newReserved) || newReserved < 0) {
               throw new Error(`VALIDACAO_QTD:Quantidade conferida inválida no item ${adj.id}.`);
             }
+
+            // ── TETO DA CONFERÊNCIA (lote C-teto, decisão (c) do Bruno) ─────────────────────
+            // O front já trava isto desde 27902cb. Esta é a SEGUNDA PAREDE: front é conveniência,
+            // não proteção. Quem chama a API direto — curl, script, ou uma aba que ficou aberta
+            // desde antes do deploy do front — passava por cima da trava da tela.
+            //
+            // NA FASE DE CONFERÊNCIA O TETO NÃO É MAIS O QUE SE PEDIU: É O QUE SE APROVOU.
+            // Quem aprovou já decidiu a quantidade; conferir acima dela desfaz, sem registro, a
+            // decisão de quem tinha autoridade sobre ela. No 3D é pior: conferir acima da aprovada
+            // pede peça que a demanda nunca foi mandada produzir, e a entrega bate em
+            // ENTREGA_3D_SEM_PECA lá na frente — erro tardio e num lugar que não explica a causa.
+            //
+            // `quantity_delivered` NULL = item NUNCA ajustado. Aí não existe "aprovada" e o teto
+            // segue sendo o pedido: a regra antiga fica viva, intacta, para esse caso.
+            // A fase de APROVAÇÃO (aberto->aprovado) também não muda — lá o teto é o pedido,
+            // porque é exatamente ali que a quantidade aprovada NASCE.
+            const aprovada = item.quantity_delivered === null || item.quantity_delivered === undefined
+              ? null
+              : parseFloat(item.quantity_delivered);
+            if (status === 'conferido' && aprovada !== null && Number.isFinite(aprovada) && newReserved > aprovada) {
+              // Sentinela PRÓPRIA (não VALIDACAO_QTD): os dois números são o conteúdo do erro, e
+              // quem está na tela precisa dos dois — o que tentou e o teto real.
+              throw new Error(`TETO_CONFERENCIA:${newReserved}:${aprovada}`);
+            }
+
             if (newReserved > requested) {
               throw new Error(`VALIDACAO_QTD:Quantidade conferida (${newReserved}) não pode passar do pedido (${requested}).`);
             }
@@ -652,6 +677,14 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     }
     if (typeof error?.message === 'string' && error.message.startsWith('VALIDACAO_QTD:')) {
       return res.status(400).json({ error: error.message.slice('VALIDACAO_QTD:'.length) });
+    }
+    // Teto da conferência estourado: conferir acima do que foi APROVADO. Mensagem com os dois
+    // números — o tentado e o teto — porque "não pode" sem o teto obriga a adivinhar.
+    if (typeof error?.message === 'string' && error.message.startsWith('TETO_CONFERENCIA:')) {
+      const [, conferida, aprovada] = error.message.split(':');
+      return res.status(400).json({
+        error: `Quantidade conferida (${conferida}) não pode passar da aprovada (${aprovada}).`,
+      });
     }
     if (typeof error?.message === 'string' && error.message.startsWith('TRANSICAO_INVALIDA:')) {
       const [, de, para] = error.message.split(':');
