@@ -7,7 +7,7 @@ import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
-import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
 import {
   registerPendingReturns,
   conferReturn as conferReturnCore,
@@ -18,6 +18,13 @@ import {
 
 export const getStock = async (req: Request, res: Response) => {
   try {
+    // GRÃO: LINHA de stock do ALMOX pooled (op_id IS NULL) — 1 por produto (uq_stock_pooled).
+    // Sem estes filtros, a 2ª linha do mesmo produto (outro armazém ou per-OP) fazia a tela
+    // LISTAR O MESMO SKU N VEZES, cada uma com saldo parcial. NÃO agrega de propósito: `s.*`
+    // carrega `s.id`, que é a chave de PUT /stock/:id e GET /stock/:id/reservations (contrato em
+    // Frontend-5.0-App/src/types/domain.ts:52-63) — agregar destruiria o id. Soma entre armazéns
+    // no Controle de Estoque é mudança de contrato de rota: registrada em DIVIDAS.md.
+    const almoxId = await getAlmoxId(pool);
     const { rows } = await pool.query(`
       SELECT s.*, json_build_object(
         'id', p.id,
@@ -32,8 +39,10 @@ export const getStock = async (req: Request, res: Response) => {
       FROM stock s
       JOIN products p ON s.product_id = p.id
       WHERE p.active = true
+        AND s.warehouse_id = $1
+        AND s.op_id IS NULL
       ORDER BY s.created_at DESC;
-    `);
+    `, [almoxId]);
     res.json(rows);
   } catch (error: any) {
     res.status(500).json({ error: 'Erro ao buscar estoque' });
