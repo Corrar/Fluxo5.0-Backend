@@ -1,7 +1,7 @@
 // src/controllers/stock.controller.ts
 
 import { Request, Response } from 'express';
-import { pool, withTransaction } from '../db';
+import { pool, query as dbQuery, withTransaction } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
@@ -25,7 +25,10 @@ export const getStock = async (req: Request, res: Response) => {
     // Frontend-5.0-App/src/types/domain.ts:52-63) — agregar destruiria o id. Soma entre armazéns
     // no Controle de Estoque é mudança de contrato de rota: registrada em DIVIDAS.md.
     const almoxId = await getAlmoxId(pool);
-    const { rows } = await pool.query(`
+    // RETRY: era `pool.query` CRU, fora do wrapper do db.ts — a classe do 500 intermitente no cold
+    // start do Neon, já diagnosticada e paga em separations.controller.ts:26-27. Leitura
+    // idempotente ⇒ auto-elegível (a query começa com SELECT).
+    const { rows } = await dbQuery(`
       SELECT s.*, json_build_object(
         'id', p.id,
         'name', p.name,
