@@ -449,3 +449,45 @@ que foi outra pessoa.
 o que for preciso) ou pode ser furo (cada um cancela o seu, o almoxarifado recusa com motivo).
 São desenhos diferentes, não graus do mesmo. Saída, se virar furo: `requester_id = userId` como
 alternativa ao gate de cargo em `deleteRequest`, e exibir o autor do cancelamento no drawer.
+
+## Controle de Estoque — soma entre armazéns exige mudar o contrato da rota (lote futuro)
+
+**Registrado em 17/08/2026** (LOTE 0, veredito V1 do arquiteto). `GET /stock` devolve `s.*` —
+inclusive **`s.id`, o id da LINHA de stock**, que é a chave de `PUT /stock/:id` (ajuste de
+inventário) e `GET /stock/:id/reservations`, com contrato escrito em
+`Frontend-5.0-App/src/types/domain.ts:52-63` (`StockRow`). Por isso o LOTE 0 **filtrou**
+(`warehouse_id = ALMOX AND op_id IS NULL`) em vez de agregar: agregar por produto destruiria o
+`id` ou obrigaria a eleger um id de linha arbitrária — mentira pior que a duplicata que o lote
+veio matar. Quando a tela precisar de fato do saldo somado de todos os armazéns, é **mudança de
+contrato de rota + front junto** (campo agregado novo, ou rota separada, com as ações de ajuste
+apontando para a linha certa). Não é conserto de leitor: é peça de produto.
+
+## Smokes que leem `stock` sem filtrar armazém — não são bug hoje, viram bug amanhã
+
+**Registrado em 17/08/2026** (varredura L4 do LOTE 0). Cinco smokes leem saldo com
+`WHERE product_id = $1` sem `warehouse_id`: `smoke_demandas_3d.ts:173`, `smoke_op_status.ts:210`,
+`smoke_requests_3d.ts:177`, `smoke_teto_conferencia.ts:176`, `smoke_returns_total_cost.ts:45`.
+**Não são bug**: cada um opera em produto que ELE MESMO acabou de criar, com uma linha única de
+stock. Passam a mentir no dia em que rodarem contra produto com múltiplas linhas (outro armazém
+ou per-OP) — a leitura pegaria uma linha arbitrária e o smoke acusaria falha (ou sucesso) falsa.
+O padrão certo já existe no repo: `smokes/_smoke.ts:61` (`getAlmoxId` + `op_id IS NULL`).
+
+## LOTE 0 — os 20 smokes ficaram SEM EXECUÇÃO neste lote (motivo declarado)
+
+**Registrado em 17/08/2026.** Nenhum dos 20 smokes do `package.json` rodou no lote que blindou os
+três leitores de saldo, e o motivo não é preguiça nem regressão:
+
+- **4 de semeadura em transação com ROLLBACK** (`returns:grao`, `returns:janela`,
+  `returns:total-cost`, `returns:perop`) falham no `INSERT` porque o branch de validação está com
+  **`default_transaction_read_only = on`** (medido: `SHOW default_transaction_read_only` → `on`,
+  user `neondb_owner`, não é réplica). **Isso é proteção funcionando** — e o arquiteto decidiu
+  **não liberar escrita nesse branch para rodar smoke**.
+- **16 HTTP** (`users`, `tickets`, `permissions`, `security:*`, `dev*`, `pricing3d`, `assembly`,
+  `opstatus`, `demandas3d`, `teto`, `requests3d`, `audit:logs`) exigem server local com escrita
+  **commitada**, o que colide com o "zero escrita em banco" do próprio lote.
+
+O critério de aceitação foi coberto por outras provas: **P1** (identidade byte-a-byte antes×depois
+no dado real: 6 separações, 61 linhas de estoque, 1 inativo), **P2** (fixture de 2 linhas por CTE
+`VALUES`, zero INSERT, mostrando duplicata antes e grão correto depois) e **build/typecheck**.
+Para rodar os smokes: branch Neon próprio com escrita liberada e `FR_EXPECT_DB_HOST` declarado,
+DEPOIS do push — nunca no branch de validação read-only.
