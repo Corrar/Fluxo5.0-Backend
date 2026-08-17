@@ -293,13 +293,23 @@ export const reactivateProduct = async (req: Request, res: Response) => {
 
 export const getInactiveProducts = async (req: Request, res: Response) => {
   try {
+    // GRÃO: 1 linha por produto, saldo pooled SOMADO entre armazéns — mesmo padrão do catálogo
+    // (:48-59). Sem a agregação, a 2ª linha de stock do mesmo produto DUPLICAVA o produto na lista
+    // e o saldo exibido era o de uma linha arbitrária. POOLED-ONLY: material com op_id está
+    // apropriado a uma OP e não é saldo residual do produto inativo.
+    // RETRY explícito: o CTE fez a query começar com WITH, e o auto-detect do db.ts só marca
+    // SELECT/EXPLAIN/SHOW/TABLE/VALUES como retentável — reafirma {retryable:true} (leitura).
     const { rows } = await query(`
+      WITH pooled AS (
+        SELECT product_id, SUM(quantity_on_hand) AS on_hand
+          FROM stock WHERE op_id IS NULL GROUP BY product_id
+      )
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.unit_price, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
-        json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0)) as stock
-      FROM products p LEFT JOIN stock s ON p.id = s.product_id
+        json_build_object('quantity_on_hand', COALESCE(s.on_hand, 0)) as stock
+      FROM products p LEFT JOIN pooled s ON s.product_id = p.id
       WHERE p.active = false ORDER BY p.name ASC
-    `);
+    `, [], { retryable: true });
     
     const safeRows = rows.map(r => {
        const { parsed } = sanitizeTags(r.tags);
