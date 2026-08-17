@@ -44,7 +44,8 @@
     "smoke:requests3d": "ts-node src/smokes/smoke_requests_3d.ts",
     "smoke:opstatus": "ts-node src/smokes/smoke_op_status.ts",
     "smoke:demandas3d": "ts-node src/smokes/smoke_demandas_3d.ts",
-    "smoke:teto": "ts-node src/smokes/smoke_teto_conferencia.ts"
+    "smoke:teto": "ts-node src/smokes/smoke_teto_conferencia.ts",
+    "smoke:recount": "ts-node src/smokes/smoke_recount.ts"
   },
   "devDependencies": {
     "@types/web-push": "^3.6.4",

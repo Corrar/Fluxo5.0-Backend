@@ -491,3 +491,95 @@ no dado real: 6 separações, 61 linhas de estoque, 1 inativo), **P2** (fixture 
 `VALUES`, zero INSERT, mostrando duplicata antes e grão correto depois) e **build/typecheck**.
 Para rodar os smokes: branch Neon próprio com escrita liberada e `FR_EXPECT_DB_HOST` declarado,
 DEPOIS do push — nunca no branch de validação read-only.
+---
+
+# Lote R1 — recontagem física (`POST /stock/recount`), 17/08/2026
+
+Quatro dívidas nomeadas ao ligar a recontagem. Nenhuma bloqueia o endpoint; todas foram
+decididas com o Bruno antes de escrever a primeira linha.
+
+## 1. RBAC: `estoque:edit` em vez de uma chave dedicada
+
+A rota usa `requirePermission('estoque:edit')` — a chave que já existe e que já governa quem
+corrige saldo (hoje: `almoxarife` e `usinagem_lider`). **Zero seed, zero migration.**
+
+O mais correto em auditoria seria uma chave própria, `estoque:ajustar`: recontagem física é um
+poder diferente de "editar estoque" — ela reescreve o saldo para um valor absoluto declarado por
+uma pessoa, sem documento de origem (não há NF, não há separação). Quem audita quer poder
+perguntar "quem pode recontar?" e receber uma lista, não deduzir a partir de outra chave.
+
+**Ficou de fora por custo de matriz**: a chave nova teria de ser semeada e depois decidida para
+as 15 classes na tela de Permissões, uma a uma. Saída, quando o custo valer a pena: seed da chave
++ trocar o `requirePermission` da rota + marcar as classes que hoje têm `estoque:edit`.
+
+## 2. `STOCK_RECOUNT` aparece CRUA na tela de Auditoria
+
+`audit_logs.action` é `text` sem CHECK e sem ENUM (medido na branch de produção em 17/08 —
+76 verbos distintos já convivem lá), então o verbo novo entrou **sem migration**. O front tem
+fallback explícito (`audit_format.js`: "action desconhecida cai no fallback, NUNCA lança"), então
+a tela não quebra: mostra a action crua e os pares chave-valor do `details`.
+
+**Pendência de front, uma linha**: somar a entrada `STOCK_RECOUNT` em `AUDIT_ACTIONS`
+(`src/lib/audit_format.js`) para a Auditoria narrar o evento em português, como faz com
+`UPDATE_STOCK` e `STOCK_ENTRY`. O `details` já vem no formato que a narrativa precisa:
+`{ idem_key, total_itens, aplicados, replays, com_diferenca, itens: [{ product_id, sku, old_qty, new_qty }] }`.
+
+## 3. `PUT /stock/:id` (a rota antiga) — duas dívidas que a rota nova NÃO herda
+
+Decidido explicitamente: **o lote R1 não toca o `PUT /stock/:id`**. A tela nova de recontagem não
+o usa, então nenhuma das duas dívidas abaixo a alcança. Ficam registradas porque a rota continua
+viva e aberta a quem chamar a API direto.
+
+**(a) `op_key` ancorada no VALOR FINAL.** A chave é `stock:<id>:adjust:<valor>` — o valor contado
+faz parte dela. Consequência: recontar **10 → 12 → 10** faz o terceiro ajuste colidir com a chave
+do primeiro, o `alreadyApplied` do motor dispara e o saldo **fica em 12, em silêncio** (HTTP 200,
+sem aviso nenhum). Recontagem legítima para um valor já usado é indistinguível de replay. É
+exatamente por isso que a rota nova exige `X-Idempotency-Key` e ancora a chave na SESSÃO
+(`recount:<chave>:product:<id>`), nunca no valor — e há prova dedicada disso no `smoke_recount`.
+
+**(b) Gate inline morto para Usinagem.** O `updateStock` não tem `requirePermission`: decide por
+role hardcoded (`admin`/`almoxarife` passam) e, para os demais, exige
+`profiles.sector.toLowerCase() === 'usinagem'` **e** produto com tag `usinagem`. O dado real de
+`profiles.sector` em produção é **"Setor: Usinagem"** (5 usuários) — que em minúsculas é
+`'setor: usinagem'` e **nunca** casa com `'usinagem'`. Na prática o ramo inteiro está morto: só
+admin e almoxarife ajustam por lá. Efeito colateral de auditoria: por não usar `requirePermission`,
+essa rota é a única mutação de saldo **invisível para a tela de Permissões** — quem administra a
+matriz não tem como saber que ela existe.
+
+## 4. Endpoint POOLER da VALIDAÇÃO em modo somente-leitura (achado de bancada)
+
+Ao rodar o `smoke_recount` contra a validação (`ep-summer-wave`), toda escrita voltou
+`cannot execute INSERT in a read-only transaction`. Medido na sequência:
+
+| rota de conexão | `default_transaction_read_only` | escrita |
+|---|---|---|
+| `ep-summer-wave-ajlt26g5-**pooler**...` (a URL do `.env`) | **on** | recusada |
+| `ep-summer-wave-ajlt26g5...` (direto, sem `-pooler`) | off | OK |
+
+Não vem de `pg_roles.rolconfig` nem de `pg_db_role_setting` (ambos vazios) e o compute **não** está
+em recovery (`pg_is_in_recovery = false`) — ou seja, não é réplica: é configuração do endpoint
+pooled no Neon. **Produção (`ep-steep-breeze`) não é afetada** — escreveu normalmente durante todo
+o dia 17/08. O `smoke_recount` rodou pelo endpoint direto, com o guard de host declarado
+(`FR_EXPECT_DB_HOST=ep-summer-wave`) e as duas camadas conferidas.
+
+**Consequência para quem vier depois**: qualquer smoke de escrita rodado com o `.env` do
+repositório vai falhar em validação até isso ser resolvido no console do Neon (ou até a
+`DATABASE_URL` do `.env` deixar de usar o pooler). Não é dívida de código deste repositório —
+é estado de infraestrutura, registrado aqui para não custar meia hora de diagnóstico ao próximo.
+
+**AÇÃO PENDENTE — antes do próximo lote que ESCREVA (verificação de infra, não de código):**
+conferir no Render (serviço `fluxo5-0-backend-r49g`) se a `DATABASE_URL` de **PRODUÇÃO** usa
+endpoint **pooler** ou **direto**, e medir `SHOW default_transaction_read_only` nele.
+
+Por que isso importa: os dois endpoints da **mesma branch** divergiram em capacidade de escrita
+**sem** que a diferença viesse de `pg_roles.rolconfig` ou de `pg_db_role_setting` — ou seja, a
+diferença é do endpoint, não do banco. Um pooler read-only em produção derrubaria **toda** mutação
+com **o guard de host passando em silêncio**: `FR_EXPECT_DB_HOST` confere o HOST, e o host estaria
+certo — o modo é que estaria errado. O sintoma chegaria como 500 genérico em telas não
+relacionadas, e o diagnóstico começaria no lugar errado.
+
+Olhar também a **query string** da URL, não só o hostname: `options=` (pode carregar
+`-c default_transaction_read_only=on`) e `target_session_attrs` (`any` × `read-write` — este
+último recusa a conexão em vez de aceitar e depois negar cada escrita, que é o comportamento
+preferível). Se produção estiver no pooler e escrevendo normalmente (foi o observado em 17/08),
+o item vira apenas registro; se estiver perto de virar, é bloqueio de go-live.

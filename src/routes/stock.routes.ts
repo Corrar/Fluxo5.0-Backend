@@ -13,7 +13,8 @@ import {
   getPendingReturns,
   conferReturn,
   rejectReturn,
-  registerEntries // A nova função do controller
+  registerEntries, // A nova função do controller
+  recountStock
 } from '../controllers/stock.controller';
 
 const router = Router();
@@ -66,6 +67,22 @@ router.post('/manual-withdrawal', requirePermission('entradas:add'), manualWithd
  * @body { entries: Array<{ product_id: string, quantity: number, type: string, observation?: string }> }
  */
 router.post('/entries', requirePermission('entradas:add'), registerEntries); // O Endpoint novo que fica no lugar da entrada manual
+
+/**
+ * @route POST /stock/recount
+ * @description Recontagem física de inventário: item único (array de 1) ou lote (array de N, teto 500).
+ *              Alvo cravado no servidor — (product_id, ALMOX, op_id NULL); o cliente nunca escolhe a linha.
+ * @header X-Idempotency-Key OBRIGATÓRIO (âncora da sessão de contagem; 400 sem ele).
+ * @body { items: Array<{ product_id: string (uuid), counted_qty: number >= 0 }> }
+ *
+ * RBAC: `estoque:edit` — a chave que já existe para quem corrige saldo (almoxarife, usinagem_lider).
+ * Uma chave dedicada (`estoque:ajustar`) separaria "corrigir saldo" de "editar estoque" na auditoria;
+ * ficou de fora por custo de matriz (15 classes). Ver DIVIDAS.md.
+ *
+ * ⚠ O `PUT /stock/:id` acima NÃO foi tocado: continua com o gate inline por role e a op_key
+ *   ancorada no valor final. As duas dívidas dele estão nomeadas no DIVIDAS.md; esta rota não as herda.
+ */
+router.post('/recount', requirePermission('estoque:edit'), recountStock);
 
 // =========================================================================
 // ROTAS DE DEVOLUÇÕES (OP)

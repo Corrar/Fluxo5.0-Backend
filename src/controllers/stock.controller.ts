@@ -689,3 +689,209 @@ export const registerEntries = async (req: Request, res: Response) => {
     res.status(500).json({ error: error.message || 'Erro interno ao registar as entradas.' });
   }
 };
+
+// =============================================================================
+// RECONTAGEM FÍSICA DE INVENTÁRIO — POST /stock/recount (lote R1)
+// =============================================================================
+// UM endpoint, DOIS consumidores: item único é array de 1; a planilha é array de N. É o que
+// destrava o "Processar inventário" que nasceu desabilitado (pages_main.jsx) — disparar N PUTs
+// unitários daqui seria N escritas sem transação, meio inventário aplicado se uma falhar.
+//
+// POR QUE NÃO REUSAR `PUT /stock/:id`: aquela rota chaveia por `stock.id`, que o GET /products
+// NÃO expõe (decisão declarada em adapters.js) e que deixa de ser único no dia em que o transfer
+// povoar outros armazéns. Aqui o alvo é CRAVADO NO SERVIDOR: (product_id, ALMOX, op_id NULL).
+// O cliente manda o QUE contou, nunca ONDE gravar.
+//
+// X-Idempotency-Key é OBRIGATÓRIO (400 sem ele) e a op_key deriva da CHAVE DA SESSÃO + product_id,
+// NUNCA do valor contado. A rota antiga ancora no valor final (`stock:<id>:adjust:<valor>`), e por
+// isso recontar 10 → 12 → 10 colide com a chave do primeiro ajuste: o `alreadyApplied` dispara e o
+// saldo FICA em 12, em silêncio. Com a âncora de sessão, cada recontagem é um evento distinto e
+// só o RETRY da mesma sessão é replay.
+const RECOUNT_MAX_ITENS = 500;
+const RECOUNT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Unidades que aceitam fração. Espelha DECIMAL_UNITS de requests.controller.ts:15 (que por sua vez
+// espelha o front) — mesma lista, MESMO default seguro: unidade desconhecida conta como INTEIRA.
+// 'UND' (36 produtos ativos) fica FORA de propósito: é sinônimo de 'UN' (unidade), não de medida
+// contínua. 'MT' fica DENTRO por fidelidade à lista original, embora não exista no catálogo hoje
+// (192 produtos usam 'M'). Divergir daquela lista aqui criaria duas réguas para o mesmo produto.
+const RECOUNT_DECIMAL_UNITS = new Set(['M', 'MT', 'L', 'KG']);
+const recountIsDecimalUnit = (un: unknown): boolean => RECOUNT_DECIMAL_UNITS.has(String(un ?? '').trim().toUpperCase());
+
+export const recountStock = async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { items } = req.body ?? {};
+
+  // ── Borda 1: a âncora de idempotência ──────────────────────────────────────
+  // Só string; header repetido (array) ou vazio → AUSENTE. Aqui a ausência é ERRO (ao contrário
+  // de entries/manual-withdrawal, onde o header é opcional): sem âncora de sessão a op_key teria
+  // de voltar a depender do valor contado, que é exatamente o bug que esta rota existe para não ter.
+  const rawIdem = req.headers['x-idempotency-key'];
+  const idemKey = typeof rawIdem === 'string' && rawIdem.trim() ? rawIdem.trim() : null;
+  if (!idemKey) {
+    return res.status(400).json({ error: 'Header X-Idempotency-Key é obrigatório nesta rota.' });
+  }
+
+  // ── Borda 2: forma do array ────────────────────────────────────────────────
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Informe ao menos um item contado.' });
+  }
+  // TETO POR DURAÇÃO DE TRANSAÇÃO, não por payload: são ~5 statements e 2 triggers por item numa
+  // única TX segurando FOR UPDATE em N linhas (o express aceita 50mb — 500 itens não passam de ~30KB).
+  // Planilha maior é fatiada pelo FRONT em lotes sequenciais, cada um com a sua própria chave.
+  if (items.length > RECOUNT_MAX_ITENS) {
+    return res.status(400).json({ error: `Lote grande demais: ${items.length} itens (máximo ${RECOUNT_MAX_ITENS} por chamada).` });
+  }
+
+  // ── Borda 3: cada item, e a DUPLICATA ──────────────────────────────────────
+  // DIVERGÊNCIA DELIBERADA do molde (registerEntries agrega duplicata por produto somando as
+  // quantidades, stock.controller.ts:585-590): lá o dado é ENTRADA (duas linhas da mesma NF somam);
+  // aqui é CONTAGEM FÍSICA — dois valores para o mesmo SKU não somam, são contradição do operador.
+  // Somar inventaria um número que ninguém contou; a última-vence esconderia a divergência. 400.
+  const normalizados: Array<{ product_id: string; counted_qty: number }> = [];
+  const vistos = new Set<string>();
+  for (const it of items) {
+    const pid = typeof it?.product_id === 'string' ? it.product_id.trim() : '';
+    if (!RECOUNT_UUID_RE.test(pid)) {
+      return res.status(400).json({ error: 'Item inválido: product_id ausente ou fora do formato uuid.' });
+    }
+    if (vistos.has(pid)) {
+      return res.status(400).json({ error: `Produto repetido no lote (${pid}): a contagem física não soma duas linhas do mesmo item — envie um valor só.` });
+    }
+    vistos.add(pid);
+
+    const qty = Number(it?.counted_qty);
+    if (!Number.isFinite(qty) || qty < 0) {
+      return res.status(400).json({ error: `Contagem inválida no produto ${pid}: informe um número maior ou igual a zero.` });
+    }
+    normalizados.push({ product_id: pid, counted_qty: qty });
+  }
+
+  // ORDEM DETERMINÍSTICA por product_id — mesma disciplina do StockService.transfer
+  // (stock.service.ts:257-267). Os locks de linha acumulam até o COMMIT e o motor NÃO ordena nada:
+  // dois lotes concorrentes percorrendo os mesmos produtos em ordens diferentes podem DEADLOCKAR.
+  // O retry de 40P01/40001 do withTransaction (db.ts:280) mitiga, não elimina — ordenar elimina.
+  normalizados.sort((a, b) => (a.product_id < b.product_id ? -1 : a.product_id > b.product_id ? 1 : 0));
+
+  const multi = normalizados.length > 1;
+  const nomear = (sku: string, msg: string) => (multi ? `Item ${sku}: ${msg}` : msg);
+
+  // `active` viaja na resposta por item: produto ARQUIVADO é contável (decisão do lote — ver o
+  // SELECT abaixo), mas a tela precisa poder avisar o operador de que aquele item está fora do
+  // catálogo ativo. É FATO devolvido, não regra aplicada: nada aqui decide por causa dele.
+  type LinhaResultado = { product_id: string; sku: string; active: boolean; antes: number; depois: number; delta: number; status: 'aplicado' | 'replay' };
+  let resultado: LinhaResultado[] = [];
+
+  try {
+    resultado = await withTransaction(async (client) => {
+      const warehouseId = await resolveWarehouseId(client, userId);
+      const ids = normalizados.map((n) => n.product_id);
+
+      // Produtos numa tacada (evita N SELECTs). `active` NÃO filtra: inventário conta o que está na
+      // prateleira, e item arquivado que aparece na contagem precisa poder ser corrigido — a tela
+      // só oferece ativos, então na prática o caso não nasce por lá.
+      const prods = await client.query<{ id: string; sku: string; name: string; unit: string | null; active: boolean | null }>(
+        `SELECT id, sku, name, unit, active FROM products WHERE id = ANY($1::uuid[])`,
+        [ids],
+      );
+      const porId = new Map(prods.rows.map((p) => [String(p.id), p]));
+
+      // VALIDAÇÃO COMPLETA ANTES DE QUALQUER ESCRITA: o throw já garantiria o ROLLBACK, mas checar
+      // tudo antes evita gravar metade do razão para depois desfazer.
+      for (const n of normalizados) {
+        const p = porId.get(n.product_id);
+        if (!p) throw new Error(`RECOUNT_PRODUTO:${n.product_id}`);
+        if (!recountIsDecimalUnit(p.unit) && !Number.isInteger(n.counted_qty)) {
+          throw new Error(`RECOUNT_FRACAO:${p.sku}:${n.counted_qty}:${String(p.unit ?? '').trim() || 'UN'}`);
+        }
+      }
+
+      const linhas: LinhaResultado[] = [];
+      for (const n of normalizados) {
+        const p = porId.get(n.product_id)!;
+        // op_key ancorada na SESSÃO + produto. NUNCA no valor contado (ver cabeçalho).
+        const opKey = `recount:${idemKey}:product:${n.product_id}`;
+
+        // Replay explícito: o motor já trata (alreadyApplied), mas a RESPOSTA precisa distinguir
+        // "apliquei agora" de "isto é o retry do mesmo POST" — daí a consulta própria.
+        const ja = await client.query('SELECT 1 FROM stock_ledger WHERE op_key = $1 LIMIT 1', [opKey]);
+        const ehReplay = (ja.rowCount ?? 0) > 0;
+
+        const snapAntes = await StockService.read(client, n.product_id, warehouseId, POOLED_OP_ID);
+        const antes = snapAntes ? snapAntes.onHand : 0;
+
+        try {
+          const snap = await StockService.adjust(client, n.product_id, warehouseId, POOLED_OP_ID, n.counted_qty, {
+            refType: 'stock_recount', refId: idemKey, userId,
+            opKey,
+            reason: 'Recontagem física de inventário',
+          });
+          linhas.push({
+            product_id: n.product_id, sku: p.sku, active: p.active !== false,
+            antes, depois: snap.onHand, delta: snap.onHand - antes,
+            status: ehReplay ? 'replay' : 'aplicado',
+          });
+        } catch (err: any) {
+          // AJUSTE_ABAIXO_RESERVA e afins já vêm com os DOIS números na mensagem do motor; só
+          // acrescentamos QUAL item, e apenas quando o lote tem mais de um (num item só o SKU
+          // seria ruído — o cliente sabe o que mandou).
+          if (err instanceof StockError) {
+            throw new StockError(err.code, nomear(p.sku, err.message), n.product_id, warehouseId, POOLED_OP_ID);
+          }
+          throw err;
+        }
+      }
+
+      // Auditoria DENTRO da TX, no formato do UPDATE_STOCK (o único que grava antes E depois).
+      // Só os itens que MUDARAM entram em `itens`: contagem que confirma o saldo não é evento de
+      // auditoria, e um lote de 500 confirmações encheria o details de ruído. Os totais ficam.
+      const mudados = linhas.filter((l) => l.delta !== 0);
+      await createLog(userId, 'STOCK_RECOUNT', {
+        idem_key: idemKey,
+        total_itens: linhas.length,
+        aplicados: linhas.filter((l) => l.status === 'aplicado').length,
+        replays: linhas.filter((l) => l.status === 'replay').length,
+        com_diferenca: mudados.length,
+        itens: mudados.map((l) => ({ product_id: l.product_id, sku: l.sku, old_qty: l.antes, new_qty: l.depois })),
+      }, getClientIp(req), client);
+
+      return linhas;
+    });
+  } catch (error: any) {
+    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+
+    const msg = String(error?.message ?? '');
+    if (msg.startsWith('RECOUNT_PRODUTO:')) {
+      return res.status(404).json({ error: `Produto não encontrado: ${msg.slice('RECOUNT_PRODUTO:'.length)}.` });
+    }
+    if (msg.startsWith('RECOUNT_FRACAO:')) {
+      const [, sku, valor, un] = msg.split(':');
+      return res.status(400).json({ error: nomear(sku, `a unidade "${un}" não aceita casas decimais (contado: ${valor}).`) });
+    }
+    // Corrida: dois POSTs paralelos com a MESMA chave. O 1º comitou; o 2º passou o alreadyApplied
+    // ANTES do commit dele e bateu no índice único da op_key. O withTransaction já fez ROLLBACK ->
+    // nada duplicou e o saldo é o do vencedor. Mesmo tratamento cirúrgico de entries/withdrawal:
+    // só a NOSSA constraint vira resposta idempotente; outro 23505 RE-LANÇA.
+    if (error?.code === '23505' && error?.constraint === 'uq_stock_ledger_opkey') {
+      const opKeyConflict = /\(op_key\)=\(([^)]*)\)/.exec(error?.detail ?? '')?.[1] ?? null;
+      console.warn(JSON.stringify({ event: 'recount_idempotent_conflict', op_key: opKeyConflict }));
+      return res.status(200).json({ success: true, idempotent: true, items: [] });
+    }
+    console.error(JSON.stringify({ event: 'recount_error', err_code: error?.code ?? null, err_msg: msg.slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao registrar a recontagem.' });
+  }
+
+  // PÓS-COMMIT: avisa as telas de saldo. Só os produtos que realmente mudaram — avisar de saldo
+  // que não mudou é ruído (o helper já dedup/descarta vazio).
+  emitStockChanged(resultado.filter((l) => l.delta !== 0).map((l) => l.product_id), (req as any).io);
+
+  return res.status(200).json({
+    success: true,
+    warehouse: 'ALMOX',
+    total: resultado.length,
+    aplicados: resultado.filter((l) => l.status === 'aplicado').length,
+    replays: resultado.filter((l) => l.status === 'replay').length,
+    com_diferenca: resultado.filter((l) => l.delta !== 0).length,
+    items: resultado,
+  });
+};
