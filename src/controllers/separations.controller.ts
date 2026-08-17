@@ -5,7 +5,7 @@ import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
-import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
 
 // Guard de status da separação. Erro TIPADO para o catch mapear HTTP sem cair no 500 genérico:
 // inexistente → 404; transição terminal sem sentido (entregue/cancelada) → 400.
@@ -25,13 +25,26 @@ export const getSeparations = async (req: Request, res: Response) => {
   try {
     // RETRY explícito: era `pool.query` CRU, fora do wrapper do db.ts — origem conhecida do 500
     // intermitente desta fila no cold start do Neon. Leitura idempotente ⇒ retentável.
+    // GRÃO: o saldo é o do ALMOX pooled (op_id IS NULL) — é de lá que a separação sai, e material
+    // com op_id já está apropriado a outra OP. Sem estes dois filtros, a 2ª linha de stock do mesmo
+    // produto (outro armazém ou per-OP) DUPLICA o item dentro de items[] e cada cópia mostra o
+    // saldo de uma linha arbitrária. O join é 1-para-1 por item, então filtrar já garante 1 linha.
+    // ORDEM CRAVADA (ORDER BY p.sku NULLS LAST, p.name): `json_agg` sem ORDER BY herda a ordem do
+    // EXECUTOR — era emergente do plano, não contrato, e o predicado novo do join a mudou. items[]
+    // é a sequência de BIPAGEM do separador: SKU é o campo que ele confere contra a etiqueta, e o
+    // formato C.SS.NNNN agrupa a mesma família na ordem em que ele percorre a prateleira.
+    // NULLS LAST + p.name porque products.sku é nullable (produto custom): sem o desempate, a
+    // ordem entre itens sem SKU voltaria a ser emergente do plano.
+    const almoxId = await getAlmoxId(pool);
     const { rows } = await dbQuery(`
       SELECT s.*,
-        (SELECT json_agg(json_build_object('id', si.id, 'product_id', si.product_id, 'quantity', si.quantity, 'qty_requested', si.qty_requested, 'observation', si.observation, 'products', json_build_object('name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price, 'stock', json_build_object('quantity_on_hand', COALESCE(st.quantity_on_hand, 0), 'quantity_reserved', COALESCE(st.quantity_reserved, 0)))))
-         FROM separation_items si JOIN products p ON si.product_id = p.id LEFT JOIN stock st ON p.id = st.product_id WHERE si.separation_id = s.id) as items,
+        (SELECT json_agg(json_build_object('id', si.id, 'product_id', si.product_id, 'quantity', si.quantity, 'qty_requested', si.qty_requested, 'observation', si.observation, 'products', json_build_object('name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price, 'stock', json_build_object('quantity_on_hand', COALESCE(st.quantity_on_hand, 0), 'quantity_reserved', COALESCE(st.quantity_reserved, 0)))) ORDER BY p.sku NULLS LAST, p.name)
+         FROM separation_items si JOIN products p ON si.product_id = p.id
+         LEFT JOIN stock st ON p.id = st.product_id AND st.warehouse_id = $1 AND st.op_id IS NULL
+         WHERE si.separation_id = s.id) as items,
         (SELECT json_agg(json_build_object('id', sr.id, 'product_id', sr.product_id, 'quantity', sr.quantity, 'status', sr.status, 'product_name', p.name)) FROM separation_returns sr JOIN products p ON sr.product_id = p.id WHERE sr.separation_id = s.id) as returns
       FROM separations s ORDER BY s.created_at DESC
-    `, [], { retryable: true });
+    `, [almoxId], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar separações' }); }
 };
