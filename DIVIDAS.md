@@ -583,3 +583,69 @@ Olhar também a **query string** da URL, não só o hostname: `options=` (pode c
 último recusa a conexão em vez de aceitar e depois negar cada escrita, que é o comportamento
 preferível). Se produção estiver no pooler e escrevendo normalmente (foi o observado em 17/08),
 o item vira apenas registro; se estiver perto de virar, é bloqueio de go-live.
+
+## warehouses.sector é o QUARTO vocabulário de setor — unificar é PRÉ-REQUISITO do transfer
+
+**Registrado em 17/08/2026** (LOTE W1, migration 024). O slug de `warehouses.sector` é minúsculo
+sem acento (`esteira`, `lavadora`, `flow`, `classificadora`, `embaladora`, e da 004: `usinagem`,
+`producao_3d`, `eletrica`, `montagem`, `expedicao`). Ele **não casa** com:
+- `profiles.sector` — forma de exibição, com maiúscula e acento ("Usinagem", "Elétrica");
+- `separations.destination` — texto livre MAIÚSCULO/misto, escrito pelo operador;
+- `VALID_SECTORS` do `manualWithdrawal` (stock.controller) — lista própria com acento e nomes que
+  não existem como armazém ("Terceiros", "Acumulador", "Reposição", "Viagem", "Outros").
+
+São **quatro vocabulários independentes para a mesma coisa**. A 024 seguiu o slug da 004 de
+propósito: divergir criaria um QUINTO. **A unificação é lote próprio e é pré-requisito do
+transfer** — transferir material de setor para setor exige um de-para confiável entre "o setor que
+o usuário vê" e "o armazém que guarda o saldo"; hoje esse de-para não existe em lugar nenhum.
+
+## Os 5 armazéns novos NÃO aparecem nos dropdowns do front (e por quê)
+
+**Registrado em 17/08/2026** (LOTE W1). Nenhum front lê a tabela `warehouses` — **não existe rota
+`GET /warehouses`**. Os seletores de armazém são arrays LITERAIS no código do front, com 6 nomes
+cada: `ARMAZENS` (`fluxo-royale-react/src/parts/pages_admin.jsx:7`) e `SEP_ARMAZENS`
+(`separacoes.jsx:735`). O valor escolhido é rótulo local e nem é enviado ao backend (o
+`POST /stock/entries` recebe só `nf_number`, `type`, `entries`). Consequência honesta: os cinco
+armazéns existem no banco e **não vão aparecer em tela** até que exista a rota e o front passe a
+enumerar o banco — lote de front próprio. O lado bom: por isso mesmo a 024 não quebra tela nenhuma.
+
+## Provas ancoradas em ep-summer-wave NÃO são reproduzíveis (o read_only oscila sozinho)
+
+**Registrado em 17/08/2026.** O mesmo endpoint `-pooler` do branch de validação mediu
+`default_transaction_read_only = on` durante o LOTE 0 e `off` poucas horas depois, no LOTE W1,
+**sem intervenção de ninguém** — e o guard de host não pega isso (host certo, modo diferente).
+Some-se que o `stock` de lá tem 71 linhas com 1 armazém povoado, o que não representa produção
+(recon #3: 2.350 linhas). **Regra: prova de migration roda em branch Neon própria, criada sem
+expiração, com `FR_EXPECT_DB_HOST` declarado** — nunca no branch de validação compartilhado.
+
+## Régua de desmonte de worktree: `-Recurse` através de junction APAGA O ALVO
+
+**Registrado em 17/08/2026** (dano real observado). O `node_modules` de `Backend-Fluxo2.0` foi
+encontrado VAZIO (0 itens; `pg` e `dotenv` ausentes) horas depois de estar íntegro. Assinatura:
+worktree removido com `Remove-Item -Recurse` atravessando a junction de `node_modules` — o
+`-Recurse` segue o link e apaga o conteúdo do ORIGINAL, não só o link. **A régua (já registrada
+para o front, agora com dano medido no backend): apagar a junction PRIMEIRO, com `cmd /c rmdir`
+(sem -Recurse), e só então remover o worktree.** Recuperação: `npm ci` no repositório afetado.
+
+## O repo NÃO versiona schema-base — medido no LOTE W1 sobre banco VAZIO (a dívida AINDA VALE)
+
+**Medido em 17/08/2026** (LOTE W1, container Postgres 16 local e descartável). Aplicando as
+migrations do repo **em ordem sobre um banco vazio**, **18 das 19 falham**; só a `014_drop_dev_tasks`
+passa (é `DROP ... IF EXISTS` sobre nada). A causa é única: as migrations começam em **004** e
+pressupõem um schema-base que **nunca foi versionado** (veio do 2.0).
+
+Tabelas-base pressupostas, extraídas das próprias mensagens de guard das migrations:
+`audit_logs, client_services, dev_projects, op_material_events, op_returns, products,
+request_items, role_permissions, separation_items, separations, settings, stock, stock_ledger,
+tickets, users, xml_logs` — mais `profiles`, que aparece pelos smokes.
+
+**O lado bom, também medido:** as migrations **não explodem com erro criptográfico** — 15 delas
+abortam com guard nomeado ("X ausente — schema base não encontrado"), o que torna o diagnóstico
+imediato. **A consequência prática:** não existe caminho "banco novo → migrations → sistema
+rodando"; provisionar ambiente novo exige um dump do schema atual. E as suítes de smoke não são
+executáveis em container vazio (as 4 de ROLLBACK morrem em `profiles` ausente; as 16 HTTP exigem
+schema completo + server) — o LOTE W1 provou a 024 construindo à mão um schema-base MÍNIMO
+(products, stock, client_services, requests, request_items, separations, separation_items,
+separation_returns), rodando a **004 real** sobre ele e só então a 024.
+**Versionar o schema-base (001_base.sql, gerado por `pg_dump --schema-only` do estado atual) é
+lote próprio** — e é pré-requisito de qualquer prova de migration que não dependa de dump.
