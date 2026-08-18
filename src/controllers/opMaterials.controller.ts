@@ -14,6 +14,10 @@ import { pool, withTransaction } from '../db';
 import type { PoolClient } from 'pg';
 // Montagem v1 (016): o consume valida a ETIQUETA de máquina sem duplicar a regra de quem é dona.
 import { machinePorId } from './assembly.controller';
+// GUARD-RECEBIMENTO (18/08/2026): o de-para de setor→armazém (lote D1) é a fonte que diz se um
+// setor tem custódia. canonSetor normaliza a grafia suja de separations.destination/profiles.sector
+// antes de comparar (ver src/services/setor.ts — 25+29 valores medidos, zero desconhecido).
+import { canonSetor, resolveDestinationWarehouse } from '../services/setor';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -91,7 +95,7 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
       // 1. Trava a separação: serializa recebimentos concorrentes DA MESMA separação, que é onde
       //    o teto por item pode ser furado por corrida.
       const sep = await client.query(
-        `SELECT id, status, client_service_id FROM separations WHERE id = $1 FOR UPDATE`,
+        `SELECT id, status, client_service_id, destination FROM separations WHERE id = $1 FOR UPDATE`,
         [separationId],
       );
       if (sep.rows.length === 0) throw new OpMatError('SEPARACAO_NAO_ENCONTRADA', 'Separação não encontrada.');
@@ -103,6 +107,27 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
       // 2. A OP vem da SEPARAÇÃO, nunca do body — o body não escolhe pra qual OP o material vai.
       const clientServiceId = sep.rows[0].client_service_id;
       if (!clientServiceId) throw new OpMatError('SEPARACAO_SEM_OP', 'Separação não tem OP vinculada — não alimenta o armazém da OP.');
+
+      // 2b. GUARD DE CUSTÓDIA POR SETOR (decisões D1/D2/D3 do lote GUARD-RECEBIMENTO, 18/08/2026).
+      //
+      // D1 primeiro, e para TODO MUNDO (inclusive isMaster): se o destino da separação não tem
+      // armazém no de-para (canonSetor(destination) -> null em SETOR_ARMAZEM), o material foi
+      // consumido na entrega, não fica em custódia de setor nenhum — não há "o quê" receber aqui.
+      // Nem o master recebe o que não tem custódia; isto não é permissão, é o recurso não existir.
+      const destino = resolveDestinationWarehouse(sep.rows[0].destination);
+      if (destino.code === null) {
+        throw new OpMatError('SETOR_SEM_CUSTODIA', 'Este setor não tem armazém — o material foi consumido na entrega, não há recebimento a confirmar aqui.');
+      }
+      // D2/D3: admin e almoxarife são chave-mestra (recebem de qualquer setor); operador comum só
+      // confirma o que foi destinado ao PRÓPRIO setor — cross-setor é bloqueio (403), não aviso.
+      const perfil = await client.query(`SELECT role, sector FROM profiles WHERE id = $1`, [userId]);
+      const isMaster = perfil.rows[0]?.role === 'admin' || perfil.rows[0]?.role === 'almoxarife';
+      if (!isMaster) {
+        const operadorCanon = canonSetor(perfil.rows[0]?.sector ?? null);
+        if (canonSetor(sep.rows[0].destination) !== operadorCanon) {
+          throw new OpMatError('SETOR_ALHEIO', 'Só o setor de destino pode confirmar este recebimento.');
+        }
+      }
 
       const criados: any[] = [];
       const replays: string[] = [];
@@ -376,13 +401,29 @@ export const getOpBalance = async (req: Request, res: Response) => {
 //    pooled é literalmente client_service_id IS NULL (o mesmo sentido do POOLED_OP_ID = null
 //    do motor). Então o filtro "!= POOLED" se resolve inteiro no IS NOT NULL. Separação sem
 //    OP não tem armazém de OP pra alimentar.
-//    ?sector= filtra por separations.destination (opcional: o backend não sabe o setor do caller;
-//    profiles.sector existe mas o de-para setor->destination não é confiável — destination é texto
-//    livre sem allowlist. A tela manda o filtro; sem ele, devolve tudo).
+//
+// GUARD DE CUSTÓDIA POR SETOR (18/08/2026, mesmas decisões D1-D4 do POST /receive abaixo).
+// O filtro de setor não é mais o ?sector= cru do caller (igualdade de string, e o front nunca
+// mandava): o backend resolve pelo TOKEN. isMaster (admin/almoxarife) com ?scope=all vê a fila
+// inteira (menos D1); qualquer outro caso — operador comum, OU master sem ?scope=all — vê só o
+// próprio setor. O front NÃO decide isso; ele só pede, e é ignorado se não tiver o papel.
+//
+// FILTRO EM JS, NÃO EM SQL (escolha deliberada — a outra opção era enumerar em SQL todas as
+// grafias cruas que canonizam para o setor do operador, tipo ANY(['ELETRICA','Elétrica',...]) —
+// funciona, mas fica presa a uma lista que precisa ser re-derivada toda vez que uma grafia nova
+// aparecer em produção). canonSetor é TypeScript, não SQL: buscar sem filtro de setor e aplicar
+// resolveDestinationWarehouse/canonSetor por linha em JS não depende de enumerar nada, e o custo
+// (trazer linhas que o JS descarta) é desprezível — a fila inteira tem ~82 linhas hoje.
 // ==========================================================================
 export const getPendingReceipts = async (req: Request, res: Response) => {
-  const sector = typeof req.query.sector === 'string' && req.query.sector.trim() ? req.query.sector.trim() : null;
+  const userId = (req as any).user?.id ?? null;
+  const scopeAll = typeof req.query.scope === 'string' && req.query.scope.trim().toLowerCase() === 'all';
   try {
+    const perfil = await pool.query(`SELECT role, sector FROM profiles WHERE id = $1`, [userId]);
+    const isMaster = perfil.rows[0]?.role === 'admin' || perfil.rows[0]?.role === 'almoxarife';
+    const operadorCanon = canonSetor(perfil.rows[0]?.sector ?? null);
+    const verTudo = isMaster && scopeAll; // scope=all só tem efeito para quem TEM o papel — fail-closed
+
     const { rows } = await pool.query(
       `SELECT s.id                AS separation_id,
               s.destination       AS sector,
@@ -405,19 +446,25 @@ export const getPendingReceipts = async (req: Request, res: Response) => {
               SELECT SUM(e.qty) AS total FROM op_material_events e
                WHERE e.ref_separation_item_id = si.id AND e.event_type = 'recebido'
          ) r ON TRUE
-        WHERE s.status = ANY($2)
+        WHERE s.status = ANY($1)
           -- OP real obrigatória: NULL = pooled = sem armazém de OP pra alimentar.
           AND s.client_service_id IS NOT NULL
           -- Cutoff de go-live: só entrega a partir da virada. Ver CUTOFF_DATE.
-          AND COALESCE(s.sent_at, s.created_at) >= $3::timestamp
-          AND ($1::text IS NULL OR s.destination = $1)
+          AND COALESCE(s.sent_at, s.created_at) >= $2::timestamp
           -- só o que ainda falta receber. Item autorizado com quantity=0 (35 dos 318 entregues hoje)
           -- nunca saiu do almox -> teto 0 -> não entra na fila.
           AND si.quantity > COALESCE(r.total, 0)
         ORDER BY COALESCE(s.sent_at, s.created_at) DESC NULLS LAST, p.name ASC`,
-      [sector, STATUS_ENTREGUES, CUTOFF_DATE],
+      [STATUS_ENTREGUES, CUTOFF_DATE],
     );
-    return res.json(rows.map((r) => ({
+    const visiveis = rows.filter((r) => {
+      // D1 vale para TODO MUNDO, inclusive o "ver tudo" do master: setor sem armazém não é
+      // recebível por ninguém — não existe custódia pra confirmar.
+      if (resolveDestinationWarehouse(r.sector).code === null) return false;
+      if (verTudo) return true;
+      return canonSetor(r.sector) === operadorCanon;
+    });
+    return res.json(visiveis.map((r) => ({
       separation_id: r.separation_id, sector: r.sector, status: r.status, sent_at: r.sent_at,
       client_service_id: r.client_service_id, op_code: r.op_code,
       item_id: r.item_id, product_id: r.product_id, sku: r.sku, name: r.name, unit: r.unit,
@@ -524,7 +571,12 @@ export const getOpSummary = async (_req: Request, res: Response) => {
 // ==========================================================================
 function mapError(error: any, res: Response, where: string) {
   if (error instanceof OpMatError) {
-    const status = error.code.endsWith('_NAO_ENCONTRADA') || error.code.endsWith('_NAO_ENCONTRADO') ? 404 : 400;
+    // SETOR_ALHEIO é BLOQUEIO de quem sou (D3), não erro de requisição — 403, não 400. Os demais
+    // seguem a régua antiga: *_NAO_ENCONTRAD[AO] -> 404, resto -> 400 (inclusive SETOR_SEM_CUSTODIA:
+    // é o recurso que não é recebível por ninguém, não uma questão de QUEM está pedindo).
+    const status = error.code === 'SETOR_ALHEIO' ? 403
+      : (error.code.endsWith('_NAO_ENCONTRADA') || error.code.endsWith('_NAO_ENCONTRADO')) ? 404
+      : 400;
     return res.status(status).json({ error: error.message });
   }
   // Corrida: dois POSTs idênticos com a MESMA chave, o perdedor bate na op_key UNIQUE. O

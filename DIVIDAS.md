@@ -1101,3 +1101,116 @@ P1–P9 + P8b + P8c verdes. Destaques que valem registro:
 - **P9**: prova de CONTEÚDO (git show base × arquivo novo), não HTTP ao vivo — mesma limitação
   já registrada no D1 (RBAC chumbado nos smokes/contas de teste). O trecho comparado é a
   construção da resposta HTTP inteira, fora do `withTransaction`.
+
+---
+
+# Lote GUARD-RECEBIMENTO — custódia por setor no recebimento de material de OP, 18/08/2026
+
+Guard nos dois lados do fluxo de `op-materials` (`opMaterials.controller.ts`): GET esconde o que
+não é do operador, POST recusa o que não é dele. Instrumento reaproveitado sem reescrita:
+`canonSetor`/`resolveDestinationWarehouse` de `src/services/setor.ts` (lote D1) — mesma fonte que
+já resolve setor→armazém em toda a casa.
+
+**As quatro decisões, cravadas pelo Bruno antes da 1ª linha:**
+- **D1** — setor SEM armazém não entra na fila nem é recebível, nem para o master. Consumiu na
+  entrega; não há custódia de setor para confirmar. Vale para TODOS, sem bypass de cargo.
+- **D2** — admin/almoxarife (`isMaster`) é chave-mestra: recebe de qualquer setor, e tem toggle de
+  "ver tudo" na fila (D1 continua excluindo mesmo com o toggle ligado).
+- **D3** — cross-setor é BLOQUEIO (403 `SETOR_ALHEIO`), não aviso. Operador comum só confirma o
+  que foi destinado ao próprio setor.
+- **D4** — a guarda mora nos DOIS lados. GET filtra por padrão (esconde); POST recusa mesmo que
+  algo apareça na tela por algum outro caminho (fechadura, não cortina).
+
+**Por que o filtro do GET é em JS (`canonSetor`) e não SQL com lista de grafias**: o de-para já
+normaliza (`NFD` + remoção de acento + maiúsculas) — enumerar grafias no SQL duplicaria essa lógica
+numa segunda linguagem e quebraria silenciosamente diante de uma grafia nova que ninguém previu.
+Buscar sem filtro de setor e filtrar em memória paga uma leitura maior (fila inteira, não só a do
+operador) por não depender de enumerar o que pode aparecer amanhã.
+
+**SETOR_ALHEIO ganhou status próprio no `mapError`**: 403, não o 400 genérico de corpo malformado —
+é recusa de QUEM está pedindo, não de o que foi pedido. `SETOR_SEM_CUSTODIA` (D1 no POST) fica no
+400 padrão: o recurso não é recebível por ninguém, não é uma questão de autorização.
+
+## Provas — branch de ensaio, transação com ROLLBACK, funções REAIS do dist/
+
+Mesma técnica de alta-fidelidade do lote TRANSFER (monkey-patch de `withTransaction`/`pool.query`
+redirecionando para um único client mantido aberto), estendida aqui para também cobrir GET: como
+`getPendingReceipts` usa `pool.query` direto (não `withTransaction`), a troca alcança as duas
+funções chamando as exportadas do `dist/`, sem reescrever nem uma linha de SQL. Fixtures efêmeras
+(users/profiles/products/client_services/separations) na MESMA transação, `ROLLBACK` no fim.
+P1–P9 verdes; resíduo pós-rollback conferido em 0.
+
+- **P1**: operador de Esteira vê as DUAS grafias sujas de fixture (`Esteira`/`ESTEIRA`, que o
+  `canonSetor` casa) e não vê a separação de Flow — confirma o filtro por canônico, não por string.
+- **P2**: `Geral`/`Almoxarifado`/`Reposição` (setor sem armazém, D1) somem da fila do operador E da
+  fila do master com "ver tudo" ligado — D1 não tem bypass de cargo, nem no GET.
+- **P3**: master com "ver tudo" enxerga Esteira+Flow (cross-setor, D2); master SEM o toggle vê
+  fila vazia porque o setor do próprio master (`Geral`, fixture) não tem armazém — some pelo D1,
+  não por falta de permissão. Mostra que "ver tudo" desligado não degrada para "vejo o meu": para
+  um master sem setor com armazém, degrada para vazio, e isso é o D1 fazendo o trabalho certo.
+- **P4 — segurança**: operador comum forjando `?scope=all` continua sem ver a separação de Flow —
+  o parâmetro é ignorado pelo backend para quem não é `isMaster` (fail-closed do lado do servidor,
+  o `scope` do front é só UX do master). **Nota de medição**: a contagem TOTAL de linhas variou
+  entre a chamada do P1 e a do P4 (6 → 5) porque `ep-holy-fog` é branch de ensaio COMPARTILHADA com
+  tráfego real concorrente (outros scripts/uso), não um banco isolado por execução — a comparação
+  de contagem bruta contra P1 não é sinal confiável nesse ambiente. O sinal que importa, e que se
+  sustentou, é por MEMBRO: as duas grafias de Esteira da fixture continuam visíveis e a de Flow
+  continua invisível com o parâmetro forjado, idêntico ao sem-parâmetro.
+- **P5 — o caso do Osmar**: operador de Flow tentando confirmar uma separação destinada à Esteira
+  leva 403 `SETOR_ALHEIO`, **zero eventos gravados** (conferido por contagem antes/depois). É
+  exatamente o caso que o laudo original mediu como o único recebimento real de produção — o guard
+  agora bloqueia essa combinação por desenho, não por acidente.
+- **P6**: o mesmo operador (Esteira) confirmando a própria separação recebe 201, evento gravado,
+  saldo recebido correto (10 unidades). Ordenado depois do P5 de propósito: a prova de que o guard
+  FALA (bloqueia o errado) vem antes da prova de que ele deixa passar o certo.
+- **P7**: master confirma separação de Flow (setor alheio, mas é master — D2 bypassa D3) → 201; o
+  MESMO master tentando confirmar separação sem armazém (`Geral`) → 400 `SETOR_SEM_CUSTODIA` — D2
+  não bypassa D1, cargo não compra custódia que não existe.
+- **P8**: repetir o POST com a MESMA `X-Idempotency-Key` não duplica — 2ª chamada devolve
+  `idempotent:true`, `criados:[]`, `replays` populado, contagem de eventos igual antes/depois.
+- **P9**: chaves do GET (sucesso) e a linha de resposta de sucesso do POST idênticas entre o commit
+  base e o novo (comparação de conteúdo via `git show`, mesma limitação de RBAC-nos-smokes já
+  registrada no D1/TRANSFER) — confirmado também ao vivo pelas chaves reais da resposta do P6.
+
+**Build**: `tsc` verde. **Suítes**: os 21 smokes de `package.json` seguem no estado já registrado
+acima ("LOTE 0 — os 20 smokes ficaram SEM EXECUÇÃO neste lote") — 4 passam (os de retorno, que só
+semeiam e leem), 17 falham por exigirem servidor HTTP local com escrita commitada ou por RBAC de
+ator (contas de teste). Rodados neste lote contra `ep-holy-fog` só para reconferir: mesma proporção
+de antes, nenhuma queda nova — nenhum dos 17 toca `opMaterials.controller.ts` nem os caminhos que
+este lote mudou. **O portão deste lote é P1–P9, não a suíte de smoke** (dívida de infraestrutura de
+teste já nomeada na Missão B, acima).
+
+## Dívidas registradas neste lote (medidas, não corrigidas)
+
+### `usinagem_lider` sem a chave `producao:apontar` — falta uma permissão anterior à custódia
+
+**Medido em produção (read-only), 18/08/2026.** A migration 008 lista 8 papéis para
+`producao:apontar`; `role_permissions` hoje tem 7 — falta exatamente `usinagem_lider`. Existe
+**1 perfil real** em produção com esse papel, hoje sem a chave.
+
+Este guard **não resolve o caso dele**: custódia (este lote) e permissão de apontar produção (a
+chave que falta) são camadas diferentes — mesmo com o setor certo, sem a chave RBAC o usuário
+nem chega a abrir a tela de apontamento. É decisão de RBAC do Bruno (semear a chave para o papel
+na matriz de Permissões), não algo que o guard de recebimento decide por conta própria.
+
+### `separations.warehouse_id` — coluna morta, ninguém escreve
+
+Medido por `git grep` no backend: a coluna existe (FK para `warehouses`) e **nenhum controller
+escreve nela**. `resolveDestinationWarehouse` (a fonte real do de-para) não passa pelo banco — é
+mapa em memória — então a coluna nunca foi alimentada por ele nem por ninguém. Candidata a nascer
+carimbada (mesmo padrão de `requests.warehouse_id`, lote D1) ou a ser removida, quando o Bruno
+decidir; não é usada por este guard nem pelo transfer.
+
+### `requests.op_id` — coluna fóssil
+
+Medido por `git grep`: nenhum controller lê ou escreve `requests.op_id`. A OP viva de todo o
+sistema é `client_service_id` (mesma conclusão já registrada em "ordens_producao — tabela rival
+órfã", acima, para a tabela irmã). Candidata a DROP com guarda de premissa, quando o Bruno decidir.
+
+### `request_items.client_service` — TEXT denormalizado, 2ª fonte de "qual OP"
+
+Medido por `git grep`: a coluna é `TEXT` (não FK) e tem leitura/escrita ativa, em paralelo a
+`requests.client_service_id` (a FK real). As duas podem divergir — nenhum guard impede. Não é
+usada por este lote, mas é a mesma classe de risco que fechou "`requests.sector` carrega DOIS
+significados", acima: duas fontes escreventes para o mesmo fato, sem CHECK nem trigger de
+sincronismo. Fica nomeada para quando `request_items` for revisitada.
