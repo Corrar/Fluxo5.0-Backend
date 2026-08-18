@@ -699,6 +699,81 @@ Isso inclui o **`Outro`** (1 separação), que não está em nenhuma das três l
 inclui qualquer nome que alguém digite amanhã. **A regra é: o de-para responde "qual armazém?"
 com um armazém ou com "nenhum" — nunca com um erro.**
 
+#### ✅ IMPLEMENTADO em 18/08/2026 (lote D1) — e a régua que o acompanha
+
+O requisito acima virou código: `canonSetor` e `SETOR_ARMAZEM` em **`src/services/setor.ts`**,
+`resolveDestinationWarehouseId` em `src/services/warehouse.ts`, e o carimbo de
+`requests.warehouse_id` em `createRequest`. A normalização é `lower`+sem-acento em TypeScript
+(`NFD` + faixa U+0300–U+036F), não `unaccent` do Postgres — sem extension, sem migration.
+
+### ⚠ RÉGUA: `warehouses.sector` NÃO é a fonte do de-para
+
+**Resolver de destino que leia `warehouses.sector` é BUG.** A coluna parece a fonte óbvia e não é,
+por três motivos medidos no M5 (produção, 18/08/2026):
+
+| | `warehouses.sector` | `SETOR_ARMAZEM` (a fonte) |
+|---|---|---|
+| vocabulário | slug snake_case: `producao_3d`, `eletrica` | canônico: `PRODUCAO 3D`, `ELETRICA` |
+| cardinalidade | **1→1** (uma linha por armazém) | **N→1** (`3D` e `PRODUCAO 3D` → `P3D`) |
+| "sem armazém" | não tem onde guardar | 18 chaves com `null`, decisão registrada |
+
+**A coluna não representa sinônimos.** É metadado descritivo do armazém, e continua correta para
+o que ela é — este lote não a alterou de propósito (é dado de produção e não estorva).
+
+**A PRESCRIÇÃO, que é a parte que importa:**
+
+> **Setor novo entra como CHAVE em `SETOR_ARMAZEM` (`src/services/setor.ts`), NUNCA como UPDATE em
+> `warehouses.sector`.**
+
+O risco real não é alguém LER da coluna — é alguém tentar **"consertar o de-para" editando-a**. Ela
+é gravável, não tem CHECK, e foi a própria migration 024 que escreveu aqueles slugs, o que a faz
+parecer a fonte canônica. Um `UPDATE warehouses SET sector = ...` roda sem erro, parece ter
+funcionado, e não muda nada — porque o resolver lê o mapa, não a coluna. Falha silenciosa com
+aparência de conserto.
+
+### Cobertura medida do mapa (produção, 18/08/2026)
+
+**61 valores distintos** nas três pontas. Antes do D1:
+
+| fonte | distintos | desconhecidos |
+|---|---|---|
+| `profiles.sector` | 19 | **0** |
+| `separations.destination` | 25 | 1 — `Granja NaturOvos` |
+| `requests.sector` | 17 | 1 — `Obras` |
+
+As duas lacunas foram fechadas no lote, e por motivos diferentes:
+
+- **`Granja NaturOvos`** era omissão de transcrição: já estava na lista SEM ARMAZÉM decidida no W2,
+  acima nesta mesma seção, mas a chave não tinha chegado ao código.
+- **`Obras`** entra por FATO medido, não por analogia: as 2 solicitações com `requests.sector =
+  'Obras' (25/03 e 02/04/2026) são do mesmo usuário, cujo `profiles.sector` HOJE é
+  "Outros Setores" — que já era `null` no mapa. A derivação atual
+  (`requests.controller.ts:133-137`) **não consegue mais gerar** "Obras", porque nenhum perfil tem
+  esse setor. A chave fecha o histórico; não decide política nova.
+
+**MONTAGEM e EXPEDIÇÃO seguem FORA do mapa de propósito** — e, por estarem fora, caem no ramo
+`conhecido: false`, que avisa no log. É o comportamento desejado: setor indefinido que apareça em
+produção tem de gritar, não passar batido.
+
+### O carimbo: o que ele é e o que ele não é
+
+`requests.warehouse_id` (coluna com FK desde a 004, **0 de 2.641 preenchida** antes deste lote)
+passa a ser gravada na criação da solicitação. **É carimbo, não ponteiro vivo**: resolvido uma vez,
+no nascimento. Se a pessoa mudar de setor amanhã, a solicitação antiga não muda — que é o que um
+registro histórico deve fazer. As 2.641 existentes **ficam com NULL**: o carimbo não retroage, e
+inventar destino para o passado seria adivinhar.
+
+Ele nasce ANTES do transfer existir, de propósito, para que quando o transfer entrar o destino já
+esteja gravado em todas as solicitações novas. **A entrega segue chamando `consume`** — este lote
+não liga transferência nenhuma.
+
+### Nota para o lote do TRANSFER
+
+`separations.destination` é OUTRO campo livre, com 25 valores distintos. Quando o transfer entrar
+no caminho de separação, ele passa pelo **MESMO `canonSetor` e pelo MESMO `SETOR_ARMAZEM`** — não
+nasce cópia. Uma segunda tabela para os 25 valores reintroduziria, em duas linhas, exatamente o
+problema de vocabulário múltiplo que este lote existe para resolver.
+
 ## Os 7 armazéns novos NÃO aparecem nos dropdowns do front (e por quê)
 
 **Registrado em 17/08/2026** (LOTE W1). Nenhum front lê a tabela `warehouses` — **não existe rota
@@ -818,3 +893,67 @@ saber que ela existe.
 impossível provar qual delas destravou a rota. O S1 provou que foi o DADO: mesmo operador, mesmo
 produto, mesma expressão — 403 antes, passa depois. O conserto do desenho é lote próprio e agora
 tem uma prova de regressão pronta para reusar.
+
+# Réguas de instrumentação — aprendidas medindo, não por teoria
+
+**Registradas em 18/08/2026** (lote D1). As duas nasceram de prova que ficou VERDE estando errada,
+ou VERMELHA estando certa. Instrumento que erra em silêncio é pior que instrumento ausente: o
+ausente você sabe que não tem.
+
+## Asserir CARDINALIDADE junto com conteúdo
+
+> **Instrumento que degrada para um conjunto menor passa vazio — asserir cardinalidade junto com
+> conteúdo.**
+
+**O caso que criou a régua.** A prova P6 do D1 comparava as 23 chamadas de `resolveWarehouseId`
+antes e depois, para provar que nenhuma tinha sido tocada. O parser do harness quebrava em 22 das
+23 linhas (ver a régua do CRLF abaixo) e devolvia `null`, que era filtrado — sobrava **uma**. A
+comparação então rodava sobre uma lista de 1 elemento contra outra de 23, e num cenário ligeiramente
+diferente teria dado **verde comparando quase nada**.
+
+O padrão é geral e não depende de CRLF: `.filter(Boolean)`, `.filter(x => x.ok)`, `try/catch` que
+engole item ruim, `LIMIT` esquecido, regex que não casa — todos **encolhem o conjunto sob teste** em
+vez de falhar. Um teste que só pergunta "todos os que rodaram passaram?" responde SIM para o
+conjunto vazio.
+
+**Como aplicar:** todo laço de verificação assere **quantos** entraram, além de **se** passaram.
+
+```js
+// FRÁGIL — verde com lista vazia, verde com lista truncada
+if (itens.every(ok)) aprovado();
+
+// COM CARDINALIDADE — só passa se rodou sobre o conjunto que se pretendia medir
+if (itens.length === ESPERADO && itens.every(ok)) aprovado();
+```
+
+E, quando o número esperado vem de uma medição (61 valores de setor, 23 chamadas, 5 perfis),
+**o número entra no teste como constante**, não como `itens.length`. Comparar um conjunto consigo
+mesmo é tautologia: `itens.length === itens.length` é sempre verdade, inclusive com zero.
+
+## CRLF: normalizar ANTES de comparar ou casar regex
+
+> **Neste ambiente, normalizar `\r\n` → `\n` antes de qualquer comparação ou regex sobre arquivo do
+> repositório.**
+
+O repo está com `core.autocrlf=true`: o **objeto git guarda LF** e a **árvore de trabalho é CRLF**.
+Toda ferramenta que cruza as duas pontas vê bytes diferentes para conteúdo idêntico.
+
+**Já mordeu três vezes, em dois lotes:**
+
+| onde | sintoma | o que mascarava |
+|---|---|---|
+| S1, ao commitar | `warning: LF will be replaced by CRLF` | nada — mas exigiu conferir o blob contra o arquivo provado |
+| D1, prova P6 (corpo) | `git show` (LF) × arquivo (CRLF) davam md5 diferente | **falso VERMELHO**: a função estava intocada |
+| D1, prova P6 (chamadas) | `git grep` na árvore devolve a linha com `\r`; `(.*)$` não casa depois dele | **falso VERDE em potencial**: 22 de 23 linhas viravam `null` em silêncio |
+
+A segunda é a perigosa e merece o detalhe: em JavaScript, `.` **não** casa `\r` (é terminador de
+linha), e `$` sem a flag `m` casa só no fim da string. Então `/^([^:]+):(\d+):(.*)$/` falha em toda
+linha terminada em `\r` — e falha **devolvendo null**, não lançando.
+
+**Como aplicar:**
+
+- comparação de conteúdo: normalizar os DOIS lados (`t.split(String.fromCharCode(13)).join('')`);
+- saída de `git grep`/`git show` sobre a árvore: tirar o `\r` de cada linha antes de qualquer regex;
+- ao gerar o normalizador por camada de shell, **evitar o escape de `\r`** — ele se perdeu duas
+  vezes em 18/08 atravessando o shell e virou uma quebra de linha literal, quebrando o script.
+  `String.fromCharCode(13)` não tem backslash e sobrevive a qualquer camada.

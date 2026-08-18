@@ -8,7 +8,7 @@ import { getClientIp } from '../utils/ip';
 import { sendPushNotificationToRole } from '../utils/notifications';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
-import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { resolveWarehouseId, resolveDestinationWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 import { liberarReserva3D, abaterQtyReservada, qtyReservadaDoItem, cancelarDemandasDaRequest } from '../services/requests3d';
 
 // Unidades que aceitam quantidade fracionada (metro, litro, quilo). Qualquer outra → inteiro
@@ -202,9 +202,29 @@ export const createRequest = async (req: Request, res: Response) => {
       // =========================================================================
       // 🟢 3. INSERÇÃO DO PEDIDO BASE
       // =========================================================================
+      // CARIMBO DO ARMAZÉM DE DESTINO — para onde o material VAI.
+      //
+      // ⚠ NÃO confundir com o `warehouseId` lá de cima (:111), que é a ORIGEM e é sempre o ALMOX.
+      //   As duas variáveis convivem nesta função de propósito, e respondem perguntas opostas.
+      //
+      // `null` é resultado LEGÍTIMO, não falha: setor sem armazém (escritório, chefia, viagem…)
+      // consome na entrega e não tem custódia. Setor desconhecido também dá null, e o resolver já
+      // avisou no log — a régua é NUNCA falhar por setor, porque um nome novo digitado no cadastro
+      // não pode travar quem está no chão de fábrica.
+      //
+      // É CARIMBO, NÃO PONTEIRO VIVO: resolvido UMA vez, no nascimento da solicitação, e gravado.
+      // Se a pessoa mudar de setor amanhã, esta solicitação continua apontando para o armazém que
+      // valia quando ela foi criada — que é o que um registro histórico deve fazer. Quem quiser o
+      // setor atual da pessoa lê `profiles`, não esta coluna.
+      //
+      // Nasce agora, antes do transfer existir, para que quando ele entrar o destino já esteja
+      // gravado em todas as solicitações NOVAS. As antigas ficam com NULL: o carimbo não
+      // retroage, e inventar destino para o passado seria adivinhar.
+      const destinoWarehouseId = await resolveDestinationWarehouseId(client, setorFinal);
+
       const reqRes = await client.query(
-        'INSERT INTO requests (requester_id, sector, status, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id',
-        [userId, setorFinal, 'aberto', client_service_id]
+        'INSERT INTO requests (requester_id, sector, status, client_service_id, warehouse_id) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+        [userId, setorFinal, 'aberto', client_service_id, destinoWarehouseId]
       );
       const requestId = reqRes.rows[0].id;
 
