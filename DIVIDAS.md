@@ -957,3 +957,36 @@ linha terminada em `\r` — e falha **devolvendo null**, não lançando.
 - ao gerar o normalizador por camada de shell, **evitar o escape de `\r`** — ele se perdeu duas
   vezes em 18/08 atravessando o shell e virou uma quebra de linha literal, quebrando o script.
   `String.fromCharCode(13)` não tem backslash e sobrevive a qualquer camada.
+
+## Senha de smoke LITERAL em 5 arquivos — lote futuro: SMOKE_SENHA/SMOKE_ADMIN por env
+
+**Registrado em 18/08/2026** (portão G2 do lote D1). Os cinco smokes que criam solicitação
+(`smoke_requests_3d`, `smoke_op_status`, `smoke_demandas_3d`, `smoke_teto_conferencia`,
+`smoke_recount`) carregam a credencial CHUMBADA:
+
+```ts
+const SENHA_SEED = 'Teste@123';
+const ADMIN = '001@fluxoroyale.local';
+```
+
+Duas consequências, uma operacional e uma de segurança:
+
+1. **Os smokes só rodam onde essa senha vale** — na prática, só no seed de validação
+   (`ep-summer-wave`), que está DESQUALIFICADO como alvo de prova (read_only oscilante, dado não
+   representativo). Para rodá-los na branch de ensaio em 18/08 foi preciso TROCAR a senha das
+   contas 001/002/005 na branch e restaurar depois — instrumentação que não deveria ser
+   necessária.
+2. **Senha literal versionada em 5 arquivos é dívida de segurança**, não só de ergonomia — ainda
+   que seja a senha do seed, ela está no histórico do git e aparece em qualquer grep.
+
+**Saída (zero lógica nova, 5 arquivos):**
+
+```ts
+const SENHA_SEED = process.env.SMOKE_SENHA ?? 'Teste@123';
+const ADMIN = process.env.SMOKE_ADMIN ?? '001@fluxoroyale.local';
+```
+
+Fallback no literal atual = comportamento byte-idêntico para quem roda hoje contra a validação;
+quem rodar contra a branch de ensaio passa a credencial por env, sem UPDATE em banco nenhum.
+`smoke_recount` usa também `002@` (ator com estoque:edit) e `005@` (sem a chave) — entram como
+`SMOKE_ATOR`/`SMOKE_SEM_CHAVE` no mesmo molde.
