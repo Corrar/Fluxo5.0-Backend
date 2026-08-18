@@ -546,6 +546,12 @@ admin e almoxarife ajustam por lá. Efeito colateral de auditoria: por não usar
 essa rota é a única mutação de saldo **invisível para a tela de Permissões** — quem administra a
 matriz não tem como saber que ela existe.
 
+> **Atualização 18/08/2026 (lote S1).** A metade do DADO está endereçada: a migration
+> `025_normaliza_prefixo_setor.sql` tira o prefixo dos 5 perfis, e com isso o ramo volta a
+> viver **sem tocar no código** — a prova do S1 mostra o mesmo operador levando 403 antes e
+> passando depois, com a segunda condição (tag `usinagem` no produto) intacta. A metade do
+> CÓDIGO continua aberta: ver "Lote S1 · 2" no fim deste arquivo.
+
 ## 4. Endpoint POOLER da VALIDAÇÃO em modo somente-leitura (achado de bancada)
 
 Ao rodar o `smoke_recount` contra a validação (`ep-summer-wave`), toda escrita voltou
@@ -649,3 +655,72 @@ schema completo + server) — o LOTE W1 provou a 024 construindo à mão um sche
 separation_returns), rodando a **004 real** sobre ele e só então a 024.
 **Versionar o schema-base (001_base.sql, gerado por `pg_dump --schema-only` do estado atual) é
 lote próprio** — e é pré-requisito de qualquer prova de migration que não dependa de dump.
+
+# Lote S1 — prefixo "Setor: " em `profiles.sector`, 18/08/2026
+
+A migration `025_normaliza_prefixo_setor.sql` tira o prefixo de **5 perfis** (`"Setor: Usinagem"`
+-> `"Usinagem"`), consertando o 403 de `PUT /stock/:id` para os 4 `usinagem_operador` e o 1
+`usinagem_lider`. Escopo deliberadamente estreito: só o prefixo, só `profiles`. Duas coisas
+ficaram nomeadas e FORA.
+
+## 1. `requests.sector` — 210 linhas já carregam o prefixo. Reescrever histórico é decisão do Bruno.
+
+**Medido em 18/08/2026 contra a produção (`ep-steep-breeze`, sessão READ ONLY):**
+
+| medida | valor |
+|---|---|
+| solicitações totais | 2.630 |
+| com `sector` = `"Setor: Usinagem"` | **210 (8,0%)** |
+| janela | 12/06/2026 → 17/08/2026 |
+| `requests.sector` NULL | 0 |
+
+**O vetor** é `requests.controller.ts:133-137`: quando o corpo não manda `sector`, o servidor
+deriva de `profiles.sector`. Meus Pedidos **nunca** manda — setor de quem pede é identidade, e
+identidade vem do token, não do corpo (foi assim de propósito, para fechar a divergência de
+sessão da dívida (f)). Logo, toda solicitação de um usuário da Usinagem gravou o prefixo junto.
+
+**A torneira ESTANCA sozinha com a 025**: a derivação passa a copiar `"Usinagem"` limpo, sem
+nenhuma mudança em `requests.controller.ts`. O que resta é **histórico** — e é só sobre ele que
+há decisão a tomar.
+
+**A favor de NÃO reescrever**: o histórico registra o que estava gravado na época. Uma
+solicitação de junho realmente nasceu com `"Setor: Usinagem"`; reescrevê-la é apagar o rastro do
+defeito, não o defeito.
+
+**A favor de reescrever**: `reportsBi.controller.ts:111` agrupa por `requests.sector`
+(`COALESCE(NULLIF(TRIM(r.sector), ''), 'Sem setor')`). Sem normalizar, o relatório passa a tratar
+`"Setor: Usinagem"` e `"Usinagem"` como **setores DIFERENTES** — dois pontos no mesmo gráfico para
+a mesma Usinagem, com o consumo dela partido ao meio na data da migration. Quem lê o BI não tem
+como saber que é a mesma gente.
+
+**Lote próprio, com decisão explícita do Bruno.** Se for reescrever, o mesmo desenho da 025 serve
+(condição que só casa o que ainda tem prefixo + guard de premissa ancorado em 210), mas o guard
+precisa ser remedido na hora: 210 é de 18/08/2026 e a janela seguia aberta até a 025 rodar.
+
+## 2. O gate de `PUT /stock/:id` compara STRING SOLTA onde deveria haver chave de RBAC
+
+**A 025 conserta o DADO, não o desenho.** `stock.controller.ts:127` continua decidindo assim:
+
+```ts
+if (userCheck.rows[0]?.sector?.toLowerCase() !== 'usinagem' || !hasTag) return 403;
+```
+
+Autorização ancorada em **texto digitado num `<input>` livre** (`pages_admin.jsx:1109-1110`), sem
+allowlist, sem tela de edição depois do cadastro. Qualquer variação de digitação — `"Usinagem "`,
+`"USINAGEM"` passa (o `toLowerCase`), mas `"Usinagem 2"`, `"Usinagem/Torno"` ou o próximo prefixo
+que alguém invente — volta a matar o ramo, em silêncio e com 403 sem explicação. **Foi assim que
+esta dívida nasceu**: ninguém escreveu código errado; alguém digitou um rótulo.
+
+O desenho certo é o mesmo já discutido no **Lote R1 · 1** (`estoque:edit` vs. uma chave dedicada)
+e no **Lote R1 · 3** (as duas dívidas do `PUT /stock/:id`): **chave de RBAC**, semeada, decidida
+na tela de Permissões classe a classe, e checada por `requirePermission` — não `sector` comparado
+com literal. Hoje `usinagem_lider` **já tem** `estoque:edit`; o que falta é a rota usar isso.
+
+Efeito colateral que continua valendo: por não usar `requirePermission`, esta rota é a única
+mutação de saldo **invisível para a tela de Permissões** — quem administra a matriz não tem como
+saber que ela existe.
+
+**NÃO foi consertado no S1 de propósito.** Duas mudanças ao mesmo tempo (dado + gate) tornariam
+impossível provar qual delas destravou a rota. O S1 provou que foi o DADO: mesmo operador, mesmo
+produto, mesma expressão — 403 antes, passa depois. O conserto do desenho é lote próprio e agora
+tem uma prova de regressão pronta para reusar.
