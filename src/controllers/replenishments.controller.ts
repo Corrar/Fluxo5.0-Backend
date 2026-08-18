@@ -4,7 +4,7 @@ import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
-import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
@@ -14,15 +14,25 @@ export const getReplenishments = async (req: Request, res: Response) => {
     // um armazém o MESMO item saía duplicado no array `items[]`, e `stock_available` virava o saldo
     // de uma linha arbitrária (qual dependia do plano de execução). Agora agrega antes de juntar.
     // POOLED-ONLY (op_id IS NULL): material já empenhado numa OP não está disponível pra reposição.
+    //
+    // FILTRAR ALMOX, NÃO SOMAR SETOR (LOTE A, FASE 0/1, o caso PRIORITÁRIO — medido, não suposto):
+    // `stock_available` alimenta `repTetoDe` (`pages_rest.jsx:650`, `min(qtd, sep+disponivel)`), o
+    // teto que decide se "separar" fica habilitado. O contrato é o mais forte dos seis leitores
+    // que filtram ALMOX (ver DIVIDAS.md): `authorizeReplenishment` reserva via `resolveWarehouseId`
+    // (sempre ALMOX) e `StockService.reserve` LANÇA `RESERVA_INSUFICIENTE` (erro duro, sem
+    // degradar) quando o disponível do ALMOX é menor que o pedido. Somando o setor aqui, a tela
+    // liberaria separar mais do que o motor aceita — e o clique em "separar" quebraria com um erro
+    // que a tela nunca avisou.
     // RETRY: leitura idempotente via query({retryable:true}) — mata o 500 transitório de cold start
     // do Neon (era pool.query cru, fora do wrapper). Precisa ser explícito: a query começa com WITH
     // e o auto-detect de db.ts só marca SELECT/EXPLAIN/SHOW/TABLE/VALUES como retentável.
+    const almoxId = await getAlmoxId(pool);
     const { rows } = await query(`
       WITH pooled AS (
         SELECT product_id,
                SUM(quantity_on_hand)  AS on_hand,
                SUM(quantity_reserved) AS reserved
-          FROM stock WHERE op_id IS NULL GROUP BY product_id
+          FROM stock WHERE op_id IS NULL AND warehouse_id = $1 GROUP BY product_id
       )
       SELECT rep.*, (
         SELECT COALESCE(json_agg(json_build_object(
@@ -40,7 +50,7 @@ export const getReplenishments = async (req: Request, res: Response) => {
         WHERE ri.replenishment_id = rep.id
       ) as items
       FROM replenishments rep ORDER BY rep.created_at DESC
-    `, [], { retryable: true });
+    `, [almoxId], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar pedidos de reposição' }); }
 };

@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { pool, query, withTransaction } from '../db';
 import { StockService, StockError } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
-import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
 import { creditarProducaoNoItem } from '../services/requests3d';
 
 // ==========================================
@@ -17,13 +17,22 @@ export const get3DParts = async (req: Request, res: Response) => {
     // `disponivel` e `pedidos` são ADITIVOS (a Vitrine 3D precisa deles; Catálogo/Dashboard/Demandas
     // ignoram). Ambos agregam ANTES de juntar, pelo mesmo motivo do low-stock: o stock tem 1 linha
     // por (product_id, warehouse_id) e mais as per-OP — juntar cru por product_id duplicaria a peça.
-    //   disponivel = saldo POOLED somado entre armazéns (op_id IS NULL; material com op_id já está
-    //                comprometido com uma OP e não pode ser separado pra outro pedido).
+    //   disponivel = saldo do ALMOX (op_id IS NULL; material com op_id já está comprometido com
+    //                uma OP e não pode ser separado pra outro pedido).
     //   pedidos    = quanto já foi solicitado da peça (ranking "Mais Solicitadas"). Exclui requests
     //                'rejeitado', que englobam os cancelamentos — pedido cancelado não é popularidade.
+    //
+    // FILTRAR ALMOX, NÃO SOMAR SETOR (LOTE A, FASE 0/1, medido, não suposto): `disponivel` alimenta
+    // o badge "X em Stock" da Vitrine 3D (`pages_rest.jsx:196-202`, vitAdapt). O contrato real está
+    // em `createRequest` (`requests.controller.ts:254`): o `available` que decide quanto ESTE pedido
+    // reserva vem de `s.warehouse_id = $2 AND s.op_id IS NULL` com `$2 = resolveWarehouseId(...)` —
+    // sempre ALMOX. Se este SELECT somasse ALMOX+setor, a vitrine mostraria "em estoque" para peça
+    // cujo saldo mora todo num setor — o badge mentiria, e a reserva real cairia silenciosamente em
+    // "a produzir" sem erro nenhum, só um número que não bate com o que o operador viu.
     // RETRY: leitura idempotente via query({retryable:true}) — era pool.query cru, sem defesa de cold
     // start do Neon. O grão aqui é subquery (a query começa com SELECT, então o auto-detect até
     // pegaria); {retryable:true} explícito blinda o intento e sobrevive a virar CTE no futuro.
+    const almoxId = await getAlmoxId(pool);
     const { rows } = await query(`
         SELECT p.id, p.sku, p.name, p.image_url as image, p.production_minutes, p.filament_grams, p.description,
                (COALESCE(s.on_hand, 0) - COALESCE(s.reserved, 0)) AS disponivel,
@@ -31,7 +40,7 @@ export const get3DParts = async (req: Request, res: Response) => {
           FROM products p
           LEFT JOIN (
             SELECT product_id, SUM(quantity_on_hand) AS on_hand, SUM(quantity_reserved) AS reserved
-              FROM stock WHERE op_id IS NULL GROUP BY product_id
+              FROM stock WHERE op_id IS NULL AND warehouse_id = $1 GROUP BY product_id
           ) s ON s.product_id = p.id
           LEFT JOIN (
             SELECT ri.product_id, SUM(ri.quantity_requested) AS pedidos
@@ -41,7 +50,7 @@ export const get3DParts = async (req: Request, res: Response) => {
           ) rq ON rq.product_id = p.id
          WHERE p.is_3d = true AND p.active = true
          ORDER BY p.name ASC
-    `, [], { retryable: true });
+    `, [almoxId], { retryable: true });
 
     const formatted = rows.map(r => ({
        id: r.id,

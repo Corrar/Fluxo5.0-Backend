@@ -1309,3 +1309,78 @@ Fora do C3 por escopo. O que já se sabe, para quem pegar:
   volta — que pode FALHAR** com `RESERVA_INSUFICIENTE` se o disponível sumiu no meio-tempo. O
   `deleteTravelOrder` não precisou dela porque apaga a viagem; uma edição precisa;
 - e o campo minado do legado vale em dobro ali: 42 das 43 viagens sem razão são `reconciled`.
+
+---
+
+# Lote A — mapa completo dos leitores de "disponível" (POOLED vs ALMOX), 18/08/2026
+
+Varredura fechada em duas fases: FASE 0 mediu os cinco leitores que somavam saldo pooled de TODOS
+os armazéns sem filtrar `warehouse_id` (recon do Ajuste 1); FASE 1 aplicou o filtro só nos dois
+cujo contrato exige ALMOX. Registro aqui para a PRÓXIMA varredura não recomeçar do zero — nem
+"consertar" um TOTAL que está certo por desenho.
+
+**Por que a varredura nasceu**: o transfer de `6cf7038` (lote TRANSFER) e o guard de custódia por
+setor (lote GUARD-RECEBIMENTO) tornaram REAL o que antes era hipotético — saldo pode existir fora
+do ALMOX a partir da primeira entrega para um setor com armazém. Todo leitor que soma pooled sem
+filtrar `warehouse_id` passa a somar ALMOX+setor no dia em que isso acontecer. Hoje (medido nas
+duas fases, produção): **zero linhas de stock pooled fora do ALMOX** — o problema é real mas ainda
+não armado.
+
+## Os SEIS que filtram ALMOX (`getAlmoxId` + `warehouse_id = <ALMOX>`)
+
+Contagem por `grep -rn "getAlmoxId(" src/controllers` (18/08/2026, 6 call sites — número
+verificado, não de memória): 2 já fechados no Lote 0, 2 no lote TRANSFER, 2 neste lote.
+
+| leitor | fila/tela | contrato que exige ALMOX |
+|---|---|---|
+| `stock.controller.ts:27` `getStock` (Lote 0) | Controle de Estoque | `s.id` é a chave de `PUT /stock/:id` — a linha tem de ser a do ALMOX, não uma soma |
+| `separations.controller.ts:38` `getSeparations` (Lote 0) | Separações | reserva/consome via `resolveWarehouseId`=ALMOX |
+| `products.controller.ts:62` `getProducts` (TRANSFER) | Catálogo/Reposição/Pedidos/Separações | piso da recontagem física (`AJUSTE_ABAIXO_RESERVA`) mora no ALMOX |
+| `products.controller.ts:321` `getInactiveProducts` (TRANSFER) | Inativos | mesmo grão do catálogo — não pode divergir dele |
+| **`producao3d.controller.ts:35`** `get3DParts` (**Lote A**) | Vitrine 3D (`pages_rest.jsx:196-202`) | `createRequest` reserva via `s.warehouse_id=$2, $2=resolveWarehouseId=ALMOX` — badge somando setor mentiria "em estoque" |
+| **`replenishments.controller.ts:28`** `getReplenishments` (**Lote A, prioritário**) | Reposições, teto de separação (`pages_rest.jsx:650`, `repTetoDe`) | `authorizeReplenishment` reserva via `resolveWarehouseId`=ALMOX; `StockService.reserve` lança `RESERVA_INSUFICIENTE` (erro duro) se faltar — o mais forte dos seis contratos medidos |
+
+**Nota sobre a contagem "5 leitores" de entradas anteriores deste documento** (seção do lote
+TRANSFER, acima): o texto da época fala em "5 leitores pooled" e "o padrão dos outros três" ao
+fechar `getInactiveProducts`/`getProducts`. Reconferindo por grep AGORA, só encontro DOIS call
+sites de `getAlmoxId` anteriores ao TRANSFER (`getStock`, `getSeparations`) — não três. Não sei a
+origem do terceiro da contagem antiga (pode ter contado algo que mudou desde então, ou ter sido
+impreciso na hora); não assumo que fosse `system.controller.ts` (que **não filtra** ALMOX — está no
+grupo TOTAL abaixo, por contrato medido nesta fase). Registro a divergência em vez de silenciá-la;
+o número desta seção (SEIS, verificado agora por grep) é o que vale daqui em diante.
+
+## Os TRÊS que mantêm TOTAL por contrato (intocados, DE PROPÓSITO)
+
+Medidos na FASE 0 e explicitamente NÃO alterados na FASE 1 — filtrar aqui introduziria bug, não
+consertaria nada. Os três são informativos/consolidados: nenhum alimenta um guard ou teto que o
+motor valida contra uma linha específica de armazém.
+
+| leitor | consumidor real (confirmado por git grep no front) | por que TOTAL é o contrato certo |
+|---|---|---|
+| `products.controller.ts:99-118` `getLowStockProducts` | tela Críticos (`pages_rest.jsx:2220+`, RBAC `estoque_critico`) | lista informativa de "quem está ≤ mínimo"; sem submit, sem teto validado por motor |
+| `system.controller.ts:28` `getDashboardStats` (`low_stock`, `total_value`) | Dashboard (`pages_admin.jsx:1221/1256`), KPIs "Valor do estoque"/"Abaixo do mínimo" | valor do estoque da EMPRESA não pode excluir material em custódia de setor; comentário do próprio código já alinha a regra com Críticos por desenho |
+| `system.controller.ts:241` `getGeneralReports` (`estoqueRes`) | Relatórios, "Itens parados" (`pages_admin.jsx:1243`) | mesmo caso: KPI/relatório informativo, TOTAL é o número certo |
+
+Os dois de `system.controller.ts` apareceram na recon original com "—" em "alimenta" (suspeita de
+leitor órfão). **Medição fechou que NÃO estão órfãos**: os dois têm consumidor vivo confirmado no
+front, listados acima.
+
+## Prova de que os seis e os três não se confundem
+
+**PA4, produção, READ ONLY, hoje**: as duas queries de `replenishments`/`producao3d` (COM e SEM o
+filtro `warehouse_id=ALMOX`) devolveram **0 divergências** em 271 itens de reposição e 77 peças 3D —
+confirma que o lote não muda nenhum número em produção agora, só fecha a exposição antes da
+primeira entrega para setor com armazém armar a bomba.
+
+**Fabricado em `ep-holy-fog`** (transação com `ROLLBACK`, fixture ALMOX=3/ESTEIRA=20 do mesmo
+produto): `stock_available`/`disponivel` SEM filtro = 23 (mente); COM filtro = 3 (bate com o que o
+motor realmente reserva). Chamando as funções REAIS do `dist/`, não reimplementação.
+
+## Se aparecer um SÉTIMO leitor pooled amanhã
+
+O teste que decide, na ordem: **(1)** existe um endpoint que reserva/consome/ajusta contra uma
+linha específica de armazém (via `resolveWarehouseId` ou equivalente)? **(2)** este leitor alimenta,
+direta ou indiretamente (por um teto como `repTetoDe`), a decisão de QUANTO submeter àquele
+endpoint? Se as duas forem SIM → `[FILTRAR ALMOX]`. Se o número só aparece num card/relatório sem
+submit nenhum atrás → `[MANTER TOTAL]`. Não decidir por analogia com um leitor parecido — decidir
+pelo contrato medido, como os nove acima (seis ALMOX + três TOTAL).
