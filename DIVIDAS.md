@@ -593,7 +593,8 @@ o item vira apenas registro; se estiver perto de virar, é bloqueio de go-live.
 ## warehouses.sector é o QUARTO vocabulário de setor — unificar é PRÉ-REQUISITO do transfer
 
 **Registrado em 17/08/2026** (LOTE W1, migration 024). O slug de `warehouses.sector` é minúsculo
-sem acento (`esteira`, `lavadora`, `flow`, `classificadora`, `embaladora`, e da 004: `usinagem`,
+sem acento (`esteira`, `lavadora`, `flow`, `classificadora`, `embaladora`, `prototipo`,
+`desenvolvimento`, e da 004: `usinagem`,
 `producao_3d`, `eletrica`, `montagem`, `expedicao`). Ele **não casa** com:
 - `profiles.sector` — forma de exibição, com maiúscula e acento ("Usinagem", "Elétrica");
 - `separations.destination` — texto livre MAIÚSCULO/misto, escrito pelo operador;
@@ -605,13 +606,106 @@ propósito: divergir criaria um QUINTO. **A unificação é lote próprio e é p
 transfer** — transferir material de setor para setor exige um de-para confiável entre "o setor que
 o usuário vê" e "o armazém que guarda o saldo"; hoje esse de-para não existe em lugar nenhum.
 
-## Os 5 armazéns novos NÃO aparecem nos dropdowns do front (e por quê)
+### DE-PARA FECHADO (decisão do Bruno, 18/08/2026) — a peça que o transfer vai consumir
+
+O de-para deixou de "não existir em lugar nenhum": está fechado abaixo e replicado no comentário
+de topo da 024. Ele **não** substitui a unificação de vocabulário — é a decisão de PRODUTO (quem
+guarda custódia) que a unificação vai ter de respeitar quando virar tabela.
+
+**COM ARMAZÉM — guardam custódia (recebem por transferência, apontam consumo depois):**
+
+| setor | armazém | origem |
+|---|---|---|
+| Usinagem | `USINAGEM` | 004 |
+| Elétrica | `ELET` | 004 |
+| 3D | `P3D` | 004 |
+| Esteira | `ESTEIRA` | 024 |
+| Lavadora | `LAVADORA` | 024 |
+| Flow | `FLOW` | 024 |
+| Classificadora | `CLASSIF` | 024 |
+| Embaladora | `EMBALAD` | 024 |
+| **Protótipo** | `PROTOTIPO` | **024, emenda W2** |
+| **Desenvolvimento** | `DESENV` | **024, emenda W2** |
+
+**SEM ARMAZÉM — consomem na entrega, sem custódia** (armazém aqui seria saldo que ninguém aponta):
+Escritório, Chefia, Financeiro, Compras, Gerência, Assistente Técnico, Engenharia, Ferro, Geral,
+Outros Setores, Almoxarifado, Viagem, Terceiros, Reposição, Acumulador, Granja NaturOvos.
+
+**INDEFINIDOS — fora do de-para até decisão:** Montagem, Expedição. Os armazéns `MONT` e `EXP`
+existem desde a 004, estão vazios (0 linhas de `stock`) e não têm tráfego em
+`separations.destination`. Não se sabe se guardam custódia; chutar plantaria de-para errado.
+
+#### O que a medição de 18/08 (produção, READ ONLY) mostrou sobre este de-para
+
+**Os nomes vêm de DUAS fontes, e isso é parte da dívida.** Os dez com armazém e onze dos sem
+armazém saem de `profiles.sector`; **Viagem, Terceiros, Reposição, Acumulador e Granja NaturOvos
+só existem em `separations.destination`** — nunca foram setor de ninguém. Um de-para que só olhe
+uma das pontas fica cego para metade dos nomes.
+
+**A evidência que sustenta Protótipo e Desenvolvimento**: `separations.destination` tem
+`DESENVOLVIMENTO` (23 separações) e `Protótipo` (13) + `PROTÓTIPO` (1) — ou seja, material JÁ é enviado
+para esses dois setores hoje. A decisão da engenharia bate com o tráfego medido.
+
+**⚠ Três buracos conhecidos, nomeados para não serem descobertos tarde:**
+
+1. **`Classificadora` e `Embaladora` não têm NENHUMA evidência de uso.** Não aparecem em
+   `profiles.sector` (nenhum perfil) nem em `separations.destination` (nenhuma separação). Os dois
+   armazéns nascem da 024 por decisão de domínio, não por dado observado. Se a fábrica não usar
+   esses nomes, sobram dois armazéns vazios — inócuo, mas vale reconferir com a engenharia.
+2. **`separations.destination` tem o mesmo setor em até TRÊS grafias**: `ELETRICA` (62),
+   `Elétrica` (27) e `eletrica` (2); `ESTEIRA` (105) e `Esteira` (8); `USINAGEM` (45) e
+   `Usinagem` (26); `FLOW` (49) e `Flow` (8); `LAVADORA` (58) e `Lavadora` (8). Qualquer de-para
+   que case por igualdade de string vai errar a maioria das linhas — tem de normalizar
+   (minúsculas + sem acento) antes de comparar.
+3. **`Outro` (1 separação) não está em NENHUMA das três listas.** É o valor de escape do texto
+   livre. Um de-para completo precisa decidir o que fazer com ele em vez de deixá-lo cair fora.
+
+#### ⚠ REQUISITO DO LOTE SEGUINTE (quem for implementar o de-para lê isto primeiro)
+
+**1. A comparação setor→armazém NÃO PODE SER POR IGUALDADE DE STRING.**
+
+Medido em produção em 18/08/2026, `separations.destination`:
+
+| grafias do MESMO setor | separações |
+|---|---|
+| `ELETRICA` / `Elétrica` / `eletrica` | 62 / 27 / 2 |
+| `ESTEIRA` / `Esteira` | 105 / 8 |
+| `USINAGEM` / `Usinagem` | 45 / 26 |
+| `FLOW` / `Flow` | 49 / 8 |
+| `LAVADORA` / `Lavadora` | 58 / 8 |
+| `REPOSIÇÃO` / `Reposição` | 48 / 7 |
+| `TERCEIROS` / `Terceiros` | 10 / 7 |
+| `PROTÓTIPO` / `Protótipo` | 1 / 13 |
+
+Casar por igualdade **erraria a maioria das linhas** — e erraria em silêncio, achando que o setor
+não existe. **A normalização mínima é `lower()` + remoção de acento** (`unaccent` ou equivalente),
+**aplicada nos DOIS lados** da comparação: no valor lido e na chave do de-para. Aplicar só de um
+lado é o mesmo defeito com outro nome — foi exatamente assim que o `toLowerCase()` sozinho do
+`stock.controller.ts:127` deixou 5 usuários com 403 (ver "Lote S1 · 2").
+
+Nota de infra: `unaccent` é EXTENSION, não função nativa — exige `CREATE EXTENSION IF NOT EXISTS
+unaccent` (disponível no Neon). Se a preferência for não depender de extension, `translate()` com
+a tabela de acentos do português resolve; o que **não** pode é comparar sem normalizar.
+
+**2. Valor NÃO MAPEADO → SEM ARMAZÉM → consome na entrega. Nunca falhar por setor desconhecido.**
+
+O de-para tem de ter fallback declarado, e o fallback é o comportamento SEGURO: um nome que não
+está em nenhuma das listas cai em "sem custódia" e o material é consumido na entrega — que é o
+que já acontece hoje para a maioria dos setores. Erguer exceção ou devolver erro por setor
+desconhecido transformaria um cadastro novo (o campo é `<input>` de texto livre nas duas pontas)
+em operação travada no chão de fábrica.
+
+Isso inclui o **`Outro`** (1 separação), que não está em nenhuma das três listas do Bruno, e
+inclui qualquer nome que alguém digite amanhã. **A regra é: o de-para responde "qual armazém?"
+com um armazém ou com "nenhum" — nunca com um erro.**
+
+## Os 7 armazéns novos NÃO aparecem nos dropdowns do front (e por quê)
 
 **Registrado em 17/08/2026** (LOTE W1). Nenhum front lê a tabela `warehouses` — **não existe rota
 `GET /warehouses`**. Os seletores de armazém são arrays LITERAIS no código do front, com 6 nomes
 cada: `ARMAZENS` (`fluxo-royale-react/src/parts/pages_admin.jsx:7`) e `SEP_ARMAZENS`
 (`separacoes.jsx:735`). O valor escolhido é rótulo local e nem é enviado ao backend (o
-`POST /stock/entries` recebe só `nf_number`, `type`, `entries`). Consequência honesta: os cinco
+`POST /stock/entries` recebe só `nf_number`, `type`, `entries`). Consequência honesta: os sete
 armazéns existem no banco e **não vão aparecer em tela** até que exista a rota e o front passe a
 enumerar o banco — lote de front próprio. O lado bom: por isso mesmo a 024 não quebra tela nenhuma.
 
