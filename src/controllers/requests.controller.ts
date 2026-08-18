@@ -433,9 +433,10 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     const { changedProducts } = await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
 
-      const currentRes = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [id]);
+      const currentRes = await client.query('SELECT status, sector FROM requests WHERE id = $1 FOR UPDATE', [id]);
       if (!currentRes.rows[0]?.status) throw new Error("Solicitação não encontrada");
       const currentStatus = currentRes.rows[0].status;
+      const requestSector = currentRes.rows[0].sector;
 
       // Validação de TRANSIÇÃO: bloqueia pulos de estado (ex.: aberto→entregue). Roda APÓS o FOR UPDATE
       // (verdade travada) e ANTES de qualquer toque em estoque (adjusted_items/consume/release/receive).
@@ -556,10 +557,16 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
 
       const itemsRes = await client.query('SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, ri.qty_reserved, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1 ORDER BY ri.product_id', [id]);
 
-      // Status: Entregue -> consume (baixa físico + libera a reserva correspondente).
+      // Status: Entregue -> consume no ALMOX, ou transfer ALMOX->setor quando o setor tem armazém.
       // Entrega vem SÓ depois de 'conferido' (a transição já bloqueia aberto/aprovado→entregue); mantemos
       // 'aprovado' no guard por defesa/coerência, mas na prática só 'conferido' chega aqui.
       if (status === 'entregue' && (currentStatus === 'aprovado' || currentStatus === 'conferido')) {
+        // DESTINO DA ENTREGA — re-resolve por `requestSector` AGORA, não lê `requests.warehouse_id`.
+        // O carimbo (lote D1) é AUDITORIA: registra o destino que valia quando a solicitação nasceu.
+        // A entrega age sobre a verdade VIGENTE do setor, e isso também cobre as solicitações abertas
+        // de ANTES do D1 — todas com warehouse_id NULL, que o carimbo nunca teria como preencher.
+        // Uma resolução para a solicitação inteira (não por item: o setor não muda entre itens).
+        const destinoWarehouseId = await resolveDestinationWarehouseId(client, requestSector);
         for (const item of itemsRes.rows) {
           if (!item.product_id) continue;
           const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
@@ -575,11 +582,23 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
             if (reservada < finalQty) {
               throw new Error(`ENTREGA_3D_SEM_PECA:${item.id}:${reservada}:${finalQty}`);
             }
-            await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
-              refType: 'request', refId: id, userId,
-              opKey: `request:${id}:item:${item.id}:consume`,
-              reason: 'Entrega da solicitação (peça 3D)',
-            });
+            // opKey IDÊNTICA à do consume de sempre: transfer deriva :out/:in dela, então um retry
+            // com a mesma chave cai no alreadyApplied ANTES de tocar em qualquer linha — não duplica
+            // nem a saída do ALMOX nem a entrada no setor. fromReserved:true é a MESMA fórmula do
+            // consume (onHand -= qty, reserved -= min(qty,reserved)) só que também credita o destino.
+            if (destinoWarehouseId) {
+              await StockService.transfer(client, item.product_id, warehouseId, POOLED_OP_ID, destinoWarehouseId, POOLED_OP_ID, finalQty, {
+                refType: 'request', refId: id, userId,
+                opKey: `request:${id}:item:${item.id}:consume`,
+                reason: 'Entrega da solicitação (peça 3D)',
+              }, { fromReserved: true });
+            } else {
+              await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
+                refType: 'request', refId: id, userId,
+                opKey: `request:${id}:item:${item.id}:consume`,
+                reason: 'Entrega da solicitação (peça 3D)',
+              });
+            }
             // O consumido deixa de estar reservado. O que sobrar é EXCEDENTE — peça produzida a
             // mais, ou conferência que reduziu a quantidade depois da produção — e volta a ser
             // estoque livre pela fórmula única (o `sobra` já É o qty_reserved do momento).
@@ -591,11 +610,19 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
               });
             }
           } else {
-            await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
-              refType: 'request', refId: id, userId,
-              opKey: `request:${id}:item:${item.id}:consume`,
-              reason: 'Entrega da solicitação',
-            });
+            if (destinoWarehouseId) {
+              await StockService.transfer(client, item.product_id, warehouseId, POOLED_OP_ID, destinoWarehouseId, POOLED_OP_ID, finalQty, {
+                refType: 'request', refId: id, userId,
+                opKey: `request:${id}:item:${item.id}:consume`,
+                reason: 'Entrega da solicitação',
+              }, { fromReserved: true });
+            } else {
+              await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, finalQty, {
+                refType: 'request', refId: id, userId,
+                opKey: `request:${id}:item:${item.id}:consume`,
+                reason: 'Entrega da solicitação',
+              });
+            }
             await abaterQtyReservada(client, item.id, finalQty);
           }
         }

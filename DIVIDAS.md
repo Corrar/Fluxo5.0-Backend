@@ -1008,3 +1008,96 @@ duas listas + contador de clients, INSERT extraído LITERALMENTE do `dist/` (nã
 4 casos (Elétrica→ELET, Produção 3D→P3D, Escritório→NULL decidido, desconhecido→NULL+warn),
 releitura DENTRO da transação com `warehouse_id` conferido contra o id de `warehouses` no MESMO
 host, e ROLLBACK com contagem de `requests` idêntica antes/depois (2639→2639). Zero resíduo.
+
+# Lote TRANSFER — entrega de solicitação materializa no armazém do setor, 18/08/2026
+
+Troca `StockService.consume` por `StockService.transfer(..., { fromReserved: true })` na entrega
+de solicitação (`requests.controller.ts`, dois pontos: item normal e item 3D), quando o setor da
+solicitação tem armazém. Duas linhas de bifurcação por ponto, motor intocado — o `transfer` já
+existia desenhado para este uso exato (comentário de `stock.service.ts:220-226` já nomeava o caso
+"entrega ALMOX(op NULL) -> setor(op X): use `fromReserved: true`").
+
+## A entrega passa a RE-RESOLVER por setor — o carimbo é auditoria, não fonte de ação
+
+**Decisão explícita**: a entrega NÃO lê `requests.warehouse_id` (o carimbo do lote D1). Ela chama
+`resolveDestinationWarehouseId(client, requestSector)` de novo, no momento da entrega, com o
+`sector` lido `FOR UPDATE` na mesma query que já trava a linha (`SELECT status, sector FROM
+requests WHERE id = $1 FOR UPDATE`).
+
+Duas razões, e a segunda é a que decide:
+
+1. **O carimbo registra o destino que valia quando a solicitação NASCEU** — é fotografia, não
+   ponteiro vivo (assim foi desenhado no D1, de propósito). A entrega quer a verdade VIGENTE.
+2. **Cobre as solicitações abertas de ANTES do D1.** Toda solicitação criada antes do carimbo
+   existir tem `warehouse_id IS NULL` para sempre — ele nunca vai ser preenchido retroativamente.
+   Se a entrega lesse o carimbo, todo pedido anterior ao D1 cairia em `consume` puro mesmo sendo
+   de um setor COM armazém, e essa degradação seria PERMANENTE (o carimbo NULL não se conserta
+   sozinho). Re-resolver por sector faz a mesma solicitação antiga se comportar como uma nova, a
+   partir do dia em que o transfer entrou — sem precisar de backfill nenhum.
+
+## O warn de setor desconhecido agora dispara em DOIS pontos do sistema, não um
+
+O `console.warn` de `resolveDestinationWarehouse` (nomeado no D1) já disparava na CRIAÇÃO da
+solicitação. A partir deste lote, ele também dispara na ENTREGA — para a MESMA solicitação, se o
+setor dela ainda for desconhecido nos dois momentos (o normal: setor não muda entre criação e
+entrega). Não é bug nem duplicação indevida: é o mesmo aviso, uma vez por chamada de resolver,
+como sempre foi. Quem for procurar "por que este log dobrou" começa aqui.
+
+## O que NÃO mudou (e foi medido, não suposto)
+
+`StockService.transfer` **byte-idêntico** ao commit anterior (`stock.service.ts` não entrou no
+diff deste lote). A resposta HTTP de `updateRequestStatus` (o trecho de `res.json({ success:
+true })` até o fim da função, incluindo todo o mapeamento de erros do `catch`) está **byte-a-byte
+idêntica** entre este commit e o anterior — a troca fica inteiramente dentro do `withTransaction`,
+antes de qualquer construção de resposta.
+
+`separations.controller.ts:143` (entrega de OP/separação) e os dois sites de Saída Manual
+(`stock.controller.ts:313,333`) **não foram tocados**: o primeiro é fluxo distinto (recon
+própria, se um dia entrar); os dois últimos usam `sector` só como metadado de log — nunca
+resolveram destino, e continuam sem resolver.
+
+## Provas — branch de ensaio, transação com ROLLBACK, funções REAIS do dist/
+
+P1–P9 + P8b + P8c verdes. Destaques que valem registro:
+
+- **P1/P7**: entrega de setor COM armazém materializa a 2ª linha (ALMOX perde `on_hand` e libera
+  `reserved`; o setor nasce com `on_hand=qty, reserved=0`); um segundo transfer do MESMO produto
+  para o MESMO setor ACUMULA na linha existente (`ON CONFLICT DO NOTHING` + UPDATE), não duplica.
+- **P8**: com a linha viva em ELET, `getStock` e `getSeparations` (filtram `warehouse_id=ALMOX`)
+  seguem enxergando só ALMOX — confirmado que a blindagem do Lote 0 paga o transfer sem ajuste.
+- **P8b/P8c — o Lote 0 fica COMPLETO: 5 leitores pooled, os 5 filtrando ALMOX explicitamente.**
+  `getInactiveProducts` E `getProducts` (`products.controller.ts`) somavam `SUM(quantity_on_hand)`
+  **sem** filtrar `warehouse_id` — inócuo enquanto "pooled" e "ALMOX" eram a mesma coisa (0 linhas
+  fora do ALMOX, medido no D1). Era por isso que os dois ficaram de fora do Lote 0 na época: não
+  havia o que blindar contra. **Este lote CRIA a causa** (a 1ª linha pooled fora do ALMOX), então o
+  filtro entrou nos DOIS no MESMO push — `AND warehouse_id = $1`, com `getAlmoxId(pool)` no padrão
+  dos outros três. Sem ele, Inativos e o Catálogo passariam a somar ALMOX+setor para produto
+  transferido a partir deste deploy.
+
+  `getProducts` foi medido antes de fechar, não decidido por analogia. O adaptador do front
+  (`src/lib/adapters.js:59-83`, `productToCard`) expõe `stock.quantity_reserved` como o PISO da
+  recontagem física — o comentário do próprio código diz: "o servidor recusa contagem abaixo do
+  reservado (AJUSTE_ABAIXO_RESERVA)". Esse guard mora em `recountStock`, que resolve `warehouseId`
+  por `resolveWarehouseId` — sempre ALMOX. Se `getProducts` somasse ALMOX+setor, o piso mostrado na
+  tela divergiria do piso que o servidor realmente aplica: a tela mentiria antes do operador
+  digitar. Os quatro call sites do front (`pages_admin`, `pages_main`, `pedidos`, `separacoes`) lêem
+  `disp`/`estoque` como "quanto dá para eu reservar/separar/pedir AGORA" — nenhum espera "total da
+  empresa somando setores". Nenhum relatório/BI depende deste número
+  (`reportsBi.controller.ts` lê de `stock_ledger`, caminho separado).
+
+  **Provas**, mesma fixture do P8 (ALMOX=85, ELET=15 do mesmo produto), queries extraídas do
+  `dist/`: `getInactiveProducts` devolveu `{quantity_on_hand: 85}`; `getProducts` devolveu
+  `{quantity_on_hand: 85, quantity_reserved: 0}` — nos dois, só ALMOX, ELET não entrou na soma.
+  Contrato de `getProducts` (colunas selecionadas) idêntico entre o commit anterior e este.
+- **P4**: retry com a MESMA `opKey` é no-op (zero linhas novas no razão, saldo idêntico); o
+  controle negativo (chaves `:A`/`:B` diferentes na mesma operação) DUPLICA de verdade — prova
+  que o guard de idempotência está fazendo trabalho real, não sempre-no-op por acidente.
+- **P5**: entrega de 3 itens com o 2º estourando `FURO_ESTOQUE` — `ROLLBACK TO SAVEPOINT` desfaz
+  o transfer do item 1 (já aplicado) e o item 3 nunca chega a rodar (o `for` real para no throw).
+- **P6**: 3D com excedente — o efeito líquido no ALMOX (`on_hand -= qty`, depois `reserved` some
+  via consumo + liberação do excedente) é **idêntico**, byte a byte, entre o caminho `transfer`
+  e o caminho `consume` de hoje. `abaterQtyReservada`/`liberarReserva3D` continuam intocados e
+  seguem operando sobre o ALMOX (`warehouseId`, a origem), nunca sobre o destino.
+- **P9**: prova de CONTEÚDO (git show base × arquivo novo), não HTTP ao vivo — mesma limitação
+  já registrada no D1 (RBAC chumbado nos smokes/contas de teste). O trecho comparado é a
+  construção da resposta HTTP inteira, fora do `withTransaction`.

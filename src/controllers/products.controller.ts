@@ -4,6 +4,7 @@ import { Request, Response } from 'express';
 import { pool, query } from '../db';
 import { getClientIp } from '../utils/ip';
 import { createLog } from '../utils/logger';
+import { getAlmoxId } from '../services/warehouse';
 
 // 🧠 SANITIZADOR DE TAGS BLINDADO
 // Limpa os objetos do TagInput e extrai apenas o texto puro (String).
@@ -42,21 +43,35 @@ export const getProducts = async (req: Request, res: Response) => {
     // GRÃO (6ª ocorrência da mesma classe): o JOIN cru por product_id DUPLICAVA o produto na lista
     // quando ele tinha linha em mais de um armazém, e o `stock` exibido virava o de uma linha
     // arbitrária. É a fonte do catálogo de Produtos e do seletor de materiais da Reposição, então o
-    // saldo errado aqui contamina a decisão de quanto pedir. Agrega pooled-only antes de juntar.
+    // saldo errado aqui contamina a decisão de quanto pedir. Agrega ALMOX-only antes de juntar.
+    //
+    // POR QUE ALMOX, NÃO CONSOLIDADO (medido no lote TRANSFER, não suposto): o adaptador do front
+    // (`src/lib/adapters.js:59-83`, `productToCard`) expõe `stock.quantity_reserved` como o PISO da
+    // recontagem física — "a recontagem física precisa do PISO antes de o operador digitar; o
+    // servidor recusa contagem abaixo do reservado (AJUSTE_ABAIXO_RESERVA)". Esse guard mora em
+    // `recountStock` (`stock.controller.ts`), que resolve `warehouseId` por `resolveWarehouseId` —
+    // sempre ALMOX. Se este SELECT somasse ALMOX+setor, o piso mostrado na tela divergiria do piso
+    // que o servidor realmente aplica: a tela mentiria antes do operador digitar. Os quatro
+    // call sites do front (`pages_admin`, `pages_main`, `pedidos`, `separacoes`) leem `disp`/
+    // `estoque` como "quanto dá para eu reservar/separar/pedir AGORA" — disponibilidade do central,
+    // nunca "total da empresa somando setores". Nenhum relatório/BI depende deste número
+    // (`reportsBi.controller.ts` lê de `stock_ledger`, caminho separado).
+    //
     // RETRY explícito: já usava query(), mas o CTE fez a query começar com WITH — o auto-detect de
     // db.ts (só SELECT/…) deixou de marcá-la como retentável. Reafirma {retryable:true} (leitura).
+    const almoxId = await getAlmoxId(pool);
     const { rows } = await query(`
       WITH pooled AS (
         SELECT product_id,
                SUM(quantity_on_hand)  AS on_hand,
                SUM(quantity_reserved) AS reserved
-          FROM stock WHERE op_id IS NULL GROUP BY product_id
+          FROM stock WHERE op_id IS NULL AND warehouse_id = $1 GROUP BY product_id
       )
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.tags, p.unit_price, p.sales_price, p.min_stock, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.on_hand, 0), 'quantity_reserved', COALESCE(s.reserved, 0)) as stock
       FROM products p LEFT JOIN pooled s ON s.product_id = p.id WHERE p.active = true ORDER BY p.name ASC
-    `, [], { retryable: true });
+    `, [almoxId], { retryable: true });
     
     // 🛡️ A CORREÇÃO MÁGICA AQUI:
     // Nós limpamos a sujeira e devolvemos exatamente em formato de Texto (JSON.stringify)
@@ -293,23 +308,28 @@ export const reactivateProduct = async (req: Request, res: Response) => {
 
 export const getInactiveProducts = async (req: Request, res: Response) => {
   try {
-    // GRÃO: 1 linha por produto, saldo pooled SOMADO entre armazéns — mesmo padrão do catálogo
-    // (:48-59). Sem a agregação, a 2ª linha de stock do mesmo produto DUPLICAVA o produto na lista
-    // e o saldo exibido era o de uma linha arbitrária. POOLED-ONLY: material com op_id está
-    // apropriado a uma OP e não é saldo residual do produto inativo.
+    // GRÃO: 1 linha por produto, saldo do ALMOX (pooled, op_id NULL) — mesmo padrão dos outros três
+    // leitores do Lote 0 (separations.controller, stock.controller, e este). Até o lote TRANSFER,
+    // "pooled" e "ALMOX" eram a MESMA coisa (0 linhas fora do ALMOX) e o filtro por warehouse_id era
+    // redundante — por isso este leitor ficou de fora do Lote 0 na época. O TRANSFER cria a PRIMEIRA
+    // linha pooled fora do ALMOX (armazém do setor), e sem o filtro este SUM passaria a somar
+    // ALMOX+setor no MESMO push que causa o efeito — um produto entregue por transfer pareceria
+    // "mais inativo com estoque" do que realmente está no central. Filtro acrescentado agora que a
+    // causa passou a existir; os quatro leitores pooled do sistema filtram ALMOX explicitamente.
     // RETRY explícito: o CTE fez a query começar com WITH, e o auto-detect do db.ts só marca
     // SELECT/EXPLAIN/SHOW/TABLE/VALUES como retentável — reafirma {retryable:true} (leitura).
+    const almoxId = await getAlmoxId(pool);
     const { rows } = await query(`
       WITH pooled AS (
         SELECT product_id, SUM(quantity_on_hand) AS on_hand
-          FROM stock WHERE op_id IS NULL GROUP BY product_id
+          FROM stock WHERE op_id IS NULL AND warehouse_id = $1 GROUP BY product_id
       )
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.unit_price, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.on_hand, 0)) as stock
       FROM products p LEFT JOIN pooled s ON s.product_id = p.id
       WHERE p.active = false ORDER BY p.name ASC
-    `, [], { retryable: true });
+    `, [almoxId], { retryable: true });
     
     const safeRows = rows.map(r => {
        const { parsed } = sanitizeTags(r.tags);
