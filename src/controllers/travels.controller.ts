@@ -10,8 +10,21 @@ export const getTravelOrders = async (req: Request, res: Response) => {
   try {
     // `query` (não pool.query cru): SELECT puro -> auto-elegível a retry (cold start Neon).
     // unit_price entra no aninhado: é a fonte dos R$ (Levado/Retornado/Consumido) da tela Confronto.
+    // `has_ledger` (lote C3): ACRÉSCIMO ao contrato, nada do que já existia muda de nome ou tipo.
+    // É a MESMA pergunta que o guard de updateTravelOrder faz — "esta viagem movimenta estoque por
+    // este sistema?" — respondida uma vez aqui para o front não precisar adivinhar nem chamar a
+    // rota só para descobrir que vai levar 400.
+    //
+    // POR QUE `has_ledger` E NÃO `editable`: este campo é um FATO medido (tem linha no razão,
+    // sim/não), não uma política. "Editável" depende também do status, e amanhã pode depender de
+    // permissão ou de janela de tempo — regra que muda. Nome de fato envelhece melhor que nome de
+    // regra; o front compõe `pending && has_ledger` e a composição fica visível na tela, não
+    // escondida num booleano do servidor.
+    //
+    // EXISTS + o índice de ref_id do razão: não conta linhas, para na primeira.
     const { rows } = await query(`
       SELECT t.*,
+        EXISTS (SELECT 1 FROM stock_ledger sl WHERE sl.ref_type = 'travel' AND sl.ref_id = t.id::text) AS has_ledger,
         (SELECT json_agg(json_build_object('id', ti.id, 'product_id', ti.product_id, 'quantity_out', ti.quantity_out, 'quantity_returned', ti.quantity_returned, 'status', ti.status, 'products', json_build_object('name', p.name, 'sku', p.sku, 'unit', p.unit, 'unit_price', p.unit_price))) FROM travel_order_items ti JOIN products p ON ti.product_id = p.id WHERE ti.travel_order_id = t.id) as items
       FROM travel_orders t ORDER BY t.status ASC, t.created_at DESC
     `);
@@ -251,6 +264,35 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
       if (orderRes.rows.length === 0) throw new Error('VIAGEM_NAO_ENCONTRADA');
       if (orderRes.rows[0].status === 'reconciled') throw new Error('VIAGEM_JA_RECONCILIADA');
 
+      // ==========================================================================================
+      // GUARD DE VIAGEM LEGADA (lote C3) — antes de QUALQUER escrita, depois do FOR UPDATE.
+      //
+      // 43 das 45 viagens em produção vieram do corte 2.0→5.0 e NÃO têm uma única linha em
+      // `stock_ledger`: foram criadas antes do motor, então o saldo delas nunca foi movimentado por
+      // aqui. Uma dessas está 'pending' (BARRACAO WILLIAN, 10/07): o status diz que segura reserva,
+      // e ela NÃO segura.
+      //
+      // Editar uma dessas é incoerente nos dois sentidos, e o pior é que um dos lados MENTE:
+      //   • para MENOS -> release sobre reserva inexistente. O motor clampa em
+      //     Math.min(qty, cur.reserved) = 0 -> NO-OP SILENCIOSO: a tela muda, o estoque não.
+      //   • para MAIS  -> reserve de verdade. A viagem fica MEIO-reservada, inconsistente consigo
+      //     mesma: parte do quantity_out com reserva, parte sem, e ninguém sabe qual é qual.
+      // Não há edição correta possível — só há errar de um jeito ou de outro. Por isso RECUSA, em
+      // vez de "editar só os dados" (que deixaria quantity_out divergindo do que o razão sustenta).
+      //
+      // DISCRIMINADOR MEDIDO, não presumido: existe linha em stock_ledger apontando para esta
+      // viagem? `ref_id` é TEXT (não uuid) — o cast é obrigatório, sem ele o Postgres devolve
+      // `operator does not exist: text = uuid`.
+      //
+      // O front usa o MESMO sinal — `has_ledger`, exposto no GET acima — para desabilitar o botão
+      // com tooltip. Este guard existe porque botão desabilitado não é trava: a rota tem de recusar
+      // quem a chama direto.
+      const razaoRes = await client.query(
+        `SELECT 1 FROM stock_ledger WHERE ref_type = 'travel' AND ref_id = $1::text LIMIT 1`,
+        [id],
+      );
+      if (razaoRes.rows.length === 0) throw new Error('VIAGEM_LEGADA');
+
       await client.query('UPDATE travel_orders SET technicians = $1, city = $2, status = COALESCE($3, status) WHERE id = $4', [technicians, city, status, id]);
 
       const warehouseId = await resolveWarehouseId(client, userId);
@@ -313,6 +355,10 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
     if (err instanceof StockError) return res.status(400).json({ error: err.message });
     if (err.message === 'VIAGEM_NAO_ENCONTRADA') return res.status(404).json({ error: 'Viagem não encontrada.' });
     if (err.message === 'VIAGEM_JA_RECONCILIADA') return res.status(400).json({ error: 'Não é possível editar uma viagem já concluída.' });
+    // Mensagem PARA O OPERADOR: diz o que é e por que não dá, sem jargão de razão contábil.
+    if (err.message === 'VIAGEM_LEGADA') {
+      return res.status(400).json({ error: 'Viagem importada do sistema antigo: ela não movimenta estoque e por isso não pode ser editada.' });
+    }
     if (err?.code === '23505' && err?.constraint === 'uq_stock_ledger_opkey') {
       console.warn(JSON.stringify({ event: 'travel_update_idempotent_conflict', op_key: /\(op_key\)=\(([^)]*)\)/.exec(err?.detail ?? '')?.[1] ?? null }));
       return res.json({ success: true });

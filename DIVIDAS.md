@@ -1243,3 +1243,69 @@ Medido por `git grep`: a coluna é `TEXT` (não FK) e tem leitura/escrita ativa,
 usada por este lote, mas é a mesma classe de risco que fechou "`requests.sector` carrega DOIS
 significados", acima: duas fontes escreventes para o mesmo fato, sem CHECK nem trigger de
 sincronismo. Fica nomeada para quando `request_items` for revisitada.
+## Viagem LEGADA não pode ser editada — e o DELETE ainda pode apagá-la (lote C3)
+
+Registrado em 18/08/2026, ao ligar o `PUT /travel-orders/:id` (rota que existia desde sempre e
+nenhuma tela chamava).
+
+### O fato medido
+
+45 viagens em produção; **43 não têm uma única linha em `stock_ledger`**. Vieram do corte 2.0→5.0,
+criadas antes do motor existir, e por isso o saldo delas nunca passou por aqui. Uma delas está
+`'pending'` (BARRACAO WILLIAN, 10/07): **o status diz que segura reserva, e ela não segura.**
+
+### Por que BLOQUEAR em vez de editar só os dados
+
+Não existe edição correta de uma viagem legada — só há errar de um jeito ou de outro, e um dos
+lados **mente em silêncio**:
+
+| edição | o que acontece |
+|---|---|
+| para MENOS | `release` sobre reserva inexistente. O motor clampa em `Math.min(qty, cur.reserved)` = 0 → **no-op silencioso**: a tela muda, o estoque não. |
+| para MAIS | `reserve` de verdade. A viagem fica **meio-reservada** — parte do `quantity_out` com lastro, parte sem, e nada distingue as duas. |
+
+"Editar só os dados" (sem tocar saldo) também não serve: deixaria `quantity_out` divergindo do que
+o razão sustenta, que é a mesma mentira com outro nome.
+
+### O discriminador
+
+```sql
+SELECT 1 FROM stock_ledger WHERE ref_type = 'travel' AND ref_id = $1::text LIMIT 1
+```
+
+`ref_id` é **TEXT**, não uuid — sem o cast o Postgres devolve `operator does not exist: text = uuid`.
+O guard roda **dentro da transação, depois do `FOR UPDATE`, antes de qualquer escrita**, e lança
+`VIAGEM_LEGADA` → 400 com mensagem para o operador.
+
+A mesma pergunta é exposta no `GET /travel-orders` como **`has_ledger`** (acréscimo ao contrato;
+nenhum campo existente mudou de nome ou tipo). Escolhido `has_ledger` e não `editable` de propósito:
+é um **fato** medido, não uma política. "Editável" depende também do status — e amanhã de permissão
+ou de janela de tempo. Nome de fato envelhece melhor que nome de regra; o front compõe
+`pending && has_ledger` e a composição fica visível na tela.
+
+O front desabilita o botão com tooltip, mas **o guard do backend é a trava** — botão escondido ou
+desabilitado não é proteção contra quem chama a rota direto.
+
+### ⚠ DÍVIDA ABERTA: `DELETE /travel-orders/:id` tem o MESMO risco e NÃO foi tocado
+
+`deleteTravelOrder:339-364` desfaz a matemática do reconcile: para uma viagem `reconciled` faz
+`receive(consumed)` e `reverseReceive(extra)`. Numa viagem **legada** isso credita estoque que
+**nunca foi debitado** — no pior caso medido em produção, `consumed = 1027 m` de cabo (viagem
+`9.99.0546`, CABO 4X1 PRETO). Seriam 1.027 metros nascidos do nada, no razão imutável.
+
+Fica assim de propósito neste lote, com dois atenuantes que não são solução:
+- **nenhuma tela chama o DELETE** — a rota existe, o front nunca a aciona;
+- exige `separacoes:edit`.
+
+Quando alguém for ligar o DELETE numa tela, **o mesmo guard de `has_ledger` tem de entrar lá**, com
+a decisão de produto correspondente (recusar? apagar sem estornar? exigir confirmação explícita?).
+Não replicar o guard seria repetir o furo do lado destrutivo.
+
+### Editar `reconciled` segue como peça própria
+
+Fora do C3 por escopo. O que já se sabe, para quem pegar:
+- **o mapa inverso existe** e está escrito em `deleteTravelOrder:339-364` (`receive` ↔ `reverseReceive`);
+- **falta uma perna**: o `reconcile` fez `release(qtyOut)`, e desfazer exige **`reserve(qtyOut)` de
+  volta — que pode FALHAR** com `RESERVA_INSUFICIENTE` se o disponível sumiu no meio-tempo. O
+  `deleteTravelOrder` não precisou dela porque apaga a viagem; uma edição precisa;
+- e o campo minado do legado vale em dobro ali: 42 das 43 viagens sem razão são `reconciled`.
