@@ -1131,6 +1131,35 @@ operador) por não depender de enumerar o que pode aparecer amanhã.
 é recusa de QUEM está pedindo, não de o que foi pedido. `SETOR_SEM_CUSTODIA` (D1 no POST) fica no
 400 padrão: o recurso não é recebível por ninguém, não é uma questão de autorização.
 
+## O que a D1 removeu da fila, medido em produção no dia do deploy (18/08/2026)
+
+Antes do push, medição READ ONLY em produção (`ep-steep-breeze-aehqqvcd`, `START TRANSACTION READ
+ONLY` + `ROLLBACK`, mesma query/constantes de `getPendingReceipts`, `canonSetor`/
+`resolveDestinationWarehouse` do `dist/` reais — sem reimplementar nada). Número que o Bruno teve
+na mão para autorizar o push, registrado aqui para quando alguém perguntar "cadê o material da OP
+X na fila" e a resposta for "a D1 tirou, desde 18/08":
+
+| | valor medido |
+|---|---|
+| total na fila antes do deploy (sem filtro de setor) | **81** |
+| total depois, visão do master "ver tudo" (com D1) | **42** |
+| linhas removidas pela D1 | **39** |
+
+**As 39, por `destination` (grafia crua) — todas viram `SETOR_SEM_CUSTODIA` se alguém tentar
+confirmar pela API direto:**
+
+| destination | linhas | OPs distintas | qtd pendente total |
+|---|---|---|---|
+| Geral | 22 | 1 | 252 |
+| Almoxarifado | 15 | 1 | 47 |
+| Reposição | 2 | 2 | 82 |
+
+Bate por setor canônico (GERAL/ALMOXARIFADO/REPOSICAO) linha a linha — nenhuma grafia adicional
+entrou no grupo. É a única mudança visível de DADO que o lote provoca na tela, e some para todos,
+inclusive o admin sem o toggle "ver tudo" (que, com `Geral` sendo o setor do próprio master nesta
+fixture de prova, já era o caso mostrado no P3). Estas 39 linhas não desaparecem do banco — apenas
+saem da fila de recebimento, porque nunca tiveram custódia de setor para confirmar.
+
 ## Provas — branch de ensaio, transação com ROLLBACK, funções REAIS do dist/
 
 Mesma técnica de alta-fidelidade do lote TRANSFER (monkey-patch de `withTransaction`/`pool.query`
