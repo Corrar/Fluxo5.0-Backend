@@ -990,3 +990,21 @@ Fallback no literal atual = comportamento byte-idêntico para quem roda hoje con
 quem rodar contra a branch de ensaio passa a credencial por env, sem UPDATE em banco nenhum.
 `smoke_recount` usa também `002@` (ator com estoque:edit) e `005@` (sem a chave) — entram como
 `SMOKE_ATOR`/`SMOKE_SEM_CHAVE` no mesmo molde.
+
+## D1/carimbo `requests.warehouse_id`: o que está provado e o que não está
+
+**Registrado em 18/08/2026** (portão do push do D1). Redação fechada com o arquiteto:
+
+> D1/carimbo requests.warehouse_id: provado em COMPORTAMENTO — resolveDestination + INSERT do
+> dist/ contra schema com 004/024 reais, 7 casos (P1–P8) e o caminho feliz relido dentro de
+> transação com rollback na branch de ensaio (PASSO P). NÃO provado via HTTP ponta a ponta sob
+> Express+auth: os 5 smokes assumem papel por número de conta (001=admin) que só existe no seed
+> ep-summer-wave e falham em produtos:add contra clone de produção (admin real=007,
+> almoxarife=021/028/566). Fecha no lote SMOKE_ADMIN/SMOKE_ALMOXARIFE, que env-iza PAPEL e senha
+> nos 5 arquivos — é suposição de topologia de RBAC chumbada, não só ergonomia de senha.
+
+O PASSO P, para quem for reproduzir: transação na branch de ensaio (`ep-holy-fog`), guard das
+duas listas + contador de clients, INSERT extraído LITERALMENTE do `dist/` (não redigitado),
+4 casos (Elétrica→ELET, Produção 3D→P3D, Escritório→NULL decidido, desconhecido→NULL+warn),
+releitura DENTRO da transação com `warehouse_id` conferido contra o id de `warehouses` no MESMO
+host, e ROLLBACK com contagem de `requests` idêntica antes/depois (2639→2639). Zero resíduo.
