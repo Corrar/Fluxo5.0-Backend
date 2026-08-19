@@ -2271,3 +2271,114 @@ escritas antes de medir**. A resposta real deu **324 B por linha**: 100 OPs ≈ 
 Corrigido para o número medido, com a fonte marcada no próprio comentário ("MEDIDO (não
 estimado)"). **Comentário que contradiz a prova é pior que comentário nenhum:** o próximo a ler
 confia nele e decide errado, e o número inventado sobrevive ao autor.
+
+## LOTE SEP1 — a saída manual grava em `separations`, e isso NÃO é bug
+
+### (a) Por desenho, e o desenho está certo
+
+`stock.controller.ts:333` grava toda saída manual como uma linha de `separations` com
+`type='manual'` e `status='concluida'`. Parece contaminação, mas é o contrário: **a saída manual
+É uma movimentação de material, e `separations` + `separation_items` é o registro de movimentação
+que o sistema tem.** Gravar ali dá à saída manual razão, itens, destino e autoria pelo mesmo
+caminho da separação — inclusive a reserva e o `stock_ledger` (lote B).
+
+Inventar uma tabela paralela para o mesmo fato produziria duas verdades sobre "o que saiu do
+almoxarifado". O defeito nunca foi a gravação: era a **listagem** não distinguir.
+
+### O número medido no dia (19/08/2026, produção)
+
+```
+type       linhas    %        o que é
+manual        565    93,4%    saída manual
+op             34     5,6%    separação de verdade — a fila de trabalho
+default         6     1,0%    o DEFAULT DA COLUNA, todas de nov/2025, todas 'concluida'
+             ----
+              605
+```
+
+Na janela de 90 dias do BW, que é o que a aba recebia: **73 linhas — 14 `op` e 59 `manual`.**
+81% de ruído num quadro de trabalho. Depois do lote: **73 → 14 cards.**
+
+### ⚠ HÁ UM TERCEIRO VALOR, e ele é o DEFAULT DA COLUNA
+
+A recon falava em dois tipos. **São três.** `separations.type` é `text` NULLABLE com
+`DEFAULT 'default'::text` e **sem CHECK constraint** — a mesma frouxidão do `status`. As 6 linhas
+`'default'` são de nov/2025, de antes de alguém passar a mandar o campo.
+
+**Por isso o filtro é ALLOWLIST (`type = 'op'`), não DENYLIST (`type <> 'manual'`).** Com a coluna
+sendo texto livre e sem CHECK, um quarto valor nasce a qualquer momento e uma denylist o deixaria
+entrar em silêncio. As 6 linhas `'default'` são a prova de que isso **já aconteceu uma vez**.
+
+### (b) O filtro é PARAMETRIZÁVEL — para a aba de movimentações que virá
+
+```
+(sem parâmetro)  ->  type = 'op'       a aba de Separações — o DEFAULT SEGURO
+?type=manual     ->  type = 'manual'   as saídas manuais
+?type=default    ->  type = 'default'  o terceiro valor, pelo nome
+?type=all        ->  SEM filtro        tudo, para a futura aba de rastreamento
+```
+
+**Quando a aba de movimentações existir, ela usa `?type=all` (ou o tipo que quiser). NÃO se mexe
+no default.** Quem esquecer de mandar o parâmetro recebe a fila de trabalho, não o histórico
+inteiro — o esquecimento tem de custar barato.
+
+Bordas provadas: parâmetro **repetido** (`?type=op&type=manual`, que chega como array) cai no
+default seguro em vez de virar lista vazia; caixa é normalizada (`?type=OP` funciona); tipo
+inexistente devolve **200 com lista vazia**, não 500 nem tudo.
+
+### Os consumidores: nenhum passa por `getSeparations`
+
+Medido antes de escrever. Todos os outros leitores da tabela têm SQL próprio:
+`services/reservations.ts:143` (o helper de origens do lote B), `opMaterials.controller.ts:441,657`
+(Recebimento e KPIs), `system.controller.ts` (BI, 8 consultas), `clients.controller.ts:21`,
+`office.controller.ts:13`. Mudar `getSeparations` não os alcança.
+
+Dois mereciam atenção especial, e os números explicam por quê:
+
+- **Helper de origens (lote B)** — a reserva VIVA em produção é **234 linhas / 3.369 unidades,
+  100% de separações `type='op'`**. Manual não tem reserva viva (nasce `concluida`). Nada muda.
+- **Recebimento** — **110 das 122** separações entregues com `client_service_id` são `type='manual'`.
+  Se a fila do Recebimento passasse por `getSeparations`, o filtro a teria destruído. Não passa —
+  e a prova mostra a resposta **byte a byte idêntica** à da base.
+
+### ⚠ E a prova disso quase foi um VERDE VAZIO
+
+A primeira versão de PS5 afirmava "Recebimento responde 200 com array". A fila está **vazia** na
+branch de ensaio: `[]` passaria igualzinho se o lote a tivesse quebrado. É exatamente a régua do
+PG1 mordendo de novo, uma tela depois.
+
+Reescrito para comparar a resposta **byte a byte** contra a mesma rota no build da base — e com
+**controle do próprio método**: `/separations` tem de sair DIFERENTE (78 → 20), senão a comparação
+não sabe detectar mudança e o "idêntico" não vale nada.
+
+### RÉGUA — "ALLOWLIST, NÃO DENYLIST, EM COLUNA SEM CHECK"
+
+O valor novo entra em silêncio. E o `'default'` prova que já entrou.
+
+**O mapa medido em produção, 19/08/2026:**
+
+```
+type       linhas      %     origem
+manual        565   93,4%    saída manual (stock.controller.ts:333)
+op             34    5,6%    separação de verdade
+default         6    1,0%    o DEFAULT DA COLUNA — nov/2025, todas 'concluida'
+             ----
+              605
+```
+
+`separations.type` é `text` NULLABLE, `DEFAULT 'default'::text`, **sem CHECK constraint**. Nada no
+banco impede um quarto valor de aparecer amanhã — nem por bug, nem por feature nova, nem por um
+`INSERT` que esqueceu o campo (foi assim que os 6 `'default'` nasceram).
+
+**Uma denylist (`type <> 'manual'`) deixaria esse quarto valor ENTRAR na aba em silêncio.** A
+allowlist (`type = 'op'`) o deixa de fora até alguém decidir o contrário — e a decisão fica
+visível no código, não emergente do dado.
+
+Vale para toda coluna de vocabulário sem CHECK nesta casa, e há mais de uma: `separations.status`
+tem a mesma frouxidão (ver a seção do vocabulário da 021/023). **Onde o banco não restringe, a
+consulta restringe — e restringe por inclusão, nunca por exclusão.**
+
+O custo de errar é assimétrico e por isso a escolha não é gosto:
+- allowlist errada = alguém não vê uma linha que queria, reclama, e se conserta;
+- denylist errada = alguém vê uma linha que não devia, **não percebe**, e o quadro de trabalho
+  volta a ser um histórico sem ninguém notar.

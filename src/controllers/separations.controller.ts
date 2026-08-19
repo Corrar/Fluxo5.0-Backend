@@ -66,8 +66,44 @@ async function reservarOQueHouver(
   return reservar;
 }
 
+// ── FILTRO POR TIPO (lote SEP1) ───────────────────────────────────────────────────────────────
+// `separations.type` é `text` NULLABLE, com DEFAULT 'default' e SEM CHECK — medido em produção em
+// 19/08/2026. Existem TRÊS valores, não dois:
+//
+//     manual   565   (93,4%)  a SAÍDA MANUAL, gravada aqui por desenho (stock.controller.ts:333)
+//     op        34            a separação de verdade — a fila de trabalho da aba
+//     default    6            o DEFAULT DA COLUNA, todas de nov/2025, todas 'concluida'
+//
+// A aba de Separações só quer 'op'. Sem filtro ela mostrava 73 cards, dos quais 59 eram saída
+// manual — 81% de ruído num quadro de trabalho, e INDISTINGUÍVEL do resto (o front recebe `type`
+// e não o lê; `sepFrontStatus` traduz 'concluida' -> 'entregue' e o card fica igual).
+//
+// ⚠ ALLOWLIST, NÃO DENYLIST. O filtro é `type = 'op'`, não `type <> 'manual'`. Com a coluna sendo
+// texto livre e sem CHECK, um quarto valor nasce a qualquer momento — uma denylist o deixaria
+// entrar em silêncio. As 6 linhas 'default' são a prova de que isso já aconteceu uma vez.
+//
+// ⚠ O DEFAULT É O SEGURO: sem parâmetro, só 'op'. Quem esquecer de mandar recebe a FILA DE
+// TRABALHO, não o histórico inteiro.
+//
+// O dado NÃO some — fica ALCANÇÁVEL por parâmetro explícito, para a futura aba de rastreamento
+// de movimentações:
+//     (sem parâmetro)  -> type = 'op'        a aba de Separações
+//     ?type=manual     -> type = 'manual'    as saídas manuais
+//     ?type=default    -> type = 'default'   qualquer outro valor, pelo nome
+//     ?type=all        -> SEM filtro         tudo, para a aba de movimentações
+const TIPO_PADRAO_SEPARACAO = 'op';
+function tipoPedido(raw: unknown): string | null {
+  const v = String(Array.isArray(raw) ? '' : (raw ?? '')).trim().toLowerCase();
+  if (v === '') return TIPO_PADRAO_SEPARACAO;   // ausente => o seguro
+  if (v === 'all') return null;                 // null = sem filtro, decisão EXPLÍCITA de quem chama
+  return v;                                     // valor livre: a coluna é texto livre, a régua acompanha
+}
+
 export const getSeparations = async (req: Request, res: Response) => {
   try {
+    // Header repetido (?type=a&type=b) chega como ARRAY: `tipoPedido` o trata como ausente e cai
+    // no padrão seguro, em vez de virar "[object Object]" e devolver lista vazia sem explicação.
+    const tipo = tipoPedido(req.query.type);
     // RETRY explícito: era `pool.query` CRU, fora do wrapper do db.ts — origem conhecida do 500
     // intermitente desta fila no cold start do Neon. Leitura idempotente ⇒ retentável.
     // GRÃO: o saldo é o do ALMOX pooled (op_id IS NULL) — é de lá que a separação sai, e material
@@ -106,10 +142,16 @@ export const getSeparations = async (req: Request, res: Response) => {
       -- 'cancelada' NAO precisou de clausula propria: o front ja a descarta no adapter
       -- (separacoes.jsx, adaptSeparation devolve null) e, medido, todas as 10 sao mais velhas que
       -- a janela -- sairiam por idade de qualquer jeito.
-      WHERE s.status NOT IN ('entregue', 'cancelada', 'concluida', 'finalizada')
-         OR COALESCE(s.sent_at, s.created_at) >= now() - interval '90 days'
+      -- == FILTRO DE TIPO (lote SEP1) =======================================================
+      -- Combina com a janela por AND: o tipo escolhe QUAIS separações; a janela, QUANTO do
+      -- histórico delas. As abertas seguem entrando sem idade (1ª cláusula da janela) — a de 78
+      -- dias inclusive, porque as 5 abertas são todas type='op'.
+      -- $2 IS NULL é o ?type=all: sem filtro, e só por pedido explícito.
+      WHERE ($2::text IS NULL OR s.type = $2::text)
+        AND (s.status NOT IN ('entregue', 'cancelada', 'concluida', 'finalizada')
+             OR COALESCE(s.sent_at, s.created_at) >= now() - interval '90 days')
       ORDER BY s.created_at DESC
-    `, [almoxId], { retryable: true });
+    `, [almoxId, tipo], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar separações' }); }
 };
