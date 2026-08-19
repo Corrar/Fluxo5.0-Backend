@@ -5,6 +5,7 @@ import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
+import { emitStockChanged } from '../config/socket';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
@@ -115,6 +116,7 @@ export const updateReplenishment = async (req: Request, res: Response) => {
 };
 
 export const authorizeReplenishment = async (req: Request, res: Response) => {
+  const produtosTocados: string[] = [];   // BW item 3-i: preenchido a cada movimento REAL de saldo
   const { id } = req.params;
   const { items, action, shipping_info, tracking_code } = req.body;
   const userId = (req as any).user.id;
@@ -150,12 +152,14 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
           // reserve/release pelo motor (valida DISPONÍVEL sob FOR UPDATE + grava no ledger).
           if (diff > 0) {
+            produtosTocados.push(productId);
             await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, diff, {
               refType: 'replenishment', refId: id, userId,
               opKey: `replenishment:${id}:item:${item.id}:reserve:${newQty}`,
               reason: 'Reserva de reposição',
             });
           } else if (diff < 0) {
+            produtosTocados.push(productId);
             await StockService.release(client, productId, warehouseId, POOLED_OP_ID, -diff, {
               refType: 'replenishment', refId: id, userId,
               opKey: `replenishment:${id}:item:${item.id}:reserve:${newQty}`,
@@ -166,6 +170,7 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
           // BAIXA FÍSICA pelo motor: consume faz on_hand -= newQty, libera min(newQty, reserved) e valida FURO.
           // op_key `deliver:${newQty}` -> re-entregar com a mesma qty é no-op idempotente (fim da dupla baixa).
+          produtosTocados.push(productId);
           await StockService.consume(client, productId, warehouseId, POOLED_OP_ID, newQty, {
             refType: 'replenishment', refId: id, userId,
             opKey: `replenishment:${id}:item:${item.id}:deliver:${newQty}`,
@@ -174,6 +179,7 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
           // Decisão (b): entregou MENOS que reservou -> zera a reserva remanescente do item (não deixa sobra
           // pendurada). consume já liberou newQty; libera o resto (oldQty - newQty).
           if (oldQty > newQty) {
+            produtosTocados.push(productId);
             await StockService.release(client, productId, warehouseId, POOLED_OP_ID, oldQty - newQty, {
               refType: 'replenishment', refId: id, userId,
               opKey: `replenishment:${id}:item:${item.id}:deliver:${newQty}:relrem`,
@@ -182,12 +188,14 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
           }
         } else if (action === 'reverter') {
           // Desfaz a entrega: devolve o físico (receive) e re-empenha (reserve). Ancorado em oldQty.
+          produtosTocados.push(productId);
           await StockService.receive(client, productId, warehouseId, POOLED_OP_ID, oldQty, {
             refType: 'replenishment', refId: id, userId,
             opKey: `replenishment:${id}:item:${item.id}:revert:${oldQty}`,
             reason: 'Reversão de entrega de reposição',
           });
           if (oldQty > 0) {
+            produtosTocados.push(productId);
             await StockService.reserve(client, productId, warehouseId, POOLED_OP_ID, oldQty, {
               refType: 'replenishment', refId: id, userId,
               opKey: `replenishment:${id}:item:${item.id}:revert:${oldQty}:rereserve`,
@@ -216,7 +224,8 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
       await createLog(userId, 'AUTORIZAR_REPOSICAO', { id_reposicao: id, acao: action, codigo_rastreio: tracking_code || 'Não informado' }, getClientIp(req), client);
     });
 
-    if ((req as any).io) { (req as any).io.emit('stock_updated'); }
+    // BW item 3-i: era `io.emit('stock_updated')` NU (sem payload). Agora carrega os produtos.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (error: any) {
     // Furo de estoque / reserva insuficiente do motor -> 400 tratado com mensagem clara.
@@ -261,6 +270,10 @@ export const deleteReplenishment = async (req: Request, res: Response) => {
         if (qty > 0) {
           // release pelo motor (nunca deixa reserva negativa + grava no ledger). op_key content-addressed
           // com a AÇÃO 'cancel' -> não colide com reserve/deliver/revert do authorize do mesmo item.
+          // ⚠ deleteReplenishment LIBERA reserva e NÃO EMITE NADA — nenhuma tela de saldo fica
+          // sabendo. É buraco PRÉ-EXISTENTE, fora dos 5 emissores que este lote consertou, e NÃO
+          // foi mexido aqui de propósito: consertá-lo é mudança de comportamento (passaria a
+          // acordar telas onde hoje nada acontece), não otimização de banda. Registrado no DIVIDAS.
           await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
             refType: 'replenishment', refId: id, userId,
             opKey: `replenishment:${id}:item:${item.id}:cancel:release:${qty}`,

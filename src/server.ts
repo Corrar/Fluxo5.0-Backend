@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import { createServer } from 'http';
 
 // --- Middlewares & Background Jobs ---
@@ -64,6 +65,27 @@ app.set('trust proxy', 1);
 
 // Helmet adiciona cabeçalhos HTTP de segurança automaticamente contra ataques XSS e Clickjacking
 app.use(helmet()); 
+
+// ── COMPRESSÃO DE RESPOSTA (lote BW) ────────────────────────────────────────────────────────
+// ⚠ O GANHO NÃO É O QUE PARECE, e por isso a justificativa vem MEDIDA e não suposta.
+// A borda (Cloudflare) já entrega brotli ao NAVEGADOR, então quem olha o DevTools não vê
+// diferença nenhuma. Duas coisas que a borda não resolve, e que são o motivo real:
+//   (a) a perna Render → Cloudflare é SEMPRE CRUA. É esse tráfego que sai da conta do servidor,
+//       e é ele que o Bruno paga. Comprimir na origem reduz o egress, não a latência da tela.
+//   (b) cliente que anuncia só `gzip` (sem br) hoje recebe ZERO compressão — medido. Com este
+//       middleware ele passa a receber gzip.
+//
+// VEM DEPOIS DO helmet e ANTES das rotas: o helmet só escreve cabeçalhos, e o `compression`
+// precisa envolver o `res.write`/`res.end` de quem gera corpo. Não conflita com nenhum dos dois.
+//
+// O SOCKET NÃO É AFETADO: o Socket.IO tem seu próprio servidor HTTP anexado (`createServer(app)`
+// mais abaixo) e o handshake/upgrade não passa pela pilha de middlewares do Express. O websocket
+// também não é comprimido por aqui — quem cuida disso é o `perMessageDeflate` do próprio
+// Socket.IO, que este lote NÃO toca (a regra do Bruno: não mexer no tempo real).
+//
+// NADA de `filter` customizado: o default do `compression` já pula o que não deve comprimir
+// (respostas pequenas, `Cache-Control: no-transform`, e quem já tem `Content-Encoding`).
+app.use(compression());
 
 // --- CORREÇÃO DO ERRO 413 CONTENT TOO LARGE ---
 // Permite que o Express entenda o corpo das requisições no formato JSON (com limite aumentado para base64)

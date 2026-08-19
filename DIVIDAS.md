@@ -1876,3 +1876,180 @@ credencial errada e esconde que o banco **não existe mais**.
 Com o host antigo NOMEADO na lista negra, a recusa acontece **antes de abrir socket** e diz qual
 banco morto foi tentado. A allowlist explícita continua sendo quem autoriza; a lista negra só
 melhora o diagnóstico do que já seria recusado.
+
+---
+
+# LOTE BW — otimização de banda (19/08/2026)
+
+Regra do Bruno: **não trocar Socket.IO por polling**. O alvo é o VOLUME por evento, não a
+frequência. Nada de tempo real foi tocado.
+
+## (a) image_url SAIU da listagem — e as fotos continuam funcionando
+
+O briefing supunha que nenhuma tela exibia imagem. **Era falso, e a varredura pegou**: `ProdutoFoto`
+(`pages_main.jsx`) desenha a foto no cartão do Catálogo (mobile e desktop) e `InvMiniatura` desenha
+a miniatura em três pontos do Inventário. Remover o campo não quebraria nada — o `ProdutoFoto` faz
+`if (!p.img) return null`. As fotos simplesmente **sumiriam em silêncio**, que é pior que quebrar.
+
+Por isso a forma escolhida pelo Bruno foi a **(iii)**: `has_image` na listagem + endpoint dedicado.
+Tira os 89,1% **e** mantém a capability.
+
+```
+1.941 produtos ativos · 77 COM imagem (3,97%) · 0 URLs externas (tudo Base64 inline)
+maior imagem: 985,2 KB · formatos: 51 image/jpeg + 26 image/png, 77/77 em data:<mime>;base64,
+payload GET /products:  5.948,2 KB  ->  679,5 KB   (-88,6%)
+```
+
+**O campo CONTINUA na tabela.** As 77 imagens Base64 são a fonte da conversão para o Cloudflare R2;
+apagá-las não reduziria tráfego nenhum e destruiria dado irrecuperável.
+
+### O endpoint: bytes, não data URI em JSON
+
+`GET /products/:id/image` decodifica o data URI e responde os **BYTES** com `Content-Type` real.
+A alternativa (devolver a string dentro de um JSON) tiraria os mesmos 89,1%, mas obrigaria o front
+a remontar a string a cada visita e o navegador a tratar tudo como payload de API.
+
+**⚠ ESTE É O DEGRAU PARA O R2.** Quando as imagens migrarem, muda **só o corpo do controller**
+(buscar do bucket em vez de decodificar a coluna). A rota, o contrato e o front ficam iguais — foi
+exatamente por isso que o Bruno preferiu esta forma a remover agora e refazer depois.
+
+**Cache** (o ponto que decide se o item 1 é ganho ou empate): ETag **forte derivado do conteúdo**
++ `Cache-Control: private, max-age=3600, must-revalidate`. Medido: revalidação com `If-None-Match`
+devolve **304 com 0 bytes** no lugar de 738,9 KB; ETag que não casa devolve 200 com o corpo inteiro
+(controle negativo). `private` porque a rota é autenticada — proxy compartilhado não pode guardar.
+
+**RBAC** `produtos:view`, a mesma chave da listagem: quem vê o produto vê a foto dele. Medido: papel
+`gerente` toma 403, sem token toma 401.
+
+**404** para produto inexistente E para produto sem imagem (mesmo status de propósito: para o
+cliente as duas são a mesma resposta acionável, e o front nem chega a pedir porque a listagem já
+disse `has_image: false`). **415** se o dado não for data URI base64 — hoje são 77/77 no padrão,
+mas formato inesperado vira erro explícito em vez de imagem quebrada.
+
+### O front: por que NÃO é um `<img src>` direto
+
+A rota é autenticada por Bearer e **`<img src>` não manda `Authorization`** — buscaria sem token e
+tomaria 401. As três alternativas, e por que duas foram recusadas:
+
+| alternativa | por que NÃO |
+|---|---|
+| token na **query string** (`?token=...`) | vaza em log de proxy, em `Referer` de qualquer recurso da página, e no histórico do navegador. Um segredo de sessão num lugar que não é cabeçalho é segredo vazado. |
+| trocar a autenticação para **cookie** | resolveria o `<img>` de graça, mas é mudança de arquitetura — mexe em login, CORS, CSRF e em toda chamada do `FRApi`. Não cabe num lote de banda. |
+| **blob + object URL** (escolhida) | busca pelo `FRApi` (que já injeta o Bearer), `responseType: 'blob'`, `URL.createObjectURL`. |
+
+Então `lib/foto-produto.js` busca pelo `FRApi` (que já injeta o Bearer) com `responseType: 'blob'`
+e vira object URL. **O cache HTTP continua valendo** — o navegador guarda a resposta pelo
+ETag/Cache-Control igual guardaria a de um `<img>`. O que se perde é só o cache de imagem
+DECODIFICADA, irrelevante para 77 fotos.
+
+**Sob demanda, provado**: com **1.941 produtos** na tela, saiu **1 requisição** de imagem — o
+Catálogo pagina 24 por página e só 1 dos 24 visíveis tinha foto. Virar a página pede só as novas.
+Produto com `has_image: false` **não gera requisição nenhuma**. Cache de processo por `productId`
+guarda a PROMESSA (não a URL), então duas telas pedindo o mesmo produto fazem **um** fetch.
+
+### ⚠ getInactiveProducts AINDA carrega image_url
+
+Outra rota (`products.controller.ts`, lista de arquivados), **fora do escopo deste lote**. Tem o
+mesmo problema em menor escala. Não foi tocada.
+
+## (b) emitStockState existia MORTO
+
+`config/socket.ts:105`, assinatura `{productId, onHand, reserved, available}` — **zero chamadores
+e zero listeners**, confirmado por varredura. Continua morto: ligá-lo é o item 3(ii), que **não
+foi feito** (ver abaixo).
+
+## (c) O multiplicador real: 1 evento × K telas × peso do GET
+
+O `stock_updated` custa ~19 KB de socket numa recontagem de 500 itens. O que ele DISPARA é que
+pesa: cada tela aberta responde com um GET completo. Com 10 operadores e as telas que assinam o
+evento, uma recontagem vira dezenas de MB de HTTP. **O socket não é o problema — o reload que ele
+provoca é.** É o que o item 3(ii) existe para resolver.
+
+## Item 2 · compressão — o ganho NÃO é o que parece
+
+A borda (Cloudflare) já entrega brotli ao navegador, então o DevTools não muda. O ganho real,
+medido com servidor real e três `Accept-Encoding`:
+
+| endpoint | accept | antes | depois |
+|---|---|---|---|
+| `/products` | `br, gzip` | 5.948,2 KB | **3.448,1 KB** (−42,0%) |
+| `/products` | `gzip` | 5.948,2 KB | **3.829,6 KB** (−35,6%) |
+| `/separations` | `br, gzip` | 716,1 KB | **108,5 KB** (−84,9%) |
+| `/separations` | `gzip` | 716,1 KB | **143,6 KB** (−79,9%) |
+
+Duas coisas que a borda não resolve: **(a)** a perna Render→Cloudflare é SEMPRE crua — é esse o
+egress que se paga; **(b)** cliente que anuncia só `gzip` recebia **ZERO** compressão (medido no
+controle: as quatro variantes de `Accept-Encoding` voltavam sem `content-encoding`).
+
+**O conteúdo não mudou**: hash sha256 do corpo descomprimido **idêntico nos 8 casos** — só a
+codificação. `identity` e ausência de `Accept-Encoding` seguem sem comprimir (controle negativo).
+`/products` só comprime 42% porque é quase todo base64, já incompressível — mais um argumento para
+resolver o (a).
+
+Não conflita com `helmet` (só escreve cabeçalhos) nem com o socket: o Socket.IO tem servidor HTTP
+próprio e o upgrade não passa pela pilha do Express; o `perMessageDeflate` dele **não foi tocado**.
+
+## Item 3(i) · os 5 emissores legados agora carregam changedProducts
+
+`travels` ×4 (`createTravelOrder`, `reconcileTravelOrder`, `updateTravelOrder`,
+`deleteTravelOrder`) e `replenishments` ×1 (`authorizeReplenishment`) emitiam `stock_updated`
+**nu**. Era por causa deles que o `lib/stock-refresh.js` descartava o payload de TODOS os eventos
+("REGRA DURA" no cabeçalho): com um emissor mudo, confiar no payload faria a tela NÃO atualizar
+quando ele falasse.
+
+A coleta fica **colada em cada chamada ao motor**, não deduzida do corpo da requisição: o corpo diz
+o que o cliente pediu; o que interessa é o que o saldo **realmente** moveu.
+
+Provado com `io` FALSO capturando `(evento, payload)`, e **controle negativo no código do HEAD**:
+lá o payload chega `undefined`; aqui chega `{changedProducts:[...]}` com o produto tocado dentro.
+
+⚠ **Efeito colateral desejado:** `emitStockChanged` é no-op com lista vazia. Operação que não move
+saldo nenhum deixa de acordar as telas — antes acordava sempre.
+
+⚠ **`deleteReplenishment` LIBERA reserva e NÃO EMITE NADA.** Buraco **pré-existente**, fora dos 5
+do briefing, **não corrigido aqui**: consertá-lo é mudança de comportamento (passaria a acordar
+telas onde hoje nada acontece), não otimização de banda. Fica registrado.
+
+## Item 3(ii) · NÃO FEITO — e é maior do que o briefing supõe
+
+O patch cirúrgico ("com payload, zero GET e o saldo muda no state") **não é possível com
+`changedProducts`**: ele carrega só IDs. Para a tela atualizar o saldo sem GET, o evento precisa
+dos VALORES — que é justamente o que o `emitStockState` morto oferece
+(`{productId, onHand, reserved, available}`).
+
+Ligá-lo significa **cada um dos ~30 call sites do motor capturar o `StockSnapshot` que o
+`StockService` já devolve e propagá-lo até o emit**. É trabalho de outra ordem que o dos 5
+emissores, e mexe em todos os controllers de estoque. **Parado para decisão.**
+
+O item 3(i) é pré-requisito e está pronto: quando o (ii) entrar, o front já pode confiar que todo
+emissor fala. O **fallback** exigido (evento sem payload → reload completo) continua sendo o
+comportamento atual do `stock-refresh.js`, então ligar o (ii) é aditivo, não substitutivo.
+
+## Item 4 · /separations ganhou janela
+
+Era a **única das 8 listagens** sem `WHERE`, sem janela e sem `LIMIT`. Medido pelo servidor real:
+
+```
+602 linhas · 716,1 KB  →  72 linhas · 222,3 KB   (−69,0%)
+por status antes : concluida=568 · entregue=17 · cancelada=10 · em_separacao=7
+por status depois: concluida=58  · entregue=7   · em_separacao=7
+ABERTAS: 7/7 antes → 7/7 depois   ✓
+```
+
+A cláusula que garante o Quadro de Gestão é a **primeira**: `status NOT IN (terminais)` entra
+**sempre, sem idade**. A mais antiga viva tem 78 dias; se chegar a 5 anos, continua vindo. A
+segunda cláusula é só o histórico da aba "Entregue" (90 dias por `sent_at`).
+
+`cancelada` sumiu inteira **por idade**, sem cláusula própria — e o front já a descartava no
+adapter (`adaptSeparation` devolve `null`), então trafegava para nada.
+
+## ⚠ npm install DESTRÓI a junction do node_modules
+
+`npm install compression @types/compression` dentro do worktree **apagou a junction e criou um
+`node_modules` real** (149 entradas próprias). O original ficou **intacto** (173, `pg`/`express`
+OK, sem `compression`) — mas isso muda o desmonte: a pasta do worktree passa a ser **diretório de
+verdade** e precisa de `Remove-Item -Recurse`, não do `cmd /c rmdir` da junction.
+
+**Régua: depois de qualquer `npm install` num worktree, RECONFERIR se `node_modules` ainda é
+junction antes de desmontar.** Tratar diretório real como junction (ou vice-versa) é como o
+`node_modules` do repo principal foi destruído duas vezes em 17/08.

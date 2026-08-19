@@ -87,7 +87,27 @@ export const getSeparations = async (req: Request, res: Response) => {
          LEFT JOIN stock st ON p.id = st.product_id AND st.warehouse_id = $1 AND st.op_id IS NULL
          WHERE si.separation_id = s.id) as items,
         (SELECT json_agg(json_build_object('id', sr.id, 'product_id', sr.product_id, 'quantity', sr.quantity, 'status', sr.status, 'product_name', p.name)) FROM separation_returns sr JOIN products p ON sr.product_id = p.id WHERE sr.separation_id = s.id) as returns
-      FROM separations s ORDER BY s.created_at DESC
+      FROM separations s
+      -- == JANELA (lote BW, item 4) =========================================================
+      -- Era a UNICA das 8 listagens sem WHERE, sem janela e sem LIMIT: 602 linhas / 797 KB, e
+      -- crescendo sem teto. O array items[] e 75% do peso, entao cada separacao entregue no
+      -- passado custa banda para sempre.
+      --
+      -- A PRIMEIRA clausula e a que importa: separacao ABERTA entra SEMPRE, sem idade. O Quadro
+      -- de Gestao depende de ver todas as abertas, e uma janela so por data as perderia assim que
+      -- envelhecessem -- a mais antiga viva ja tem 78 dias (02/06). Com o OR, ela pode ter 5 anos
+      -- que continua vindo.
+      --
+      -- A SEGUNDA clausula e o historico da aba "Entregue": 90 dias por sent_at (a data que
+      -- importa para quem foi entregue), com fallback em created_at para linha sem envio.
+      -- Medido em producao: 602 -> 72 linhas, 797 KB -> 252 KB (31,6%), com as 7 abertas presentes.
+      --
+      -- 'cancelada' NAO precisou de clausula propria: o front ja a descarta no adapter
+      -- (separacoes.jsx, adaptSeparation devolve null) e, medido, todas as 10 sao mais velhas que
+      -- a janela -- sairiam por idade de qualquer jeito.
+      WHERE s.status NOT IN ('entregue', 'cancelada', 'concluida', 'finalizada')
+         OR COALESCE(s.sent_at, s.created_at) >= now() - interval '90 days'
+      ORDER BY s.created_at DESC
     `, [almoxId], { retryable: true });
     res.json(rows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar separações' }); }

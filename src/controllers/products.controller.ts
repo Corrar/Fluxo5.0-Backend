@@ -5,6 +5,7 @@ import { pool, query } from '../db';
 import { getClientIp } from '../utils/ip';
 import { createLog } from '../utils/logger';
 import { getAlmoxId } from '../services/warehouse';
+import { createHash } from 'crypto';   // ETag forte da imagem (lote BW)
 
 // 🧠 SANITIZADOR DE TAGS BLINDADO
 // Limpa os objetos do TagInput e extrai apenas o texto puro (String).
@@ -68,7 +69,17 @@ export const getProducts = async (req: Request, res: Response) => {
           FROM stock WHERE op_id IS NULL AND warehouse_id = $1 GROUP BY product_id
       )
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.tags, p.unit_price, p.sales_price, p.min_stock, p.active,
-        p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
+        p.is_3d, p.production_minutes, p.filament_grams,
+        -- BW item 1: image_url SAI da listagem. Eram 89,1% do payload (5.948,0 -> 647,3 KB, 9,2x)
+        -- em 77 produtos de 1.941, todos Base64 inline, o maior com 985,2 KB. O CAMPO CONTINUA NA
+        -- TABELA: e a fonte da conversao para o Cloudflare R2, e apaga-lo nao reduz trafego nenhum.
+        -- A listagem passa a dizer apenas SE existe foto; quem quiser a foto pede em
+        -- GET /products/:id/image, que devolve os BYTES com cache. Quando a origem virar o R2,
+        -- muda so o corpo daquele endpoint -- o front nao muda.
+        --
+        -- getInactiveProducts (mais abaixo) AINDA carrega image_url: e outra rota, fora do escopo
+        -- deste lote. Registrado no DIVIDAS.
+        (p.image_url IS NOT NULL AND p.image_url <> '') AS has_image,
         json_build_object('quantity_on_hand', COALESCE(s.on_hand, 0), 'quantity_reserved', COALESCE(s.reserved, 0)) as stock
       FROM products p LEFT JOIN pooled s ON s.product_id = p.id WHERE p.active = true ORDER BY p.name ASC
     `, [almoxId], { retryable: true });
@@ -360,4 +371,65 @@ export const updateProductPrices = async (req: Request, res: Response) => {
     try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message });
   } finally { client.release(); }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// GET /products/:id/image — a FOTO, em BYTES (lote BW, item 1 forma "iii")
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// POR QUE BYTES E NÃO O data URI EM JSON. As duas formas tiram os 89,1% da listagem, mas só esta
+// deixa a resposta ser uma IMAGEM de verdade: Content-Type próprio, ETag, e cache do navegador
+// funcionando como cache de imagem. Devolver o data URI dentro de um JSON obrigaria o front a
+// remontar a string a cada visita e o navegador a tratar tudo como payload de API.
+//
+// É TAMBÉM O DEGRAU PARA O R2. Quando as 77 imagens migrarem para o Cloudflare R2, muda só o CORPO
+// desta função (buscar do bucket em vez de decodificar a coluna). A rota, o contrato e o front
+// ficam iguais — que é exatamente por que o Bruno preferiu esta forma a remover e refazer depois.
+//
+// CACHE (o ponto que mais importa: sem ele trocamos 1 payload grande por N requisições):
+//   ETag FORTE derivado do conteúdo -> muda quando (e só quando) a foto muda.
+//   If-None-Match -> 304 sem corpo. Uma revalidação custa ~200 bytes em vez de até 985 KB.
+//   Cache-Control: private (a rota é autenticada, então não pode ser cacheada por proxy
+//   compartilhado), max-age de 1h + must-revalidate.
+//
+// RBAC: `produtos:view` — a MESMA chave que abre a listagem. Quem pode ver o produto pode ver a
+// foto dele; uma chave própria só criaria matriz sem ganho.
+//
+// SEM FOTO -> 404. É o mesmo status de "produto não existe" de propósito: para o cliente, "não há
+// imagem aqui" é a mesma resposta acionável, e o front nem chega a pedir (a listagem já disse
+// `has_image: false`). Um 204 obrigaria o `<img>`/fetch a tratar um sucesso vazio.
+export const getProductImage = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await pool.query('SELECT image_url FROM products WHERE id = $1', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Produto não encontrado.' });
+
+    const bruto: string | null = rows[0].image_url;
+    if (!bruto || !bruto.trim()) return res.status(404).json({ error: 'Este produto não tem imagem.' });
+
+    // Todas as 77 seguem `data:<mime>;base64,<dados>` (medido: 51 jpeg, 26 png, zero fora do
+    // padrão e zero URL externa). O regex é o guard: formato inesperado vira 415 explícito em vez
+    // de um Buffer.from silenciosamente vazio servido como imagem quebrada.
+    // [\s\S] em vez da flag /s: o target do tsconfig e anterior a es2018 e a flag nao compila.
+    const m = /^data:([^;,]+);base64,([\s\S]*)$/.exec(bruto.trim());
+    if (!m) {
+      return res.status(415).json({ error: 'Imagem em formato não suportado (esperado data URI base64).' });
+    }
+    const mime = m[1];
+    const bytes = Buffer.from(m[2], 'base64');
+    if (bytes.length === 0) return res.status(415).json({ error: 'Imagem vazia após decodificação.' });
+
+    // ETag do CONTEÚDO (não do id): trocar a foto do produto invalida o cache sozinho.
+    const etag = '"' + createHash('sha256').update(bytes).digest('hex').slice(0, 32) + '"';
+    res.setHeader('ETag', etag);
+    res.setHeader('Cache-Control', 'private, max-age=3600, must-revalidate');
+    res.setHeader('Content-Type', mime);
+
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+
+    res.setHeader('Content-Length', String(bytes.length));
+    return res.status(200).end(bytes);
+  } catch (error: any) {
+    return res.status(500).json({ error: 'Erro ao buscar a imagem do produto' });
+  }
 };

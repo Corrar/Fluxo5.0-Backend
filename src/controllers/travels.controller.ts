@@ -5,6 +5,19 @@ import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
+import { emitStockChanged } from '../config/socket';
+
+// ── changedProducts nos emissores legados (lote BW, item 3-i) ────────────────────────────────
+// Estes emissores mandavam `stock_updated` VAZIO. O front (`lib/stock-refresh.js`) descartava o
+// payload de TODO evento por causa deles — "REGRA DURA" no cabeçalho de lá: com um só emissor
+// mudo, confiar no payload faria a tela NÃO atualizar quando ele falasse. Enquanto eles não
+// carregassem os produtos, o patch cirúrgico não podia ser ligado em lugar nenhum.
+//
+// A coleta fica COLADA em cada chamada ao motor, não deduzida do corpo da requisição: o corpo diz
+// o que o cliente PEDIU, e o que interessa é o que o saldo REALMENTE moveu (um item pode não mover
+// nada por qty 0, idempotência ou guard). `emitStockChanged` deduplica, descarta nulos e é no-op
+// com lista vazia — então "nada moveu" deixa de acordar as telas, que é o ganho.
+
 
 export const getTravelOrders = async (req: Request, res: Response) => {
   try {
@@ -33,6 +46,7 @@ export const getTravelOrders = async (req: Request, res: Response) => {
 };
 
 export const createTravelOrder = async (req: Request, res: Response) => {
+  const produtosTocados: string[] = [];   // BW item 3-i: preenchido a cada movimento REAL de saldo
   const userId = (req as any).user.id;
   const { technicians, city, items, status } = req.body;
 
@@ -92,6 +106,7 @@ export const createTravelOrder = async (req: Request, res: Response) => {
           const opKey = idemKey
             ? `travel:idem:${idemKey}:item:${item.product_id}:reserve:${qty}`
             : `travel:${travelId}:item:${itemId}:reserve:${qty}`;
+          produtosTocados.push(item.product_id);
           await StockService.reserve(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
             refType: 'travel', refId: travelId, userId, opKey,
             reason: 'Reserva de material para viagem',
@@ -111,7 +126,9 @@ export const createTravelOrder = async (req: Request, res: Response) => {
       return { id: travelId, success: true };
     });
 
-    if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
+    if ((req as any).io) (req as any).io.emit('travel_orders_update');
+    // BW item 3-i: era `io.emit('stock_updated')` NU (sem payload). Agora carrega os produtos.
+    emitStockChanged(produtosTocados, (req as any).io);
     return res.status(201).json(result);
   } catch (err: any) {
     if (err instanceof StockError) return res.status(400).json({ error: err.message });
@@ -133,6 +150,7 @@ export const createTravelOrder = async (req: Request, res: Response) => {
 };
 
 export const reconcileTravelOrder = async (req: Request, res: Response) => {
+  const produtosTocados: string[] = [];   // BW item 3-i: preenchido a cada movimento REAL de saldo
   const { id } = req.params;
   const { returnedItems } = req.body;
   const userId = (req as any).user.id;
@@ -168,6 +186,7 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
         // 1) LIBERA A RESERVA INTEIRA que a viagem segurava. A viagem acabou p/ este item -> solta os
         //    qtyOut reservados no create, seja qual for o split. release nunca deixa reserva negativa.
         if (qtyOut > 0) {
+          produtosTocados.push(oldItem.product_id);
           await StockService.release(client, oldItem.product_id, warehouseId, POOLED_OP_ID, qtyOut, {
             refType: 'travel', refId: id, userId,
             opKey: `travel:${id}:item:${oldItem.id}:reconcile:release:${qtyOut}`,
@@ -179,6 +198,7 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
         //    liberada no passo 1; consume mexeria em quantity_reserved do agregado pooled (reservas de
         //    OUTRAS separações) -> furo. Guard on_hand-consumed >= reserved segura (invariante do reserve).
         if (consumed > 0) {
+          produtosTocados.push(oldItem.product_id);
           await StockService.reverseReceive(client, oldItem.product_id, warehouseId, POOLED_OP_ID, consumed, {
             refType: 'travel', refId: id, userId,
             opKey: `travel:${id}:item:${oldItem.id}:reconcile:consume:${consumed}`,
@@ -195,6 +215,7 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
 
         // 4) EXTRA (voltou MAIS do que levou) = entrada física nova. receive pelo motor (cria linha LAZY).
         if (extra > 0) {
+          produtosTocados.push(oldItem.product_id);
           await StockService.receive(client, oldItem.product_id, warehouseId, POOLED_OP_ID, extra, {
             refType: 'travel', refId: id, userId,
             opKey: `travel:${id}:item:${oldItem.id}:reconcile:extra:${extra}`,
@@ -214,6 +235,7 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
             [id, retItem.product_id, retQty],
           );
           const newItemId = insRes.rows[0].id;
+          produtosTocados.push(retItem.product_id);
           await StockService.receive(client, retItem.product_id, warehouseId, POOLED_OP_ID, retQty, {
             refType: 'travel', refId: id, userId,
             opKey: `travel:${id}:item:${newItemId}:reconcile:extrapuro:${retQty}`,
@@ -227,7 +249,9 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
       await createLog(userId, 'FINALIZAR_CONFRONTO_VIAGEM', { id_viagem: id }, getClientIp(req), client);
     });
 
-    if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
+    if ((req as any).io) (req as any).io.emit('travel_orders_update');
+    // BW item 3-i: era `io.emit('stock_updated')` NU (sem payload). Agora carrega os produtos.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (err: any) {
     if (err instanceof StockError) return res.status(400).json({ error: err.message });
@@ -246,6 +270,7 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
 };
 
 export const updateTravelOrder = async (req: Request, res: Response) => {
+  const produtosTocados: string[] = [];   // BW item 3-i: preenchido a cada movimento REAL de saldo
   const { id } = req.params;
   const { technicians, city, items, status } = req.body;
   const userId = (req as any).user.id;
@@ -304,6 +329,7 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
           // Item REMOVIDO da viagem -> alvo 0 -> libera a reserva inteira e apaga o item.
           const qtyOut = Number(oldItem.quantity_out);
           if (qtyOut > 0) {
+            produtosTocados.push(oldItem.product_id);
             await StockService.release(client, oldItem.product_id, warehouseId, POOLED_OP_ID, qtyOut, {
               refType: 'travel', refId: id, userId,
               opKey: `travel:${id}:item:${oldItem.id}:update:setqty:0`,
@@ -321,8 +347,10 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
             // é edição interativa sob FOR UPDATE (não é rota de retry).
             const opKey = `travel:${id}:item:${oldItem.id}:update:setqty:${newQty}`;
             if (diff > 0) {
+              produtosTocados.push(oldItem.product_id);
               await StockService.reserve(client, oldItem.product_id, warehouseId, POOLED_OP_ID, diff, { refType: 'travel', refId: id, userId, opKey, reason: 'Edição de viagem: aumenta reserva do item' });
             } else {
+              produtosTocados.push(oldItem.product_id);
               await StockService.release(client, oldItem.product_id, warehouseId, POOLED_OP_ID, -diff, { refType: 'travel', refId: id, userId, opKey, reason: 'Edição de viagem: reduz reserva do item' });
             }
             await client.query('UPDATE travel_order_items SET quantity_out = $1 WHERE id = $2', [newQty, oldItem.id]);
@@ -337,6 +365,7 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
           const insRes = await client.query('INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3) RETURNING id', [id, item.product_id, qty]);
           const newItemId = insRes.rows[0].id;
           if (qty > 0) {
+            produtosTocados.push(item.product_id);
             await StockService.reserve(client, item.product_id, warehouseId, POOLED_OP_ID, qty, {
               refType: 'travel', refId: id, userId,
               opKey: `travel:${id}:item:${newItemId}:update:setqty:${qty}`,
@@ -349,7 +378,9 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
       await createLog(userId, 'EDITAR_VIAGEM', { id_viagem: id, edicoes: 'Técnicos, cidade ou itens alterados' }, getClientIp(req), client);
     });
 
-    if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
+    if ((req as any).io) (req as any).io.emit('travel_orders_update');
+    // BW item 3-i: era `io.emit('stock_updated')` NU (sem payload). Agora carrega os produtos.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true });
   } catch (err: any) {
     if (err instanceof StockError) return res.status(400).json({ error: err.message });
@@ -369,6 +400,7 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
 };
 
 export const deleteTravelOrder = async (req: Request, res: Response) => {
+  const produtosTocados: string[] = [];   // BW item 3-i: preenchido a cada movimento REAL de saldo
   const { id } = req.params;
   const userId = (req as any).user.id;
 
@@ -392,6 +424,7 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
 
           // reconcile fez on_hand -= consumed -> devolve com receive.
           if (consumed > 0) {
+            produtosTocados.push(item.product_id);
             await StockService.receive(client, item.product_id, warehouseId, POOLED_OP_ID, consumed, {
               refType: 'travel', refId: id, userId,
               opKey: `travel:${id}:item:${item.id}:delete:revert-consume:${consumed}`,
@@ -401,6 +434,7 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
           // reconcile fez on_hand += extra -> tira com reverseReceive (recusa se já foi consumido/reservado,
           // em vez do GREATEST(0,...) cru que pisava em 0 e escondia furo).
           if (extra > 0) {
+            produtosTocados.push(item.product_id);
             await StockService.reverseReceive(client, item.product_id, warehouseId, POOLED_OP_ID, extra, {
               refType: 'travel', refId: id, userId,
               opKey: `travel:${id}:item:${item.id}:delete:revert-extra:${extra}`,
@@ -416,6 +450,7 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
         for (const item of itemsRes.rows) {
           const qtyOut = Number(item.quantity_out);
           if (qtyOut > 0) {
+            produtosTocados.push(item.product_id);
             await StockService.release(client, item.product_id, warehouseId, POOLED_OP_ID, qtyOut, {
               refType: 'travel', refId: id, userId,
               opKey: `travel:${id}:item:${item.id}:delete:release:${qtyOut}`,
@@ -431,7 +466,9 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
       await createLog(userId, 'APAGAR_VIAGEM', { id_viagem: id, status_anterior: status }, getClientIp(req), client);
     });
 
-    if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
+    if ((req as any).io) (req as any).io.emit('travel_orders_update');
+    // BW item 3-i: era `io.emit('stock_updated')` NU (sem payload). Agora carrega os produtos.
+    emitStockChanged(produtosTocados, (req as any).io);
     res.json({ success: true, message: 'Confronto apagado e estoque restaurado com sucesso.' });
   } catch (err: any) {
     if (err instanceof StockError) return res.status(400).json({ error: err.message });

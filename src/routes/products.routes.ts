@@ -10,6 +10,7 @@ import {
     updatePurchaseInfo,
     reactivateProduct,
     getInactiveProducts,
+  getProductImage,
     updateProductPrices 
 } from '../controllers/products.controller';
 
@@ -31,6 +32,29 @@ router.get('/low-stock', authenticate, requirePermission('estoque_critico'), get
 
 // 🗑️ Rota para procurar produtos inativos (fantasmas) - DEVE vir antes das rotas com /:id
 router.get('/inactive', authenticate, requirePermission('produtos:view'), getInactiveProducts);
+
+/**
+ * @route GET /products/:id/image
+ * @description A FOTO do produto, em BYTES (lote BW). A listagem deixou de carregar `image_url`
+ *              (eram 89,1% do payload) e passou a mandar só `has_image`; quem precisa da foto vem
+ *              aqui. Decodifica o data URI guardado em `products.image_url` e responde com o
+ *              Content-Type real (image/jpeg ou image/png — medido: 51 e 26).
+ *
+ * CACHE: ETag FORTE derivado do conteúdo + `Cache-Control: private, max-age=3600, must-revalidate`.
+ *        `If-None-Match` casando devolve 304 sem corpo. É o que impede a troca de "1 payload
+ *        grande" por "N requisições grandes" — sem cache, o item 1 seria um empate.
+ *        `private` porque a rota é autenticada: proxy compartilhado não pode guardar.
+ *
+ * RBAC: `produtos:view` — a MESMA chave da listagem. Quem vê o produto vê a foto dele.
+ *
+ * 404 quando o produto não existe OU não tem imagem (declarado); 415 se o dado não for um data URI
+ * base64 (guard: hoje são 77/77 no padrão, mas formato inesperado vira erro explícito e não uma
+ * imagem quebrada).
+ *
+ * ⚠ ESTE É O DEGRAU PARA O CLOUDFLARE R2. Quando as imagens migrarem, muda só o corpo do
+ * controller — a rota, o contrato e o front continuam iguais.
+ */
+router.get('/:id/image', authenticate, requirePermission('produtos:view'), getProductImage);
 
 // ============================================================================
 // 🛡️ ROTAS DE CRIAÇÃO (Requerem permissão de adição)
