@@ -1559,3 +1559,194 @@ essa leitura falhar, a frase sai **sem** os números em vez de sair com números
 (PB17): o do disponível (reserva alheia, com origens), o do chamador (produto sem linha) e o do
 motor (falta física). Guards em sequência se escondem atrás do primeiro — foi essa régua que pegou
 um erro de instrumento neste mesmo lote.
+
+---
+
+# LOTE S2 — reconstrução da reserva das separações abertas (19/08/2026)
+
+Execução de **script**, não deploy: o backend em produção seguiu em `137fdc4` (o SHA do Lote B).
+O que mudou foi **dado**, não código.
+
+## O que foi feito, e o que ficou de fora
+
+As 7 separações `em_separacao` nasceram antes do motor de reserva existir: elas prometiam material
+sem reservar nada. A reconstrução chamou `StockService.reserve` para cada item com `quantity > 0`,
+na ordem `created_at ASC`, reservando `min(quantity, disponível)`.
+
+| decisão | o que significa |
+|---|---|
+| **S2-1 escopo** | só `em_separacao`. `concluida`/`entregue`/`cancelada` ficaram FORA — nelas o material já saiu ou já foi liberado, e reservar ali criaria material preso sem razão. |
+| **S2-2 lastro parcial** | reserva o mínimo e **NÃO** ajusta `separation_items.quantity`. |
+| **S2-3 ordem** | mais antiga primeiro. As listas disputam o mesmo estoque; quem veio antes leva. |
+| **S2-4 quantity = 0** | 83 itens intocados. Não há reserva a reconstruir onde nada foi lançado. |
+
+## ⚠ S2-2 PRESERVA PROMESSA SEM LASTRO — POR DESENHO
+
+As unidades que não couberam **continuam contando como disponíveis** para todo o resto do sistema,
+inclusive para o guard da saída manual do Lote B. Foi decisão consciente do Bruno com o custo à
+vista: o `quantity` lançado é registro do que o separador contou, e rebaixá-lo apagaria informação.
+O inventário resolve o resto manualmente.
+
+**Quem "consertar" isto depois está desfazendo uma decisão, não corrigindo um bug.**
+
+## Produto ARQUIVADO entrou de propósito
+
+Os 2 itens de `3.04.0049` "CORRENTE ASA 40" (7 unidades, listas do Santinho e do Dalcio) foram
+reservados mesmo com `products.active = false`. Razão do Bruno: **arquivar tira o produto de NOVOS
+pedidos; não invalida lista que já existe, e o material físico está lá.** Não é descuido.
+
+## O contrato do razão
+
+`kind='reserve'` · `ref_type='separation'` · `ref_id` = a separação · `user_id` **NULL** ·
+`reason` = `"Reconstrucao de reserva (Lote S2): separacao aberta antes do motor de reserva"`.
+
+`user_id` fica NULL porque **quem agiu foi um script de manutenção, não uma pessoa**. Carimbar um
+usuário real seria afirmar uma identidade que não agiu — a dívida (f) deste arquivo, ao contrário.
+
+## A op_key, e por que ela é assim
+
+```
+s2:rebuild:separation_item:<separation_items.id>:reserve
+```
+
+**Ancorada no ITEM, não na separação**: uma separação tem N itens e cada um é uma chamada a
+`reserve`; com a chave na separação, o 2º item viraria no-op idempotente e a reserva dele se
+perderia — foi exatamente o defeito que a saída manual pagou com o `byProduct`
+(`stock.controller.ts`).
+
+**SEM a quantidade na chave**: se a quantidade entrasse, uma 2ª execução que calculasse um mínimo
+diferente (porque o disponível mudou) geraria chave nova, o `alreadyApplied` não a reconheceria e a
+reserva seria **somada de novo**. Provado por controle negativo: mesma chave = no-op; chave
+diferente = duplicou.
+
+---
+
+# QUATRO RÉGUAS QUE ESTE LOTE PAGOU PARA APRENDER
+
+A 4ª é a principal: as três primeiras verificam o PLANO; a quarta verifica a PREMISSA do
+plano, e foi a única que este lote não cumpriu a tempo — custou 9 unidades reservadas em
+dobro em produção.
+
+## 1. Plano congelado é INSTRUMENTO DE VERIFICAÇÃO, não documentação
+
+A fase 0 congelou o plano (`plano-m2.json`, 235 reservas / 3.002 unidades) e a fase 1 foi obrigada
+a reproduzi-lo antes de executar. **A regra pegou um defeito real.** A primeira versão do script de
+execução simulava relendo o banco a cada item — e como simulação não escreve, uma lista posterior
+enxergava material que a anterior já tinha levado. Deu `3007/407/238` contra `3002/412/235`.
+
+Os **5 itens divergentes eram todos produtos EM DISPUTA** — exatamente onde a ordem importa, e
+exatamente os casos que a decisão S2-3 existe para governar. Sem o plano congelado, a execução em
+produção teria reservado errado nesses 5 e ninguém teria notado: o total pareceria plausível.
+
+**Régua: quando um lote tem simulação e execução, a simulação vira artefato congelado e a execução
+tem de reproduzi-la ANTES de escrever. Divergência = pare, não "ajuste o número".**
+
+## 2. Relatório de execução consulta o EFEITO, não conta as chamadas
+
+Face inversa do verde falso: **trabalho falso.** A 2ª execução do ensaio reportou
+`reservou 1534 · 180 reservas` com **zero linha nova no razão**. O motor deduplicou corretamente
+pela `op_key`; o relatório é que somava toda chamada a `reserve` como se tivesse reservado, sem
+perguntar se ela virou no-op.
+
+Um laudo assim, em produção, faria alguém acreditar que 1.534 unidades foram reservadas quando nada
+aconteceu — e, pior, esconderia uma re-execução acidental atrás de números que parecem trabalho.
+
+**Régua: o laudo de uma execução mede o banco antes e depois. Contador interno de "quantas vezes
+chamei" não é evidência de efeito.** Corrigido: o script consulta a `op_key` antes e reporta
+`já aplicada`, e o bloco ANTES × DEPOIS passou a esperar **nenhuma** mudança numa re-execução (antes
+ele acusava "INCOERÊNCIA" justamente quando a idempotência funcionava — reprovando o acerto).
+
+---
+
+## 3. Em banco vivo, invariante se afirma por MEMBRO — nunca por SUM() global
+
+O laudo da execução acusou `✗ físico total em stock 377340.35 → 377342.35`. A reconstrução só chama
+`reserve`, que tem `dOnHand = 0` por construção — ela **não pode** mexer no físico. Medido:
+
+```
+linhas s2:rebuild = 235  ·  Σ delta_on_hand = 0        ✓ a reconstrução não tocou o físico
+movimentos de físico nos 30 min: receive/entry n=2, Δ=+2, às 12:42:32Z
+   4.09.0078  Δ=+1   "Entrada de estoque (NFe)"
+   4.09.0079  Δ=+1   "Entrada de estoque (NFe)"
+Σ = 2  → explica exatamente o +2
+```
+
+Alguém deu entrada de NF-e enquanto o script rodava. **Produção é viva**, e um `SUM()` sobre a
+tabela inteira mede o mundo, não o efeito do lote.
+
+**Régua: em banco com tráfego, invariante de laudo se afirma por MEMBRO (as linhas que este lote
+escreveu, identificadas pela op_key), não por agregado global.** O agregado serve de indicador —
+quando ele acusa, a investigação é obrigatória —, mas não pode ser o critério de aprovação: ou
+produz falso alarme como aqui, ou pior, um movimento concorrente compensa o do lote e o agregado
+fica verde escondendo um erro real.
+
+---
+
+## 4. PREMISSA DE ESTADO tem de ser MEDIDA NO ESCOPO, não herdada do briefing
+
+**A régua principal deste lote, e a única que ele violou.**
+
+O S2 partiu de: *"as 7 separações abertas nasceram antes do motor de reserva e não reservam nada"*.
+**Deixou de ser verdade em 17-18/08**: o fluxo NORMAL de separação já tinha reservado **23 unidades
+em 7 produtos dessas mesmas listas** (`ref_type='separation'`, reason `"Reserva de separação"`).
+
+A reconstrução reservou `min(quantity, disponível)` sem descontar **o que aquela mesma separação já
+tinha reservado**. O guard do disponível absorveu a maior parte — em `3.02.0384`, `3.02.0542` e
+`3.02.1103` o S2 reservou **0**, e em `3.01.0162` e `3.02.0803` fechou exato. Onde havia físico
+sobrando, duplicou:
+
+| SKU | lista | promete | pré-S2 | S2 | total | excesso |
+|---|---|---|---|---|---|---|
+| `3.01.0105` | FÁBIO BOLDT | 8 | 6 | 8 | 14 | **6** |
+| `3.02.0967` | IGOR KERCKHOFF | 3 | 3 | 3 | 6 | **3** |
+
+**O sinal estava na medição e ninguém puxou o fio.** O M5 reportou `separation Σdelta_reserved = 21`
+e até sinalizou que divergia do 23 do briefing — mas o número foi lido como "reserva de outras
+separações", não como "reserva DESTAS". A medição que faltava não era mais volume: era a
+**pergunta certa** — *reserva já existente POR SEPARAÇÃO DO ESCOPO*, par a par.
+
+**Por que a divergência do Catálogo não teria pegado sozinha:** ela é por PRODUTO e soma TODAS as
+origens, então um par com excesso pode ficar invisível quando o mesmo produto tem outra origem em
+falta compensando. A varredura par a par não permite compensação — foi ela que fechou o número.
+
+**Régua: verificar o plano não basta. Antes de executar, MEÇA a premissa do plano dentro do escopo
+exato do lote, com a granularidade em que ela pode ser violada.** Se a premissa é sobre separações,
+meça por separação; agregado por origem é grosso demais para prová-la.
+
+### A correção, e por que o razão guarda os dois lados
+
+Soltas as 9 unidades com `StockService.release` (motor intocado — ele já faz `min(qty, reserved)`
+sob trava), **uma transação**, `op_key` própria
+`s2:fix:excesso:separation:<sep>:product:<produto>:release`, reason declarando que é correção do
+excesso do S2.
+
+**As 235 linhas `s2:rebuild` continuam no razão.** Decisão do Bruno: o rastro do erro E o da
+correção, em vez de banco limpo com história apagada. Daqui a seis meses, quem olhar aqueles dois
+produtos vai encontrar a reserva errada, a data, e o release que a desfez — em vez de um número que
+mexeu sozinho.
+
+Depois da correção: **248 pares · 246 fecham · 11 com falta (a regra S2-2b, intocada) · 0 com
+excesso · 0 órfãos.**
+
+---
+
+# ⚠ ep-holy-fog PERDEU A FIDELIDADE DE CLONE
+
+O ensaio deste lote **escreveu de verdade** na branch:
+
+```
++3.227 unidades reservadas · +231 linhas de razão (s2:rebuild) · 2 re-execuções por cima
+```
+
+A branch `br-lively-pond-aea8kl9o` (compute `ep-holy-fog-ae2zjra2`) **não é mais cópia fiel de
+produção**. Isso afeta **todos os lotes futuros** que a usarem para prova:
+
+- medições de reserva/disponível na branch agora carregam o efeito do S2;
+- qualquer lote que precise da branch como cópia limpa **tem de recriá-la a partir de produção**
+  antes de medir;
+- a branch continua servindo para provar **mecanismo** (guards, idempotência, contratos), que foi
+  para o que ela serviu aqui — o que ela deixou de garantir é **fidelidade de número**.
+
+Ver [[branch-de-ensaio-permanente]]: a decisão de 18/08 de "não fabricar estado na branch" foi
+conscientemente rompida aqui, porque o ensaio de um script que escreve **exige** escrever. O custo
+é este, e está declarado em vez de descoberto depois por alguém que confiou num número.
