@@ -2155,3 +2155,119 @@ Instalado com `npm install --no-save` **no repo real**, nunca dentro do worktree
 **A contagem de referência do backend passou de 173 para 176 entradas.** Registrado aqui porque o
 desmonte confere esse número: usar o 173 antigo faria o próximo desmonte acusar dano que não
 existe — ou, pior, esconder um dano real de 3 pastas.
+
+## LOTE PG1 — o endpoint agregado do Armazém da Produção, e o teto que nasceu com ele
+
+### Por que um endpoint novo em vez de um laço no front
+
+A tela mostrava UMA OP por vez, atrás de um `<select>`. Para mostrar todas — que é o pedido — o
+front teria de chamar `GET /op-materials/balance/:csid` uma vez por OP: **16 requisições no
+mount**, medido em produção em 19/08/2026. O lote BW subiu hoje cortando 89% do payload da
+listagem de produtos; trocar 1 GET por 16 desfaria no mesmo dia o que acabou de subir.
+
+`GET /op-materials/warehouse` faz o **mesmo cálculo**, com a **mesma fórmula** (`SALDO_SQL`),
+agrupado por OP além de por produto. Não há conta nova: é o mesmo dado, agregado diferente. A
+prova confere as 4 linhas **campo a campo** contra o `/balance/:csid` de cada OP, nos dois
+sentidos (nada a mais, nada a menos).
+
+### A contenção veio no desenho, não depois
+
+A lição do `/separations` — o único dos 8 endpoints que subiu sem janela e teve de ser remendado.
+Aqui a contenção é dupla:
+
+1. **Só vêm OPs que têm material.** É `INNER JOIN` a partir de `op_material_events`, não `LEFT
+   JOIN` a partir de `client_services`. **16 OPs abertas → 3 na resposta.** O corte é semântico
+   antes de ser de banda: OP sem recebimento não tem o que mostrar nesta tela.
+2. **Teto de 200 OPs, com aviso honesto.** `?limit` clampado em `[1, 200]`; a resposta declara
+   `total_ops` e `truncado`, e a tela exibe "Mostrando N de M". Truncar em silêncio é o que faz
+   uma tela parecer completa sem estar.
+
+**Tamanho medido e projetado:**
+
+```
+hoje ............  3 OPs ·     4 linhas ->   1,27 KB   (~324 B/linha)
+100 OPs × 10 ....         1.000 linhas -> ~316 KB      (projeção linear)
+teto 200 × 10 ...         2.000 linhas -> ~633 KB      e aí truncado=true
+referência ...... /products depois do BW = 679 KB
+```
+
+**Se a projeção de 100 OPs virar realidade, o próximo passo é paginar por OP — não aumentar o
+teto.** Registrado aqui para que a decisão não se tome por inércia.
+
+### RBAC: nenhuma chave, e isso foi decisão
+
+O briefing pedia "a mesma chave que já abre o Armazém hoje". **Não há chave.** Todos os GETs de
+`/op-materials` exigem só `authenticate` (`opMaterials.routes.ts`), mesmo critério dos GETs de
+`/producao-3d`. `producao:apontar` gateia **escrita** (`receive`/`consume`/`transfer`).
+
+Exigir a chave no GET novo seria **mais restritivo que a tela de hoje** e tiraria o Armazém de
+quem já o vê — mudança de RBAC disfarçada de otimização. A rota nova segue o critério existente,
+e a prova mostra os dois lados: 401 sem token (igual ao `/balance`), 200 para papel sem
+`producao:apontar`.
+
+### `/balance/:csid` intocado, e provado
+
+A tela de Apontamentos e a de Montagem o consomem. A prova compara o conjunto de chaves com o do
+commit-base e conta as **linhas removidas** do controller pelo lote: **zero**. O lote só
+acrescenta.
+
+### Uma asserção que passou A VAZIO — e por que fica registrada
+
+PB2 afirma que material com saldo 0 vem na resposta (a tela o marca "Consumido"). **Na branch de
+ensaio não existe nenhum material zerado**, então a asserção passou sem medir nada.
+
+O que sustenta o comportamento é estrutural, não medido: `getWarehouseByOp` **não tem nenhum
+filtro de saldo** (`HAVING`/`WHERE saldo`) — verificado por ausência no corpo da função — e a
+prova PB1b mostrou igualdade campo a campo com o `/balance/:csid`, que devolve linha zerada por
+decisão documentada. A prova do FRONT cobre o caso de verdade, com fixture que tem 1 material
+zerado e cardinalidade contra constante.
+
+**Régua: asserção que passa a vazio é asserção que não provou nada. Ou se constrói o caso, ou se
+declara o vazio — nunca se conta como verde.**
+
+### RÉGUA — "ASSERÇÃO QUE PASSA A VAZIO NÃO CONTA COMO VERDE"
+
+Irmã do *verde falso é pior que vermelho*. Ali o verde MENTE; aqui o verde está **VAZIO** — não
+mediu nada, e parece idêntico a um que mediu.
+
+O caso: PB2 afirma que material com saldo 0 vem na resposta. **Não existe nenhum material zerado
+na branch de ensaio**, então a asserção passou sem tocar em dado nenhum. Escrita como
+`!comSaldoZero || zerados.length > 0`, ela é verdadeira por vacuidade — e some no meio de 20
+linhas verdes sem nada a distingui-la.
+
+O que sustenta o comportamento não é aquela linha:
+
+- **estrutura**, verificada por ausência: `getWarehouseByOp` não tem nenhum filtro de saldo
+  (`HAVING` / `WHERE saldo`) — as duas únicas ocorrências no arquivo estão num comentário e no
+  `getOpSummary`, ambos pré-existentes;
+- **PB1b**, que provou igualdade campo a campo com o `/balance/:csid`, o qual devolve linha zerada
+  por decisão documentada;
+- **a prova do FRONT**, que é quem realmente mede: fixture com 1 material zerado e cardinalidade
+  contra constante (1 badge, 5 cards sem badge).
+
+**Ou se constrói o caso, ou se declara o vazio. Nunca se conta como verde.** Uma asserção que
+depende de o banco ter um exemplo é uma asserção que se desliga sozinha no dia que o exemplo sai.
+
+### DÍVIDA NOMEADA — leitura de `/op-materials` não tem RBAC
+
+Não é deste lote e não foi criada por ele: **todos** os GETs do módulo (`balance`,
+`pending-receipts`, `events`, `summary` e agora `warehouse`) exigem só `authenticate`. Qualquer
+usuário logado lê o razão de material de qualquer OP.
+
+`producao:apontar` gateia **escrita** (`receive`/`consume`/`transfer`) — a leitura ficou sem chave
+desde a migration 008, pelo mesmo critério dos GETs de `/producao-3d`.
+
+O lote PG1 **seguiu** o critério em vez de divergir: exigir chave só na rota nova seria mais
+restritivo que a tela de hoje e tiraria o Armazém de quem já o vê, sem passar por decisão de RBAC.
+Fica nomeado aqui para que a decisão, quando vier, seja tomada para o módulo inteiro — não rota a
+rota, que é como matrizes de permissão ficam incoerentes.
+
+### O comentário que contradizia a prova
+
+O bloco de contenção do endpoint dizia `100 OPs ≈ 130 KB` e `teto ≈ 260 KB`. Eram **estimativas
+escritas antes de medir**. A resposta real deu **324 B por linha**: 100 OPs ≈ **316 KB**, teto ≈
+**633 KB** — quase o dobro, e perto dos 679 KB do `/products` pós-BW.
+
+Corrigido para o número medido, com a fonte marcada no próprio comentário ("MEDIDO (não
+estimado)"). **Comentário que contradiz a prova é pior que comentário nenhum:** o próximo a ler
+confia nele e decide errado, e o número inventado sobrevive ao autor.

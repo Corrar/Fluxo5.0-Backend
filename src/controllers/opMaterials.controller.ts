@@ -526,6 +526,120 @@ export const getOpEvents = async (req: Request, res: Response) => {
 //    recebimentos_pendentes: linhas da MESMA query da fila do Recebimento (condições idênticas
 //    ao pending-receipts — se divergirem, o KPI mente sobre a fila).
 // ==========================================================================
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// ARMAZÉM DA PRODUÇÃO — o saldo de TODAS as OPs abertas numa resposta só (lote PG1).
+//
+// POR QUE EXISTE: a tela mostrava UMA OP por vez, atrás de um <select>. Para mostrar todas de
+// uma vez o front teria de disparar um GET /balance/:csid por OP — 16 requisições no mount, hoje.
+// O lote BW acabou de cortar 89% do payload da listagem de produtos; trocar 1 GET por 16 andaria
+// na direção contrária. Este endpoint faz o MESMO cálculo do /balance/:csid, agregado por OP
+// além de por produto: mesma fonte, mesma fórmula (SALDO_SQL), um agrupamento a mais.
+//
+// ⚠ O /balance/:csid CONTINUA INTOCADO — a tela de Apontamentos e a de Montagem o usam.
+//
+// CONTENÇÃO, DECIDIDA AGORA E NÃO DEPOIS (a lição do /separations, o único dos 8 que subiu sem
+// janela e teve de ser remendado):
+//
+//   1. SÓ VÊM OPs QUE TÊM MATERIAL. É um INNER JOIN a partir de op_material_events, não um
+//      LEFT JOIN a partir de client_services. OP aberta sem nenhum recebimento não tem o que
+//      mostrar nesta tela — e é a maioria: medido em produção em 19/08/2026, 16 OPs abertas,
+//      apenas 3 com material. O corte é semântico antes de ser de banda.
+//
+//   2. TETO DE OPs, com aviso honesto. `limit` clampado em [1, MAX_OPS]; a resposta declara
+//      `total_ops` e `truncado` para que a tela possa dizer "mostrando N de M" em vez de mentir
+//      por omissão. Truncar em silêncio é o que faz uma tela parecer completa quando não está.
+//
+//   TAMANHO MEDIDO (não estimado) — resposta real do endpoint, 19/08/2026:
+//     hoje ......... 3 OPs · 4 linhas  ->  1,27 KB   (324 B por linha, medido)
+//     100 OPs × 10 . 1.000 linhas      ->  ~316 KB   (projeção linear sobre os 324 B)
+//     teto 200 × 10  2.000 linhas      ->  ~633 KB   e aí `truncado` acende.
+//   Para efeito de comparação: a listagem /products depois do BW são 679 KB — ou seja, no TETO
+//   este endpoint chegaria ao tamanho da maior resposta da casa. Se a projeção de 100 OPs virar
+//   realidade, o próximo passo é PAGINAR POR OP, não aumentar o teto.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+const MAX_OPS_ARMAZEM = 200;
+
+export const getWarehouseByOp = async (req: Request, res: Response) => {
+  const bruto = Number(req.query.limit);
+  const limite = Number.isFinite(bruto) && bruto > 0 ? Math.min(Math.trunc(bruto), MAX_OPS_ARMAZEM) : MAX_OPS_ARMAZEM;
+  try {
+    // Quantas OPs abertas TÊM material — a constante contra a qual o truncamento se declara.
+    // Consulta separada e barata (só conta), para que `total_ops` não dependa da janela.
+    const totalRes = await pool.query(
+      `SELECT COUNT(DISTINCT e.client_service_id)::int AS n
+         FROM op_material_events e
+         JOIN client_services cs ON cs.id = e.client_service_id
+        WHERE cs.status <> 'concluido'`,
+    );
+    const totalOps = totalRes.rows[0]?.n ?? 0;
+
+    // `status <> 'concluido'` e não `= 'em_andamento'`: OP_STATUS_VALIDOS tem os dois valores
+    // hoje (clients.controller.ts:106), e se um terceiro estado nascer amanhã, "não concluída"
+    // continua sendo a leitura certa de "ainda está com material na mão".
+    const { rows } = await pool.query(
+      `WITH ops AS (
+         SELECT DISTINCT cs.id, cs.op_code
+           FROM op_material_events e
+           JOIN client_services cs ON cs.id = e.client_service_id
+          WHERE cs.status <> 'concluido'
+          ORDER BY cs.op_code ASC
+          LIMIT $1
+       )
+       SELECT ops.id AS client_service_id, ops.op_code, cl.name AS client_name,
+              e.product_id, p.sku, p.name, p.unit,
+              COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'recebido'), 0)        AS recebido,
+              COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'consumido'), 0)       AS consumido,
+              COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'devolvido'), 0)       AS devolvido,
+              COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'transferido_in'), 0)  AS transferido_in,
+              COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'transferido_out'), 0) AS transferido_out,
+              ${SALDO_SQL} AS saldo
+         FROM ops
+         JOIN op_material_events e ON e.client_service_id = ops.id
+         JOIN products p           ON p.id = e.product_id
+         JOIN client_services cs   ON cs.id = ops.id
+         LEFT JOIN clients cl      ON cl.id = cs.client_id
+        GROUP BY ops.id, ops.op_code, cl.name, e.product_id, p.sku, p.name, p.unit
+        ORDER BY ops.op_code ASC, p.name ASC`,
+      [limite],
+    );
+
+    // Monta o agrupamento em JS e não em json_agg: a ORDEM importa para a grade, e json_agg sem
+    // ORDER BY herda a ordem do executor (régua do Lote 0). O ORDER BY do SELECT acima já entrega
+    // as linhas na ordem certa; aqui só se preserva.
+    const porOp = new Map<string, any>();
+    for (const r of rows) {
+      const k = String(r.client_service_id);
+      if (!porOp.has(k)) {
+        porOp.set(k, {
+          client_service_id: r.client_service_id,
+          op_code: r.op_code,
+          client_name: r.client_name || '',
+          materiais: [],
+        });
+      }
+      porOp.get(k).materiais.push({
+        product_id: r.product_id, sku: r.sku, name: r.name, unit: r.unit,
+        recebido: num(r.recebido), consumido: num(r.consumido), devolvido: num(r.devolvido),
+        transferido_in: num(r.transferido_in), transferido_out: num(r.transferido_out),
+        // Linha com saldo 0 VEM (a tela a marca "Consumido"): "recebi 10 e consumi 10" é
+        // informação, não ausência — a mesma decisão do /balance/:csid, palavra por palavra.
+        saldo: num(r.saldo),
+      });
+    }
+    const ops = Array.from(porOp.values());
+
+    return res.json({
+      ops,
+      total_ops: totalOps,
+      truncado: totalOps > ops.length,
+      limite,
+    });
+  } catch (error: any) {
+    console.error(JSON.stringify({ event: 'opmat_warehouse_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao carregar o armazém da produção' });
+  }
+};
+
 export const getOpSummary = async (_req: Request, res: Response) => {
   try {
     const [wip, apont, pend] = await Promise.all([

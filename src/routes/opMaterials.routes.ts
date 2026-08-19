@@ -8,6 +8,7 @@ import {
   getPendingReceipts,
   getOpEvents,
   getOpSummary,
+  getWarehouseByOp,
 } from '../controllers/opMaterials.controller';
 import { authenticate, requirePermission } from '../middlewares/auth';
 
@@ -35,5 +36,11 @@ router.get('/balance/:clientServiceId', getOpBalance);
 router.get('/pending-receipts', getPendingReceipts);
 router.get('/events/:clientServiceId', getOpEvents);
 router.get('/summary', getOpSummary);
+// Armazem da Producao: TODAS as OPs abertas com material, numa resposta so (lote PG1).
+// ⚠ SEM chave de permissao, DE PROPOSITO: nenhum GET deste modulo tem uma hoje (a linha acima e
+// as tres anteriores exigem so `authenticate`, mesmo criterio dos GETs de /producao-3d).
+// `producao:apontar` gateia ESCRITA. Exigi-la aqui seria mais restritivo que a tela atual e
+// tiraria o Armazem de quem hoje o ve — mudanca de RBAC disfarcada de otimizacao.
+router.get('/warehouse', getWarehouseByOp);
 
 export default router;
