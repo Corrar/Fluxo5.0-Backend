@@ -1730,23 +1730,149 @@ excesso · 0 órfãos.**
 
 ---
 
-# ⚠ ep-holy-fog PERDEU A FIDELIDADE DE CLONE
+# ⚠ A BRANCH DE ENSAIO — o host mudou, e a nota anterior CADUCOU
 
-O ensaio deste lote **escreveu de verdade** na branch:
+**Esta seção substitui a que dizia "ep-holy-fog perdeu a fidelidade de clone". Ela não vale mais.**
+
+Em 19/08, horas depois do S2, `ep-holy-fog-ae2zjra2` **expirou por TTL de 24h** e sumiu — a
+credencial passou a devolver `password authentication failed`, o que à primeira vista parece
+rotação de senha e não expiração. O Bruno criou uma branch NOVA a partir de produção, **sem
+expiração**:
 
 ```
-+3.227 unidades reservadas · +231 linhas de razão (s2:rebuild) · 2 re-execuções por cima
+host de ensaio ATUAL : ep-sweet-sound-aedu64i1.c-2.us-east-2.aws.neon.tech
+host ANTIGO (morto)  : ep-holy-fog-ae2zjra2        (expirado, não existe mais)
 ```
 
-A branch `br-lively-pond-aea8kl9o` (compute `ep-holy-fog-ae2zjra2`) **não é mais cópia fiel de
-produção**. Isso afeta **todos os lotes futuros** que a usarem para prova:
+**A fidelidade de clone foi RECUPERADA.** A branch nova nasceu de produção DEPOIS do S2 e traz as
+235 linhas `s2:rebuild` + 2 `s2:fix`, reservado 9.565 — conferido antes de usar. As 3.227 unidades
+que o ensaio do S2 escreveu morreram com a branch antiga. **Quem for medir número na branch pode
+confiar de novo** — o que continua valendo é não ASSUMIR: conferir a assinatura do clone antes.
 
-- medições de reserva/disponível na branch agora carregam o efeito do S2;
-- qualquer lote que precise da branch como cópia limpa **tem de recriá-la a partir de produção**
-  antes de medir;
-- a branch continua servindo para provar **mecanismo** (guards, idempotência, contratos), que foi
-  para o que ela serviu aqui — o que ela deixou de garantir é **fidelidade de número**.
+## ⚠ É A SEGUNDA VEZ QUE A EXPIRAÇÃO MORDE
 
-Ver [[branch-de-ensaio-permanente]]: a decisão de 18/08 de "não fabricar estado na branch" foi
-conscientemente rompida aqui, porque o ensaio de um script que escreve **exige** escrever. O custo
-é este, e está declarado em vez de descoberto depois por alguém que confiou num número.
+A régua **"branch de ensaio SEM expiração"** já estava escrita neste arquivo desde o incidente
+anterior — a branch que expirou e derrubou o serviço. Ela foi perdida na criação da `ep-holy-fog`,
+e o preço foi pago de novo: um lote parado no meio das provas, com o sintoma disfarçado de erro de
+senha.
+
+**Régua reafirmada, agora com o modo de falha junto:** branch de ensaio nasce **sem TTL**, e a
+verificação do cofre inclui **conectar** — não basta o arquivo existir e o host parecer certo. Uma
+branch expirada e uma senha errada dão a MESMA mensagem; só o `SELECT 1` distingue "não existe" de
+"não autoriza".
+
+## O guard bimodal precisou de manutenção — e a allowlist continuou explícita
+
+A allowlist do modo `ensaio` tinha `ep-holy-fog-ae2zjra2` cravado, então **recusaria a string nova
+e legítima**. Atualizada para o host novo, com o antigo movido para a **lista negra nomeada**: uma
+string vencida esquecida em algum script é recusada **pelo nome**, antes de conectar, em vez de
+falhar depois com erro de senha.
+
+**Não se afrouxou para "qualquer host que não seja produção".** A allowlist explícita é o que
+segurou o dia inteiro; trocá-la por uma lista negra sozinha faria qualquer host novo e desconhecido
+passar. Os dois controles foram provados de novo — positivo (a string do cofre passa) e negativo
+(produção, 2.0, validação, a branch expirada, `-pooler`, vazia e host desconhecido abortam), com
+contador de `pg` em **zero**.
+
+
+---
+
+# LOTE S1 — adicionar item na lista RESERVA na hora (19/08/2026)
+
+A lista prometia material que ninguém segurava: `createSeparation` inseria `quantity = 0` e a
+reserva só nascia na ação `'reservar'`. Entre uma coisa e outra, quem chegasse depois levava. Agora
+adicionar **reserva**, como no 2.0.
+
+O comentário do código dizia *"Criação NÃO reserva (idêntico ao 2.0)"*. A primeira metade era o
+defeito; a segunda era **falsa** — o 2.0 reservava ao lançar a lista. Corrigido junto.
+
+| campo | significado |
+|---|---|
+| `qty_requested` | **o PEDIDO** — a intenção do cliente. NUNCA é rebaixado pelo saldo do momento. |
+| `quantity` | **o RESERVADO** — o que o estoque conseguiu segurar. |
+
+"Faltam N" = `qty_requested − quantity`. O cartão da tela **já** exibia esse cálculo
+(`separacoes.jsx`, badge `Faltam {qtd − sep}`); o que faltava era o caso existir.
+
+## ⚠ DUAS GERAÇÕES DE separation_item convivendo
+
+Decisão do Bruno: `quantity` vira "reserva" **só para itens novos**. Os anteriores ao S1 ficam como
+estão — alinhá-los desfaria o S2-2(b), cravado e medido horas antes, sem fato novo.
+
+| geração | `quantity` significa | como distinguir |
+|---|---|---|
+| **anterior ao S1** | a intenção do separador (pode exceder a reserva real) | não há coluna que marque. **O discriminante é o RAZÃO**: some `delta_reserved` das linhas com `ref_type='separation'` e `ref_id` da separação; se for **menor** que `Σ quantity` dos itens dela, é geração antiga. Medido em 19/08: **11 pares (separação, produto) com gap, Σ 398 unidades**, todos nas 7 listas abertas. |
+| **a partir do S1** | a reserva efetiva | `Σ delta_reserved` bate com `Σ quantity`, e existe linha `…:reserve:create` no razão |
+
+**Dívida com prazo de validade natural:** as 7 listas serão entregues e a geração antiga some
+sozinha. Não há migração planejada.
+
+**A exposição concreta enquanto durar** (medida, não deduzida): nesses 11 pares o
+`authorizeSeparation` calcula `diff = newQty − quantity` contra um `quantity` que superestima a
+reserva. Confirmar o valor atual → `diff = 0` → nada reserva, e a promessa segue sem lastro em
+silêncio. Baixar o valor → `release` do gap, capado pelo reservado GLOBAL do produto: **em 6 dos 11
+pares isso comeria 1 unidade de reserva de OUTRO documento** (6 no total); nos outros 5 o `min()`
+do motor capa o estrago.
+
+## Reserva parcial é política do CHAMADOR
+
+`StockService.reserve` é tudo-ou-nada (`RESERVA_INSUFICIENTE`) e **continua assim** — quem promete
+material inteiro precisa saber que não coube. A separação é o caso em que o parcial É o desejado,
+então o mínimo é calculado no chamador (`reservarOQueHouver`): `SELECT … FOR UPDATE` na linha do
+ALMOX pooled, `min(pedido, disponível)`, `reserve` com o mínimo. **`stock.service.ts` intocado** —
+mesma doutrina do guard do Lote B e do script do S2.
+
+O `FOR UPDATE` vem **antes** da conta. Ler o disponível fora da trava é TOCTOU: outra transação
+reserva no meio e o `reserve` estoura `RESERVA_INSUFICIENTE` dentro de uma criação de separação.
+
+## Reduzir o pedido LIBERA o excesso
+
+`updateSeparation` atualizava `qty_requested` e **nunca** ajustava a reserva. Inofensivo antes;
+depois do S1 seria a doença que o S2 curou — baixar de 10 para 3 com 10 reservadas deixaria 7
+presas sem promessa, reserva órfã idêntica às 9 unidades corrigidas em 19/08. Agora libera, com
+`op_key` content-addressed no pedido ALVO (`…:release:req:<pedido>`).
+
+## Dívidas registradas, NÃO consertadas
+
+**`src/utils/concurrency.ts` é CÓDIGO MORTO INTEIRO.** `updateWithVersion`, `claimPickLine`,
+`markPicked`, `releasePickLine` — **zero chamadores** em todo o repo. Os três últimos mexem só em
+`picked_*`; o `updateWithVersion` é **genérico e escreveria qualquer coluna**, inclusive `quantity`,
+com controle de versão otimista que ninguém exercita. É superfície de risco parada: se alguém o
+ligar sem ler este parágrafo, ganha um caminho de escrita em `separation_items` que não passa por
+nenhuma das regras deste lote.
+
+**A ressalva do M0.** "Criar não reserva" está confirmada **pelo CÓDIGO** (`quantity = 0` literal,
+sem `StockService`) e pela ausência de qualquer linha de reserva para separação `pendente` no
+razão. **Não há caso vivo observado**: há ZERO separações em `pendente` hoje. Declarado como
+confirmado por código, não por observação — a diferença importa se alguém for reabrir a premissa.
+
+**Lista abandonada trava material.** Com reserva na entrada, uma lista esquecida segura estoque até
+alguém cancelar. A mais antiga viva é de **02/06** (78 dias). Decisão pendente do Bruno: prazo
+automático × disciplina manual. **Não implementado** — nem prazo, nem alerta.
+
+## A RÉGUA QUE ESTE LOTE PAGOU — identificar por PROXY não é identificar
+
+O harness pegava "a última separação" ordenando por `created_at DESC`. Dentro de uma transação
+**`now()` é CONSTANTE**: todas as fixtures nascem com o MESMO timestamp, empatam, e o desempate por
+uuid devolve **qualquer uma**. O PV6 editou a separação errada — a reserva subiu de 10 para 13 em
+vez de cair para 3, porque o produto entrou como item NOVO numa lista que não era a dele.
+
+O sintoma parecia defeito do produto (a liberação do excesso não funcionava). Não era: era o
+instrumento apontando para o alvo errado. Corrigido para **identidade** — o id da separação sai do
+`item_id` que a própria resposta do `createSeparation` devolve.
+
+**Régua: identificar por PROXY (timestamp, ordem, "o último", "o maior") não é identificar. Use a
+identidade que a operação devolveu.** É a mesma família da régua 4 do S2 — assumir que o proxy
+identifica em vez de MEDIR que ele identifica. Lá era a premissa do plano; aqui é a premissa do
+instrumento. As duas custaram uma execução errada.
+
+## O guard ganhou LISTA NEGRA NOMEADA, além da allowlist
+
+Quando `ep-holy-fog` expirou, a string velha continuou existindo em scripts e no `.env` de quem a
+tivesse copiado. Sem lista negra, o guard a trataria como "host desconhecido" e o processo só
+descobriria o problema **ao conectar**, com `password authentication failed` — mensagem que parece
+credencial errada e esconde que o banco **não existe mais**.
+
+Com o host antigo NOMEADO na lista negra, a recusa acontece **antes de abrir socket** e diz qual
+banco morto foi tentado. A allowlist explícita continua sendo quem autoriza; a lista negra só
+melhora o diagnóstico do que já seria recusado.

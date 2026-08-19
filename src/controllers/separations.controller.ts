@@ -21,6 +21,50 @@ class SeparationGuardError extends Error {
   }
 }
 
+/**
+ * Reserva O QUE HOUVER: `min(desejado, disponível)`, e devolve quanto foi reservado.
+ *
+ * ⚠ POR QUE ISTO EXISTE E POR QUE NÃO É MÉTODO DO MOTOR. `StockService.reserve` é tudo-ou-nada
+ * (lança `RESERVA_INSUFICIENTE`), e está certo assim: quem promete material inteiro precisa saber
+ * que não coube. A separação é o caso em que reservar o parcial É o comportamento desejado (a
+ * decisão do Bruno: adiciona o pedido inteiro, reserva o que houver, marca "Faltam N"). Isso é
+ * política do CHAMADOR, não do motor — mesmo raciocínio do guard do Lote B e do script do S2.
+ * `stock.service.ts` não foi tocado.
+ *
+ * ⚠ O `FOR UPDATE` é obrigatório e vem ANTES da conta. Ler o disponível fora da trava é TOCTOU:
+ * outra transação reserva entre a leitura e o `reserve`, e aí o `reserve` estoura
+ * RESERVA_INSUFICIENTE no meio de uma criação de separação. Sob a trava, o `reserve` logo abaixo
+ * relê a MESMA linha já travada por esta transação.
+ *
+ * Sem linha de estoque para o produto devolve 0 (não há o que reservar) em vez de deixar o motor
+ * lançar PRODUTO_SEM_ESTOQUE: aqui a ausência de saldo é "faltam todas", não erro de operação.
+ */
+async function reservarOQueHouver(
+  client: any,
+  productId: string,
+  warehouseId: string,
+  opId: string | null,
+  desejado: number,
+  refs: { refId: string; userId: string; opKey: string; reason: string },
+): Promise<number> {
+  if (!(desejado > 0)) return 0;
+  const { rows } = await client.query(
+    `SELECT quantity_on_hand::float8 AS oh, quantity_reserved::float8 AS rv FROM stock
+      WHERE product_id = $1 AND warehouse_id = $2 AND op_id IS NOT DISTINCT FROM $3::uuid
+      FOR UPDATE`,
+    [productId, warehouseId, opId],
+  );
+  if (rows.length === 0) return 0;
+  const disponivel = Number(rows[0].oh) - Number(rows[0].rv);
+  const reservar = Math.max(0, Math.min(desejado, disponivel));
+  if (reservar <= 0) return 0;
+  await StockService.reserve(client, productId, warehouseId, opId, reservar, {
+    refType: 'separation', refId: refs.refId, userId: refs.userId,
+    opKey: refs.opKey, reason: refs.reason,
+  });
+  return reservar;
+}
+
 export const getSeparations = async (req: Request, res: Response) => {
   try {
     // RETRY explícito: era `pool.query` CRU, fora do wrapper do db.ts — origem conhecida do 500
@@ -53,29 +97,63 @@ export const createSeparation = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   // 🟢 Recebe o client_service_id do frontend
   const { client_name, production_order, destination, items, client_service_id } = req.body;
+  const produtosTocados: string[] = [];
+  let reservasDoItem: Array<{ item_id: string; product_id: string; qty_requested: number; reserved: number; missing: number }> = [];
   try {
     validatePositiveItems(items);
 
     await withTransaction(async (client) => {
+      const warehouseId = await resolveWarehouseId(client, userId);
       const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
       if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Sem permissão.');
 
-      // Guardamos o client_service_id oficialmente. Criação NÃO reserva (idêntico ao 2.0):
-      // a reserva nasce na ação 'reservar' de authorizeSeparation.
       const sepRes = await client.query(
         `INSERT INTO separations (destination, client_name, production_order, status, type, client_service_id) VALUES ($1, $2, $3, 'pendente', 'op', $4) RETURNING id`,
         [destination, client_name, production_order, client_service_id || null]
       );
+      const sepId = sepRes.rows[0].id;
 
+      // ── ADICIONAR JÁ RESERVA (Lote S1) ───────────────────────────────────────────────────────
+      // O comentário que estava aqui dizia "Criação NÃO reserva (idêntico ao 2.0)". A segunda
+      // metade era FALSA: o 2.0 reservava ao lançar a lista. Era a primeira que valia, e ela é o
+      // defeito — a lista prometia material que ninguém segurava, e quem chegasse depois levava.
+      //
+      // `qty_requested` = O PEDIDO (o que o cliente quer).
+      // `quantity`      = O RESERVADO (o que o estoque conseguiu segurar AGORA).
+      // Quando não cabe tudo, o item entra com o pedido INTEIRO e a reserva parcial; a diferença
+      // é o "Faltam N" da tela. NÃO se rebaixa `qty_requested` — a intenção do cliente é registro,
+      // não consequência do saldo do momento.
       for (const item of items) {
-        await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation) VALUES ($1, $2, $3, 0, $4)`, [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
+        const pedido = Number(item.quantity);
+        const itemRes = await client.query(
+          `INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation) VALUES ($1, $2, $3, 0, $4) RETURNING id`,
+          [sepId, item.product_id, pedido, item.observation || null]
+        );
+        const itemId = itemRes.rows[0].id;
+        // op_key ancorada no ITEM (id fresco a cada criação) — a régua do S2: na separação, o 2º
+        // item viraria no-op idempotente e a reserva dele se perderia.
+        const reservado = await reservarOQueHouver(client, item.product_id, warehouseId, POOLED_OP_ID, pedido, {
+          refId: sepId, userId,
+          opKey: `separation:${sepId}:item:${itemId}:reserve:create`,
+          reason: 'Reserva ao adicionar item na separação',
+        });
+        if (reservado > 0) {
+          await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [reservado, itemId]);
+          produtosTocados.push(item.product_id);
+        }
+        reservasDoItem.push({ item_id: itemId, product_id: item.product_id, qty_requested: pedido, reserved: reservado, missing: pedido - reservado });
       }
 
-      await createLog(userId, 'CRIAR_SEPARACAO', { id_separacao: sepRes.rows[0].id, cliente: client_name }, getClientIp(req), client);
+      await createLog(userId, 'CRIAR_SEPARACAO', { id_separacao: sepId, cliente: client_name }, getClientIp(req), client);
     });
 
     if ((req as any).io) (req as any).io.emit('separations_update');
-    res.status(201).json({ success: true });
+    // A criação passou a MOVER RESERVA, então precisa do aviso de saldo — 'separations_update'
+    // fala da separação e nenhuma tela de estoque o escuta.
+    emitStockChanged(produtosTocados, (req as any).io);
+    // Resposta ENRIQUECIDA: a tela precisa do id do item (que antes só chegava no reload) e do
+    // "reservou N de M" para marcar o incompleto SEM tratar como erro. Chave nova, aditiva.
+    res.status(201).json({ success: true, items: reservasDoItem });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
@@ -257,7 +335,7 @@ export const updateSeparation = async (req: Request, res: Response) => {
       );
 
       // Compara itens antigos com novos
-      const existingItemsRes = await client.query('SELECT id, product_id, quantity FROM separation_items WHERE separation_id = $1', [id]);
+      const existingItemsRes = await client.query('SELECT id, product_id, quantity, qty_requested FROM separation_items WHERE separation_id = $1', [id]);
       const existingItems = existingItemsRes.rows;
       const newProductIds = items.map((i: any) => i.product_id);
 
@@ -277,13 +355,61 @@ export const updateSeparation = async (req: Request, res: Response) => {
         }
       }
 
-      // Adiciona novos itens ou atualiza a quantidade solicitada dos existentes
+      // ── Adiciona novos itens (JÁ RESERVADOS) ou ajusta o pedido dos existentes ───────────────
       for (const item of items) {
         const exists = existingItems.find((old) => old.product_id === item.product_id);
-        if (exists) {
-          await client.query('UPDATE separation_items SET qty_requested = $1 WHERE id = $2', [item.quantity, exists.id]);
-        } else {
-          await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [id, item.product_id, item.quantity]);
+        const pedido = Number(item.quantity);
+
+        if (!exists) {
+          // ITEM NOVO NA EDIÇÃO: nasce reservado, igual ao de criação. Antes nascia com
+          // quantity = 0 e só ganhava lastro no 'reservar' — a janela em que a lista promete sem
+          // segurar nada é exatamente o buraco que este lote fecha.
+          const novo = await client.query(
+            `INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0) RETURNING id`,
+            [id, item.product_id, pedido]
+          );
+          const novoId = novo.rows[0].id;
+          const reservado = await reservarOQueHouver(client, item.product_id, warehouseId, POOLED_OP_ID, pedido, {
+            refId: id, userId,
+            opKey: `separation:${id}:item:${novoId}:reserve:create`,
+            reason: 'Reserva ao adicionar item na separação',
+          });
+          if (reservado > 0) {
+            await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [reservado, novoId]);
+            produtosTocados.push(item.product_id);
+          }
+          continue;
+        }
+
+        const reservadoHoje = parseFloat(exists.quantity || 0);
+        await client.query('UPDATE separation_items SET qty_requested = $1 WHERE id = $2', [pedido, exists.id]);
+
+        if (pedido > reservadoHoje) {
+          // PEDIDO SUBIU (ou o item estava incompleto): tenta cobrir a diferença com o que houver.
+          // op_key content-addressed no pedido ALVO — repetir a mesma edição é no-op; uma edição
+          // diferente gera chave nova. (Se a quantidade entrasse na chave "quanto reservei", uma
+          // 2ª tentativa com disponível diferente reservaria em DOBRO — a lição da op_key do S2.)
+          const reservado = await reservarOQueHouver(client, exists.product_id, warehouseId, POOLED_OP_ID, pedido - reservadoHoje, {
+            refId: id, userId,
+            opKey: `separation:${id}:item:${exists.id}:reserve:req:${pedido}`,
+            reason: 'Reserva ao aumentar o pedido do item',
+          });
+          if (reservado > 0) {
+            await client.query('UPDATE separation_items SET quantity = quantity + $1 WHERE id = $2', [reservado, exists.id]);
+            produtosTocados.push(exists.product_id);
+          }
+        } else if (pedido < reservadoHoje) {
+          // ⚠ PEDIDO CAIU ABAIXO DO RESERVADO: LIBERA O EXCESSO. Sem isto o S1 CRIA a doença que
+          // o S2 curou — baixar de 10 para 3 com 10 reservadas deixaria 7 unidades presas sem
+          // promessa nenhuma por trás, reserva órfã idêntica às 9 que foram corrigidas em 19/08.
+          const excesso = reservadoHoje - pedido;
+          await StockService.release(client, exists.product_id, warehouseId, POOLED_OP_ID, excesso, {
+            refType: 'separation', refId: id, userId,
+            opKey: `separation:${id}:item:${exists.id}:release:req:${pedido}`,
+            reason: 'Libera excesso ao reduzir o pedido do item',
+          });
+          await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [pedido, exists.id]);
+          produtosTocados.push(exists.product_id);
         }
       }
 
