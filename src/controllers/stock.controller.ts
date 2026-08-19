@@ -9,6 +9,12 @@ import { StockService, StockError } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
 import {
+  getReservationBreakdown,
+  assertWithdrawalWithinAvailable,
+  breakdownToPayload,
+  SaidaAcimaDoDisponivelError,
+} from '../services/reservations';
+import {
   registerPendingReturns,
   conferReturn as conferReturnCore,
   rejectReturn as rejectReturnCore,
@@ -52,51 +58,88 @@ export const getStock = async (req: Request, res: Response) => {
   }
 };
 
+// GET /stock/:id/reservations — LEGADO. Reescrito no Lote B para DELEGAR ao helper de origens.
+//
+// ⚠ ROTA SEM CONSUMIDOR CONHECIDO. `grep -rn "reservations" fluxo-royale-react/src` devolve zero:
+// nenhuma tela chama. Foi MANTIDA (código morto recebe comentário, não `git rm`) e CORRIGIDA, não
+// deletada. Se continuar sem ninguém ligar, é candidata natural a remoção numa faxina futura.
+//
+// O que ela lia até aqui estava errado nas QUATRO origens, e o registro do que era está no
+// DIVIDAS.md — importa saber que existiu um leitor errado, não só que foi consertado. O pior era
+// `quantity_requested` no lugar de `qty_reserved`: quantidade PEDIDA não é quantidade RESERVADA, e
+// depois de entrega parcial as duas divergem, então a soma nunca poderia fechar com
+// `stock.quantity_reserved`. O segundo pior era `s.status = 'em_separacao'`, que não é o status com
+// que `separations.controller.ts:66` CRIA a separação ('pendente') — separação nova reservava
+// estoque e ficava invisível aqui.
+//
+// SHAPE PRESERVADO: segue devolvendo o array achatado de sempre ({ request_id, sector, quantity }).
+// Só a FONTE mudou. Quem (um dia) ligar nesta rota continua recebendo o que o contrato dizia.
 export const getStockReservations = async (req: Request, res: Response) => {
   const { id } = req.params;
   try {
-    const stockCheck = await pool.query('SELECT product_id FROM stock WHERE id = $1', [id]);
+    const stockCheck = await pool.query(
+      'SELECT product_id, warehouse_id, op_id FROM stock WHERE id = $1',
+      [id],
+    );
 
     if (stockCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Estoque não encontrado' });
     }
 
-    const productId = stockCheck.rows[0].product_id;
-    let reservations: any[] = [];
+    const { product_id, warehouse_id, op_id } = stockCheck.rows[0];
+    const breakdown = await getReservationBreakdown(pool, product_id, {
+      warehouseId: warehouse_id,
+      opId: op_id,
+    });
 
-    const reqRes = await pool.query(`
-      SELECT r.id as request_id, COALESCE(pf.sector, r.sector) as sector, ri.quantity_requested as quantity
-      FROM request_items ri
-      JOIN requests r ON ri.request_id = r.id
-      LEFT JOIN profiles pf ON r.requester_id = pf.id
-      WHERE ri.product_id = $1 AND r.status IN ('aberto', 'aprovado') AND ri.quantity_requested > 0
-    `, [productId]);
-
-    const travelRes = await pool.query(`
-      SELECT t.id as request_id, 'Viagem: ' || t.city as sector, ti.quantity_out as quantity
-      FROM travel_order_items ti
-      JOIN travel_orders t ON ti.travel_order_id = t.id
-      WHERE ti.product_id = $1 AND t.status IN ('pending', 'awaiting_stock') AND ti.quantity_out > 0
-    `, [productId]);
-
-    const sepRes = await pool.query(`
-      SELECT s.id as request_id, 'Separação OP: ' || s.client_name as sector, si.quantity as quantity
-      FROM separation_items si
-      JOIN separations s ON si.separation_id = s.id
-      WHERE si.product_id = $1 AND s.status = 'em_separacao' AND si.quantity > 0
-    `, [productId]);
-
-    const repRes = await pool.query(`
-      SELECT rep.id as request_id, 'Reposição: ' || rep.client_name as sector, ri.quantity as quantity
-      FROM replenishment_items ri
-      JOIN replenishments rep ON ri.replenishment_id = rep.id
-      WHERE ri.product_id = $1 AND rep.status = 'em_preparo' AND ri.quantity > 0
-    `, [productId]);
-
-    reservations.push(...reqRes.rows, ...travelRes.rows, ...sepRes.rows, ...repRes.rows);
-    res.json(reservations);
+    // Achatamento para o shape histórico. `label` do helper entra como `sector` porque era esse o
+    // campo que a rota usava para carregar o rótulo humano ("Viagem: São Paulo", "Reposição: ...").
+    res.json(breakdown.origins.map((o) => ({
+      request_id: o.documentId,
+      sector: o.label,
+      quantity: o.quantity,
+    })));
   } catch (error: any) {
     res.status(500).json({ error: 'Erro ao buscar reservas vinculadas' });
+  }
+};
+
+// GET /stock/reservations/product/:productId — CONSULTA DE RESERVA (D-B4).
+//
+// Abrir o produto no Catálogo responde "quanto está reservado e por quem" SEM o operador precisar
+// tentar uma saída e tomar erro. Mesmo helper do guard: se este payload divergir do que a recusa
+// mostra, há duplicação de query em algum lugar (é o que a PB9 mede).
+//
+// Chaveado por PRODUTO, não por linha de estoque, porque o Catálogo não tem o id da linha —
+// `adapters.js:104` grava `stock_id: null` com o comentário "GET /products NÃO expõe o id da linha
+// de stock". Cobrar `stock.id` aqui obrigaria a tela a um GET /stock inteiro só para traduzir id.
+//
+// READ-ONLY: nenhum INSERT/UPDATE, `lockRow` fica em false (default) — não trava linha de estoque.
+// D-B5: NÃO existe contrapartida de escrita. Não há "liberar reserva" nem "reservar mais" aqui, e
+// não é esquecimento — a reserva é a promessa de um DOCUMENTO, e soltá-la por fora deixaria o
+// documento sem lastro, que é exatamente a doença que este lote mata. A ação mora no documento.
+export const getProductReservations = async (req: Request, res: Response) => {
+  const { productId } = req.params;
+  try {
+    const prod = await pool.query('SELECT id, name, sku, unit FROM products WHERE id = $1', [productId]);
+    if (prod.rows.length === 0) {
+      return res.status(404).json({ error: 'Produto não encontrado' });
+    }
+
+    // Mesmo alvo que a saída manual mede: (produto, ALMOX, pooled). `resolveWarehouseId` devolve
+    // ALMOX nesta fase e é a única linha que reserva — ancorar aqui é ancorar no mesmo lugar.
+    const warehouseId = await resolveWarehouseId(pool);
+    const breakdown = await getReservationBreakdown(pool, productId, {
+      warehouseId,
+      opId: POOLED_OP_ID,
+    });
+
+    res.json({
+      product: { id: prod.rows[0].id, name: prod.rows[0].name, sku: prod.rows[0].sku, unit: prod.rows[0].unit },
+      ...breakdownToPayload(breakdown),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao consultar reservas do produto' });
   }
 };
 
@@ -308,11 +351,25 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
             [separationId, product_id, quantity, obsByProduct.get(product_id) ?? null]
           );
 
-          // consume: baixa física + libera reserva (motor valida FURO_ESTOQUE).
-          // op_key ancorado no header + produto agregado -> reenvio da MESMA chave NÃO duplica saldo.
-          await StockService.consume(client, product_id, warehouseId, POOLED_OP_ID, quantity, {
+          const opKey = `withdrawal:${idemKey}:product:${product_id}:consume`;
+
+          // GUARD DO DISPONÍVEL (D-B1) — RAMO IDEMPOTENTE. Vai aqui, colado na baixa, porque ele
+          // trava a linha (FOR UPDATE) e a baixa vai travar a MESMA: medir antes da trava seria
+          // TOCTOU. A op_key é a MESMA que o motor recebe, senão o pulo de idempotência do guard
+          // mediria uma chave e o motor outra.
+          await assertWithdrawalWithinAvailable(client, product_id, quantity, {
+            warehouseId, opId: POOLED_OP_ID, excludeSeparationId: separationId, opKey,
+          });
+
+          // reverseReceive, NÃO consume: baixa SÓ o físico e deixa `quantity_reserved` INTOCADO.
+          // Ver a nota grande no fim de manualWithdrawal para o porquê — em resumo: com `consume`
+          // o guard acima era contornável em dois passos, porque a baixa apagava a reserva alheia
+          // e o disponível "voltava". Sem tocar a reserva, o guard passa a ser SUFICIENTE.
+          // op_key INALTERADA (ainda termina em `:consume`) — trocar a string quebraria a
+          // idempotência das saídas já registradas. Ver DIVIDAS.md.
+          await StockService.reverseReceive(client, product_id, warehouseId, POOLED_OP_ID, quantity, {
             refType: 'separation', refId: separationId, userId,
-            opKey: `withdrawal:${idemKey}:product:${product_id}:consume`,
+            opKey,
             reason: 'Saída manual de estoque',
           });
         }
@@ -328,15 +385,55 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
             [separationId, item.product_id, item.quantity, item.observation || null]
           );
           const itemId = itemRes.rows[0].id;
+          const opKey = `separation:${separationId}:item:${itemId}:consume`;
 
-          // consume: baixa física + libera reserva correspondente (motor valida FURO_ESTOQUE).
-          await StockService.consume(client, item.product_id, warehouseId, POOLED_OP_ID, Number(item.quantity), {
+          // GUARD DO DISPONÍVEL (D-B1) — RAMO LEGADO. Mesmo guard, mesmo lugar (colado no consume).
+          // Aqui a checagem é POR ITEM e não por produto agregado, e isso está certo: o consume
+          // deste item comita o novo saldo na linha travada antes de o laço chegar no próximo, então
+          // dois itens do MESMO produto são medidos contra o disponível já debitado pelo primeiro —
+          // o teto vale para a soma sem precisar agregar nada.
+          await assertWithdrawalWithinAvailable(client, item.product_id, Number(item.quantity), {
+            warehouseId, opId: POOLED_OP_ID, excludeSeparationId: separationId, opKey,
+          });
+
+          // reverseReceive, NÃO consume — mesma troca do ramo idempotente, mesmo motivo.
+          await StockService.reverseReceive(client, item.product_id, warehouseId, POOLED_OP_ID, Number(item.quantity), {
             refType: 'separation', refId: separationId, userId,
-            opKey: `separation:${separationId}:item:${itemId}:consume`,
+            opKey,
             reason: 'Saída manual de estoque',
           });
         }
       }
+
+      // ═══════════════════════════════════════════════════════════════════════════════════════
+      // POR QUE A SAÍDA MANUAL USA reverseReceive E NÃO consume (Lote B)
+      // ═══════════════════════════════════════════════════════════════════════════════════════
+      // `consume` faz `reserved -= min(qty, reserved)`: baixa o físico E solta reserva. Isso está
+      // CERTO para quem cumpre a PRÓPRIA reserva — a entrega de solicitação (43 dos 46 `consume`
+      // do razão são `ref_type='request'`) e a entrega de separação. A saída manual é o contrário:
+      // ela não tem documento reservando por ela, então toda reserva que encontra é ALHEIA.
+      //
+      // Só o guard acima não bastava — MEDIDO (PB13): com on_hand=100 e reserved=40, uma saída de
+      // 60 (== disponível, aprovada com razão) deixava 40/0 em vez de 40/40. A reserva evaporava,
+      // o documento seguia aberto sem lastro, o disponível "voltava" para 40 e uma SEGUNDA saída
+      // de 40 era aprovada pelo mesmo guard. Em dois passos o guard era contornado.
+      //
+      // `reverseReceive` reduz SÓ `quantity_on_hand` e nunca toca `quantity_reserved` — é
+      // exatamente o que o comentário dele no motor já dizia ("consume liberaria reserva alheia —
+      // furo"). Com ele a reserva fica de pé, o disponível não volta, e o guard vira SUFICIENTE.
+      // Não é caminho novo na casa: `travels.controller.ts:182` já baixa físico assim, pelo mesmo
+      // motivo ("a reserva já foi").
+      //
+      // ⚠ A TROCA É SÓ AQUI. Nenhum outro chamador de `consume` muda, e `stock.service.ts` não foi
+      // tocado: o mesmo `min()` é acerto na entrega e erro na saída manual, e quem sabe a diferença
+      // é o chamador.
+      //
+      // ⚠ O RAZÃO PASSA A TER DUAS ASSINATURAS para saída manual: as antigas com `kind='consume'`,
+      // as novas com `kind='adjust'` (o CHECK do stock_ledger não tem 'reverse'). `ref_type` segue
+      // 'separation' e `ref_id` segue o separationId, então o vínculo com o documento não se perde.
+      // Quem lê histórico de saída precisa saber — está no DIVIDAS.md, junto com o leitor de BI
+      // que filtra por `kind='consume'` e deixa de contar estas saídas.
+      // ═══════════════════════════════════════════════════════════════════════════════════════
 
       await createLog(userId, 'MANUAL_WITHDRAWAL', { separationId, sector }, getClientIp(req), client);
     });
@@ -347,8 +444,55 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
 
     res.status(201).json({ success: true });
   } catch (error: any) {
-    // Erro de domínio do motor (furo de estoque) -> 400 tratado, não 500 cru.
-    if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    // RECUSA POR RESERVA ALHEIA (D-B1/D-B2) -> 400 com as ORIGENS NO CORPO. O front NÃO faz uma 2ª
+    // chamada para descobrir quem reservou: o payload do erro já traz agregado, origens rotuladas
+    // com o id do documento para linkar, e a diferença declarada (D-B3).
+    // A transação já sofreu ROLLBACK no withTransaction -> a separação e os separation_items que
+    // tinham sido inseridos antes do guard sumiram junto. Recusa = ZERO movimento (PB1).
+    if (error instanceof SaidaAcimaDoDisponivelError) {
+      return res.status(400).json({
+        error: error.message,
+        code: error.code,
+        reservation: breakdownToPayload(error.breakdown),
+      });
+    }
+
+    // FALTA FÍSICA REAL -> traduzida para o vocabulário da SAÍDA.
+    //
+    // Quando falta material de verdade (qty > on_hand) o guard de disponível NÃO dispara de
+    // propósito — é reserva que ele explica, não falta física — e a recusa desce para o motor.
+    // Com `consume` isso vinha como FURO_ESTOQUE; com `reverseReceive` vem como
+    // SALDO_INSUFICIENTE_REVERSAO, cuja mensagem fala em "reverter"/"reversão": vocabulário de
+    // CORREÇÃO DE ENTRADA, que não descreve nada do que o operador fez numa tela de Saída.
+    //
+    // A tradução mora AQUI, na fronteira, e não no motor: `reverseReceive` é usado por outros
+    // chamadores (viagens, produção 3D) onde "reverter" é a palavra CERTA. Quem sabe que este
+    // caminho é uma saída de material é este controller.
+    //
+    // O `code` é o do MOTOR, sem invenção — só o texto muda. Os números vêm de uma releitura do
+    // saldo (a transação já sofreu ROLLBACK, então o que se lê é o estado real que o operador tem
+    // pela frente); se essa leitura falhar, a mensagem sai sem eles em vez de sair errada.
+    if (error instanceof StockError && error.code === 'SALDO_INSUFICIENTE_REVERSAO') {
+      let detalhe = '';
+      try {
+        const { rows } = await pool.query(
+          `SELECT quantity_on_hand::float8 AS oh, quantity_reserved::float8 AS rv FROM stock
+            WHERE product_id = $1 AND warehouse_id = $2 AND op_id IS NOT DISTINCT FROM $3::uuid`,
+          [error.productId, error.warehouseId, error.opId ?? null],
+        );
+        if (rows[0]) detalhe = ` Há ${rows[0].oh} em estoque, ${rows[0].rv} reservado(s).`;
+      } catch { /* sem números é melhor que com números errados */ }
+      return res.status(400).json({
+        error: `Saldo físico insuficiente para esta saída.${detalhe}`,
+        code: 'SALDO_INSUFICIENTE_REVERSAO',
+      });
+    }
+
+    // Demais erros de domínio do motor -> 400 tratado, não 500 cru. Inclui o PRODUTO_SEM_ESTOQUE
+    // que o guard lança quando o produto não tem LINHA de estoque — caso distinto de "não há o
+    // bastante", e que o `reverseReceive` sozinho não distinguiria (o `ensureAndLock` dele cria a
+    // linha 0/0 antes de recusar). Ver services/reservations.ts.
+    if (error instanceof StockError) return res.status(400).json({ error: error.message, code: error.code });
 
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });

@@ -5,6 +5,7 @@ import { authenticate, requirePermission } from '../middlewares/auth';
 import {
   getStock,
   getStockReservations,
+  getProductReservations,
   updateStock,
   manualWithdrawal,
   getOpMaterialsForReturn,
@@ -37,9 +38,31 @@ router.use(authenticate);
 router.get('/', getStock);
 
 /**
+ * @route GET /stock/reservations/product/:productId
+ * @description CONSULTA DE RESERVA (D-B4): agregado + origens + diferença de um produto, para o
+ *              Catálogo mostrar quanto está reservado e POR QUEM sem o operador tentar a saída.
+ * @param {string} productId - O ID do PRODUTO (não o da linha de stock: o Catálogo não tem esse id).
+ *
+ * RBAC: `produtos:view` — a mesma chave do `GET /products` (products.routes.ts:23), que é o que
+ * abre o Catálogo onde esta consulta vive. Ancorar no `GET /stock/` seria ancorar em nada: aquela
+ * rota não exige permissão alguma além do token do `router.use(authenticate)` acima.
+ *
+ * READ-ONLY, sem efeito colateral. Não existe contrapartida de escrita aqui de propósito (D-B5).
+ *
+ * ⚠ ORDEM DE REGISTRO: esta rota vem ANTES de `/:id/reservations` de propósito. As duas não
+ * colidem hoje (3 segmentos contra 2, e o Express casa por contagem de segmento), mas o custo de
+ * registrar a estática primeiro é zero e a regra vale para qualquer rota que venha depois.
+ */
+router.get('/reservations/product/:productId', requirePermission('produtos:view'), getProductReservations);
+
+/**
  * @route GET /stock/:id/reservations
  * @description Retorna a lista de reservas ativas para um item específico.
  * @param {string} id - O ID do item de estoque.
+ *
+ * ⚠ LEGADO SEM CONSUMIDOR CONHECIDO — mantida e corrigida no Lote B, não deletada. Passou a
+ * delegar ao mesmo helper das outras duas (ver nota no controller); as 4 divergências que ela
+ * tinha estão no DIVIDAS.md. Se seguir sem ninguém ligar, é candidata a remoção futura.
  */
 router.get('/:id/reservations', getStockReservations);
 

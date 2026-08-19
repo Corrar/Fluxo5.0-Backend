@@ -59,15 +59,33 @@ export const getReportsBi = async (req: AuthRequest, res: Response) => {
 
     // ── 1 e 2. CAPITAL ENTRADO / SAÍDO ────────────────────────────────────────
     // A fonte é o RAZÃO (stock_ledger), não as telas: é ele que registra todo movimento com
-    // carimbo. 'receive' é entrada de material; 'consume' é baixa efetiva.
+    // carimbo. 'receive' é entrada de material; baixa efetiva é o `SAIDA` abaixo.
     // 'opening' fica DE FORA de propósito — é a carga inicial do saldo, não compra; contá-la
     // como capital entrado inflaria o número com estoque que nunca foi adquirido no período.
+    //
+    // ⚠ POR QUE A BAIXA NÃO É SÓ `kind='consume'` (Lote B, 19/08/2026).
+    // A saída manual deixou de usar `StockService.consume` e passou a usar `reverseReceive` —
+    // ela não pode soltar reserva alheia (ver a nota em stock.controller.manualWithdrawal e o
+    // DIVIDAS.md). `reverseReceive` grava `kind='adjust'`, então a partir daquele lote TODA saída
+    // manual sumiria destes dois números, em silêncio. Medido na branch de ensaio antes do push:
+    // R$ 251,00 de R$ 25.002,93 (1,0% do KPI) — pequeno na foto, mas é a fatia que cresce, e cair
+    // sem aviso é o pior jeito de um KPI errar.
+    //
+    // O discriminante é `ref_type`, não o `kind` sozinho: `adjust` + `separation` é a saída manual
+    // e mais nada (medido: ZERO linhas com esse par antes do lote, então não há ambiguidade
+    // histórica). Os outros `adjust` da casa carregam ref_type próprio — `stock_recount`
+    // (recontagem), `stock_adjust` (ajuste manual de inventário), `travel`, `production_3d`.
+    //
+    // ⚠ NÃO trocar por `kind IN ('consume','adjust')`: isso passaria a contar recontagem de
+    // inventário e ajuste manual como CAPITAL SAÍDO, inflando o KPI com correção de saldo — que
+    // não é material saindo pela porta.
+    const SAIDA = `(l.kind = 'consume' OR (l.kind = 'adjust' AND l.ref_type = 'separation'))`;
     const capital = await pool.query(
       `SELECT
-         COALESCE(SUM(l.delta_on_hand * ${PRECO}) FILTER (WHERE l.kind = 'receive'), 0)::numeric(14,2)      AS entrado,
-         COALESCE(SUM(ABS(l.delta_on_hand) * ${PRECO}) FILTER (WHERE l.kind = 'consume'), 0)::numeric(14,2) AS saido,
+         COALESCE(SUM(l.delta_on_hand * ${PRECO}) FILTER (WHERE l.kind = 'receive'), 0)::numeric(14,2)  AS entrado,
+         COALESCE(SUM(ABS(l.delta_on_hand) * ${PRECO}) FILTER (WHERE ${SAIDA}), 0)::numeric(14,2)       AS saido,
          COUNT(*) FILTER (WHERE l.kind = 'receive')::int AS n_entradas,
-         COUNT(*) FILTER (WHERE l.kind = 'consume')::int AS n_saidas
+         COUNT(*) FILTER (WHERE ${SAIDA})::int           AS n_saidas
        FROM stock_ledger l
        JOIN products p ON p.id = l.product_id
       WHERE l.created_at >= $1::date

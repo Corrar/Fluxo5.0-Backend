@@ -1384,3 +1384,178 @@ direta ou indiretamente (por um teto como `repTetoDe`), a decisão de QUANTO sub
 endpoint? Se as duas forem SIM → `[FILTRAR ALMOX]`. Se o número só aparece num card/relatório sem
 submit nenhum atrás → `[MANTER TOTAL]`. Não decidir por analogia com um leitor parecido — decidir
 pelo contrato medido, como os nove acima (seis ALMOX + três TOTAL).
+
+---
+
+# LOTE B — saída manual barra contra o disponível (19/08/2026)
+
+## Por que o guard é do CHAMADOR e o motor não mudou
+
+`StockService.consume` mede `on_hand` e faz `releaseQty = Math.min(qty, cur.reserved)`. É esse
+`Math.min` que come a reserva alheia na saída manual — e a tentação é consertá-lo. **Não se
+conserta ali.** Medido no razão: **52 dos 56 `consume` são `ref_type='request'`**, ou seja, a
+ENTREGA de uma solicitação cumprindo a **própria** reserva, onde baixar o físico e soltar a reserva
+junto é exatamente o comportamento certo. A mesma linha é acerto num chamador e erro no outro;
+quem sabe se a reserva é própria ou alheia é **quem chama**. Por isso o guard mora em
+`services/reservations.ts` e `stock.service.ts` **não foi tocado neste lote** (diff vazio, provado).
+
+## O leitor de reservas que estava errado (getStockReservations)
+
+`GET /stock/:id/reservations` existia desde antes e lia as quatro origens com filtro e coluna
+**divergentes em todas as quatro**. Fica registrado o que ele era — importa saber que existiu um
+leitor errado, não só que foi consertado:
+
+| origem | o que ele lia | o que a fase 0 mediu |
+|---|---|---|
+| Solicitações | `ri.quantity_requested` · `r.status IN ('aberto','aprovado')` | `ri.qty_reserved` · **sem** filtro de status |
+| Separações | `s.status = 'em_separacao'` | `s.status NOT IN ('entregue','cancelada','concluida')` |
+| Reposições | `rep.status = 'em_preparo'` | `rep.status NOT IN ('concluido','cancelada')` |
+| Viagens | `t.status IN ('pending','awaiting_stock')` | `t.status <> 'reconciled'` |
+
+O pior era `quantity_requested`: quantidade **pedida** não é quantidade **reservada**, e depois de
+entrega parcial as duas divergem — a soma nunca poderia fechar com `stock.quantity_reserved`. O
+segundo pior era `'em_separacao'`, que não é o status com que `separations.controller.ts:66` CRIA a
+separação (`'pendente'`): separação nova reservava estoque e ficava **invisível**. A rota foi
+**mantida e corrigida** (delega ao helper, shape de array achatado preservado), não deletada —
+código morto recebe comentário. Segue **sem consumidor conhecido** no front; candidata a remoção
+numa faxina futura.
+
+## D-B3: a diferença é declarada, e o rastro do ajuste manual mora no audit_log
+
+Quando a soma das origens não fecha com o agregado, a resposta **declara a diferença** e não aponta
+culpado. A causa conhecida é o quinto caminho, que reserva **sem documento**: `PUT /stock/:id`
+(`updateStock`) mexe em `quantity_reserved` direto via `reserve`/`release` com `refType
+'stock_adjust'`. **Se um dia precisar do rastro, ele existe**: `audit_logs` com
+`action = 'UPDATE_STOCK'` guarda quem ajustou e quando. Por decisão do Bruno (D-B3) o helper **NÃO**
+consulta o audit_log — declarar a diferença é o contrato; investigar é outra tarefa, com outra tela.
+
+## D-B5: não existe "liberar reserva" na tela, e é decisão, não esquecimento
+
+A reserva é a **promessa de um DOCUMENTO**. Soltá-la por fora deixaria o documento sem lastro — a
+mesma doença que este lote mata. Por isso nem o painel do Catálogo nem a recusa da saída têm ação
+de liberar/reservar: têm **link para o documento**, onde cancelar/reduzir/reconciliar significa
+alguma coisa. Quem acrescentar um botão de ação nessa lista está reabrindo o buraco.
+
+## Escopo do helper: produto × linha de estoque
+
+O agregado é de UMA linha `(produto, armazém, op)`; as origens são do **produto** (os quatro
+documentos não carregam armazém). Os dois casam **porque só o ALMOX pooled reserva** e
+`resolveWarehouseId` devolve ALMOX nesta fase (`warehouse.ts:44`). **Se um dia um setor reservar,
+`getReservationBreakdown` precisa ganhar a dimensão de armazém ANTES de ser usada lá** — hoje ela
+devolveria origens de todo o produto contra o saldo de uma linha só.
+
+## Status NULL nas quatro origens
+
+`NOT IN (...)` e `<> 'x'` devolvem NULL para status NULL, e a linha fica de FORA da soma. É
+deliberado (é o filtro que a fase 0 mediu, com reconciliação 100% em produção) e **não é buraco
+silencioso**: origem que não entra na soma aparece como **diferença declarada**, que é o
+comportamento honesto do D-B3.
+
+## A saída manual usa reverseReceive, não consume — e por que o motor não pôde ser corrigido
+
+O guard sozinho **não bastava**, e isso foi medido antes de decidir (PB13). Com `consume`:
+
+```
+fixture: on_hand=100  reserved=40 (separação viva)   disponível=60
+1ª saída de 60 (== disponível, o guard APROVA e com razão)
+   → on_hand=40  reserved=0   disponível=40   ← a reserva de 40 EVAPOROU
+   → a separação segue aberta prometendo 40, agora sem lastro nenhum
+2ª saída de 40  → o guard APROVA (o disponível "voltou")  → on_hand=0
+```
+
+Em dois passos o guard era contornado. **`StockService.reverseReceive` reduz só
+`quantity_on_hand` e nunca toca `quantity_reserved`**, então o disponível não volta e o guard passa
+a ser **suficiente** — medido na PB15: a 2ª saída agora toma 400. Não é caminho novo na casa:
+`travels.controller.ts:182` já baixa físico assim, pelo mesmo motivo.
+
+**Por que não consertar o `consume` no motor.** Porque para os outros chamadores ele está CERTO:
+**43 dos 46 `consume` do razão são `ref_type='request'`** — a entrega de solicitação cumprindo a
+PRÓPRIA reserva, onde baixar o físico e soltar a reserva junto é o comportamento desejado (a
+entrega de separação é o outro caso legítimo). O mesmo `Math.min` é acerto num chamador e erro no
+outro; quem sabe se a reserva é própria ou alheia é **quem chama**. Por isso `stock.service.ts`
+não foi tocado (diff vazio, provado) e a troca aconteceu em **duas linhas**, só na saída manual.
+
+## ⚠ O RAZÃO PASSA A TER DUAS ASSINATURAS PARA SAÍDA MANUAL
+
+Quem for ler histórico de saída precisa saber disto:
+
+| quando | `kind` | `delta_reserved` | `ref_type` | `ref_id` |
+|---|---|---|---|---|
+| saídas manuais **até este lote** | `consume` | negativo (comia reserva) | `separation` | separationId |
+| saídas manuais **a partir deste lote** | `adjust` | **0** | `separation` | separationId |
+
+`kind='adjust'` porque o CHECK de `stock_ledger` não tem `'reverse'` — é a mesma escolha que
+`reverseReceive` já fazia nos outros chamadores. **`ref_type` e `ref_id` NÃO mudaram**, então o
+vínculo com a separação (e com a OP, por ela) continua de pé. Discriminante para separar a saída
+manual dos outros `adjust`: `kind='adjust' AND ref_type='separation'` — medido na branch de ensaio,
+**zero linhas** hoje, então não há ambiguidade com `stock_recount`, `stock_adjust`, `travel` ou
+`production_3d`.
+
+### O leitor de BI foi fechado no MESMO push que cria a causa
+
+`reportsBi.controller.ts:68/70` calculava **"Capital saído"** e **`n_saidas`** com
+`FILTER (WHERE l.kind = 'consume')`. Com a troca para `reverseReceive` (que grava `kind='adjust'`),
+**toda saída manual sumiria desses dois números, em silêncio, a partir do push**. Medido na branch
+de ensaio antes de decidir: R$ 251,00 de R$ 25.002,93 — **1,0% do KPI** hoje, mas é a fatia que
+cresce conforme a saída manual é usada, e um KPI que cai sem aviso é o pior tipo de erro.
+
+Mesma doutrina do `getInactiveProducts`/`getProducts` no lote TRANSFER: **quem cria a causa fecha o
+leitor no mesmo push.** O filtro passou a ser:
+
+```sql
+(l.kind = 'consume' OR (l.kind = 'adjust' AND l.ref_type = 'separation'))
+```
+
+O discriminante é o `ref_type`, não o `kind` sozinho. Provado (PB19):
+
+| | resultado |
+|---|---|
+| (a) sobre o HISTÓRICO, filtro novo == filtro antigo | R$ 25.002,93 / n=46 nos dois — e o motivo é medido: **zero** linhas `adjust`+`separation` antes do lote |
+| (b) com uma saída manual NOVA | filtro antigo: n_saidas 0→0 (**a regressão**) · filtro novo: 0→1, +R$ 400,00 |
+| (c) recontagem de inventário | fica FORA do KPI (grava `ref_type='stock_recount'`) |
+| (c) controle do jeito ERRADO | `kind IN ('consume','adjust')` **contaria** a recontagem (1→2) |
+
+⚠ Por isso **não** se abre para `kind IN ('consume','adjust')`: recontagem (`stock_recount`) e
+ajuste manual de inventário (`stock_adjust`) viram "capital saído" e inflam o KPI com correção de
+saldo, que não é material saindo pela porta.
+
+**Varredura:** os únicos leitores SQL de `kind='consume'` no repo são essas duas linhas. Nenhum
+outro filtro por `kind` de `stock_ledger` existe fora do motor. `clients.controller.ts` não é
+afetado — o `total_cost` da OP sai de `separations`/`separation_items`, não do razão, e a saída
+manual continua criando os dois.
+
+## ⚠ A op_key continua com o verbo `:consume` — de propósito
+
+As chaves seguem `withdrawal:<idem>:product:<pid>:consume` e
+`separation:<sepId>:item:<itemId>:consume`, mesmo o razão gravando `kind='adjust'`. **Trocar a
+string quebraria a idempotência das saídas já registradas**: um retry de uma saída feita antes do
+deploy chegaria com a chave antiga, não encontraria o dedup, e debitaria de novo. Verbo da chave e
+verbo do razão divergem, e a divergência é o preço de não duplicar baixa. Provado na PB18.
+
+## As DUAS recusas por falta de saldo, e por que precisaram ser separadas
+
+Trocar `consume` por `reverseReceive` **fundiu dois casos que antes eram distintos**, porque o
+`ensureAndLock` do `reverseReceive` CRIA a linha 0/0 antes de recusar:
+
+| caso | antes do lote | depois da troca, sem conserto | agora |
+|---|---|---|---|
+| (i) a linha existe, o saldo não dá | `FURO_ESTOQUE` — "Saldo físico (10) menor que a baixa (99)." | `SALDO_INSUFICIENTE_REVERSAO` — "Não é possível **reverter** 99…" | `SALDO_INSUFICIENTE_REVERSAO` — **"Saldo físico insuficiente para esta saída. Há 10 em estoque, 0 reservado(s)."** |
+| (ii) o produto não tem linha de estoque | `PRODUTO_SEM_ESTOQUE` | `SALDO_INSUFICIENTE_REVERSAO` (a distinção **sumia**) | `PRODUTO_SEM_ESTOQUE` — **"Este produto não tem estoque no almoxarifado — não há saldo para dar saída."** |
+
+Status **400** nos dois; o `code` de cada um é o de antes do lote.
+
+**(ii) voltou a existir no CHAMADOR.** `assertWithdrawalWithinAvailable` lê `hasStockRow` do
+breakdown (que já consultava a linha sob trava) e lança `StockError('PRODUTO_SEM_ESTOQUE', …)`
+antes de o motor ser chamado. O `StockError` é importado do motor — **usar o tipo não é alterar o
+motor**, e reusar o code preserva o contrato de máquina que existia antes.
+
+**(i) é traduzido na fronteira**, no `catch` de `manualWithdrawal`. A tradução mora ali, e não no
+motor, porque `reverseReceive` é usado também por viagens e produção 3D, onde "reverter" é a
+palavra **certa** — quem sabe que este caminho é uma saída de material é o controller. Os números
+vêm de uma releitura do saldo após o ROLLBACK (o estado real que o operador tem pela frente); se
+essa leitura falhar, a frase sai **sem** os números em vez de sair com números errados.
+
+⚠ **Isto significa três guards no caminho da saída manual**, e cada um foi medido falando sozinho
+(PB17): o do disponível (reserva alheia, com origens), o do chamador (produto sem linha) e o do
+motor (falta física). Guards em sequência se escondem atrás do primeiro — foi essa régua que pegou
+um erro de instrumento neste mesmo lote.
