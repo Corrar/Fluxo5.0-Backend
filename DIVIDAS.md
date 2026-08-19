@@ -2053,3 +2053,105 @@ verdade** e precisa de `Remove-Item -Recurse`, não do `cmd /c rmdir` da junctio
 **Régua: depois de qualquer `npm install` num worktree, RECONFERIR se `node_modules` ainda é
 junction antes de desmontar.** Tratar diretório real como junction (ou vice-versa) é como o
 `node_modules` do repo principal foi destruído duas vezes em 17/08.
+
+## LOTE V — a régua de unidade era CINCO cópias, e o banco nunca reclamou
+
+### O que existia
+
+`DECIMAL_UNITS = {M, MT, L, KG}` estava escrita **cinco vezes**: três no front
+(`lib/adapters.js`, `parts/conferencia.jsx`, `parts/pages_main.jsx`) e **duas no backend**
+(`requests.controller.ts:16` e `stock.controller.ts:862`, esta última já com um comentário
+avisando que era espelho da outra). Cinco cópias da mesma decisão de negócio.
+
+Cópia de régua é régua que **diverge em silêncio**: basta alguém acrescentar `'PC'` num lugar
+para o mesmo produto passar num endpoint e ser recusado noutro, sem que nada acuse.
+
+Agora a fonte é `src/utils/quantidade.ts`. A lista **não mudou** ao ser promovida — é byte a byte
+a de `requests.controller.ts`, com o mesmo default seguro (unidade desconhecida = INTEIRA), `UND`
+fora de propósito e `MT` dentro por fidelidade. Os dois pontos antigos delegam.
+
+### O buraco que isso escondia
+
+A régua de unidade existia em **um** ponto de escrita: `requests.controller.ts:503`, na conferência
+da solicitação. **Todos os outros aceitavam fração em unidade de contagem** — separações,
+reposições, viagens, entradas de estoque e saída manual. O banco nunca reclamou: as colunas de
+quantidade são `numeric`, e `2.5` parafusos é um número perfeitamente válido para o Postgres.
+
+Fechado neste lote, nos 5 pontos, com `assertQuantidadesValidas` (uma consulta de unidade por
+requisição) e `assertFracaoPermitida` onde **zero é legítimo** (zerar linha de reposição libera
+reserva — exigir `> 0` ali quebraria a operação).
+
+**A guarda vale só para ESCRITA NOVA.** Nada varre nem invalida o que já está gravado: linha
+antiga com fração em unidade de contagem continua existindo e sendo lida. Só não se cria mais.
+
+### Um 500 que era mentira
+
+Os catches de `stock.controller.ts` mapeiam por **classe** (`StockError`) ou por **sentinela
+nomeada** (`NF_DUPLICADA`, `OP_OBRIGATORIA_TAGS`); `Error` genérico cai em `500`. O mesmo em
+`travels.controller.ts`. A primeira versão da guarda lançava `Error` e a prova mediu **HTTP 500
+com a mensagem certa dentro** — servidor se acusando de defeito por uma requisição errada.
+
+Por isso a guarda lança `QuantidadeInvalidaError`, e o mapeamento para 400 é **explícito** nas
+três rotas que precisavam. `separations` e `replenishments` não precisaram: o catch deles já
+converte `error.message` em 400 — e a prova mostrou os dois devolvendo 400 antes de qualquer
+mudança neles.
+
+**Régua paga aqui: nem todo catch da casa converte `Error` em 400. Guarda nova nasce com CLASSE
+própria, e o 400 se prova pelo código HTTP — não pela mensagem.**
+
+### `sectors` não existe, e `tags` está vazia na branch de ensaio
+
+Duas premissas que o briefing não tinha e a prova mediu:
+
+- **Não há tabela `sectors`.** A fonte de setor é `src/services/setor.ts` (régua do D1). A coluna
+  em `separations` chama-se `destination`, e o corpo do POST `/separations` também.
+  `/stock/manual-withdrawal` usa `sector` no corpo e grava no mesmo `destination`.
+- **Todo produto tem `tags = []` na branch de ensaio.** A isenção de OP da saída manual
+  (`camisetas`/`epi`/`ferramentas`) **não alcança ninguém lá** — toda saída manual exige `op_code`.
+  A prova teve de buscar uma OP aberta real para que o guard de OP passasse em silêncio e a guarda
+  de unidade fosse a única com motivo para falar.
+
+### `compression` estava declarada e não instalada
+
+`package.json` declara `compression` e `@types/compression` desde o lote BW, mas o `node_modules`
+compartilhado (`Backend-Fluxo2.0`, alvo da junction) **nunca os recebeu** — o BW instalou no
+worktree dele, que foi desmontado. `tsc` falhava com `Cannot find module 'compression'` num
+worktree limpo.
+
+Resolvido com `npm install --no-save` **no repo real** (alvo da junction), não no worktree — a
+régua do BW diz que `npm install` dentro do worktree destrói a junction. `package.json` e
+`package-lock.json` ficaram intocados.
+
+**Régua: dependência declarada não é dependência instalada. Worktree novo com junction herda o
+`node_modules` do repo, que pode estar atrás do `package.json`.**
+
+### RÉGUA — silenciar os outros guards para ouvir o que se quer medir
+
+A prova do item 4 na saída manual começou medindo o guard errado: `OP_OBRIGATORIA_TAGS` falava
+primeiro e a guarda de unidade nunca chegava a abrir a boca.
+
+A tentação era afrouxar a fixture (escolher produto isento pelas tags `camisetas`/`epi`/
+`ferramentas`). Medido: **todo produto tem `tags = []` na branch de ensaio** — a isenção não
+alcança ninguém lá. O caminho certo não foi contornar o guard de OP, foi **satisfazê-lo**: buscar
+uma OP aberta de verdade em `client_services`, para que ele passasse em silêncio.
+
+Junto com isso, duas premissas que o briefing não tinha: **não existe tabela `sectors`** (a fonte
+é `src/services/setor.ts`, régua do D1; a coluna é `separations.destination`) e o corpo do POST
+usa `destination` em `/separations` mas `sector` em `/stock/manual-withdrawal`.
+
+**Cenário de recusa só prova alguma coisa quando TUDO o mais está certo. Guard que dispara antes
+do que se quer medir não é ruído a contornar — é fixture a corrigir.**
+
+### LINHA DE BASE DO `node_modules` MUDOU: 176, não 173
+
+`compression` e `@types/compression` estavam no `package.json` desde o lote BW e **nunca chegaram
+ao `node_modules` compartilhado** (`Backend-Fluxo2.0`, alvo das junctions): o BW instalou no
+worktree dele, que foi desmontado junto com a instalação. Um worktree limpo falhava em `tsc` com
+`Cannot find module 'compression'`.
+
+Instalado com `npm install --no-save` **no repo real**, nunca dentro do worktree (a régua do BW:
+`npm install` no worktree destrói a junction). `package.json` e `package-lock.json` intocados.
+
+**A contagem de referência do backend passou de 173 para 176 entradas.** Registrado aqui porque o
+desmonte confere esse número: usar o 173 antigo faria o próximo desmonte acusar dano que não
+existe — ou, pior, esconder um dano real de 3 pastas.

@@ -6,6 +6,7 @@ import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from '../services/warehouse';
 import { emitStockChanged } from '../config/socket';
+import { assertQuantidadesValidas, QuantidadeInvalidaError } from '../utils/quantidade';
 
 // ── changedProducts nos emissores legados (lote BW, item 3-i) ────────────────────────────────
 // Estes emissores mandavam `stock_updated` VAZIO. O front (`lib/stock-refresh.js`) descartava o
@@ -91,6 +92,11 @@ export const createTravelOrder = async (req: Request, res: Response) => {
       );
       const travelId = toRes.rows[0].id;
 
+      // ── GUARDA DE UNIDADE (lote V) ──────────────────────────────────────────────────────
+      // Unidade de CONTAGEM não aceita fração; unidade de MEDIDA aceita. Régua única em
+      // utils/quantidade.ts. RECUSA — não arredonda. Vale só para o que está entrando agora.
+      await assertQuantidadesValidas(client, items as any[]);
+
       for (const item of (items as any[])) {
         const qty = Number(item.quantity);
         // RETURNING id p/ ancorar o fallback SEM header (o id do item é estável dentro da viagem).
@@ -131,6 +137,7 @@ export const createTravelOrder = async (req: Request, res: Response) => {
     emitStockChanged(produtosTocados, (req as any).io);
     return res.status(201).json(result);
   } catch (err: any) {
+    if (err instanceof QuantidadeInvalidaError) return res.status(400).json({ error: err.message });
     if (err instanceof StockError) return res.status(400).json({ error: err.message });
     // Corrida (2 POSTs idênticos com header): o perdedor cai aqui por 23505 (bateu na unique do razão)
     // OU por IDEMPOTENT_REPLAY (o pós-check viu o crédito do vencedor). Em ambos o withTransaction fez

@@ -21,6 +21,7 @@ import {
   listReturnableItems,
   ReturnError,
 } from '../services/returns.service';
+import { assertQuantidadesValidas, isDecimalUnit, QuantidadeInvalidaError } from '../utils/quantidade';
 
 export const getStock = async (req: Request, res: Response) => {
   try {
@@ -269,6 +270,11 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
 
+      // GUARDA DE UNIDADE (lote V): `validatePositiveItems` acima olha o numero, não a unidade.
+      // Régua única em utils/quantidade.ts — RECUSA fração em unidade de contagem, não arredonda.
+      // Throw dentro do withTransaction = ROLLBACK: nenhuma saída sai pela metade.
+      await assertQuantidadesValidas(client, items as any[]);
+
       // =========================================================================
       // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
       // =========================================================================
@@ -494,6 +500,7 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     // linha 0/0 antes de recusar). Ver services/reservations.ts.
     if (error instanceof StockError) return res.status(400).json({ error: error.message, code: error.code });
 
+    if (error instanceof QuantidadeInvalidaError) return res.status(400).json({ error: error.message });
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
     if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP já foi finalizada, verifique a OP correta" });
@@ -749,6 +756,10 @@ export const registerEntries = async (req: Request, res: Response) => {
     await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
 
+      // GUARDA DE UNIDADE (lote V): o check de "numero > 0" acima e' cego a unidade. Aqui, com o
+      // client em maos, a regua unica recusa fracao em unidade de contagem. Throw = ROLLBACK.
+      await assertQuantidadesValidas(client, entries as any[]);
+
       // Bloqueia reenvio de NF já cadastrada (só NFe com número). O op_key já protege o SALDO;
       // este check protege a UX — avisa o usuário em vez de silenciosamente não fazer nada.
       // Padrão do controller: throw + conversão pra 400 no catch. NÃO usar `return res.status()`
@@ -818,6 +829,7 @@ export const registerEntries = async (req: Request, res: Response) => {
     res.status(201).json({ success: true, message: 'Entradas registadas com sucesso.' });
   } catch (error: any) {
     if (error instanceof StockError) return res.status(400).json({ error: error.message });
+    if (error instanceof QuantidadeInvalidaError) return res.status(400).json({ error: error.message });
     if (error.message === 'NF_DUPLICADA') return res.status(400).json({ error: 'Esta NF-e já foi cadastrada.' });
     // Concorrência do reaproveitamento: 2 POSTs paralelos com a MESMA x-idempotency-key.
     // O 1º comitou o saldo; o 2º passou o SELECT-dedupe antes do commit e bateu no índice único do
@@ -859,8 +871,8 @@ const RECOUNT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 // 'UND' (36 produtos ativos) fica FORA de propósito: é sinônimo de 'UN' (unidade), não de medida
 // contínua. 'MT' fica DENTRO por fidelidade à lista original, embora não exista no catálogo hoje
 // (192 produtos usam 'M'). Divergir daquela lista aqui criaria duas réguas para o mesmo produto.
-const RECOUNT_DECIMAL_UNITS = new Set(['M', 'MT', 'L', 'KG']);
-const recountIsDecimalUnit = (un: unknown): boolean => RECOUNT_DECIMAL_UNITS.has(String(un ?? '').trim().toUpperCase());
+// (lote V) a lista mora em utils/quantidade.ts — a cópia local saiu; o nome fica como alias local.
+const recountIsDecimalUnit = isDecimalUnit;
 
 export const recountStock = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;

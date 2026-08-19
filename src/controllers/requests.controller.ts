@@ -13,8 +13,8 @@ import { liberarReserva3D, abaterQtyReservada, qtyReservadaDoItem, cancelarDeman
 
 // Unidades que aceitam quantidade fracionada (metro, litro, quilo). Qualquer outra → inteiro
 // (default seguro para unidades novas/desconhecidas). Espelha DECIMAL_UNITS do front (conferencia.jsx).
-const DECIMAL_UNITS = new Set(['M', 'MT', 'L', 'KG']);
-const isDecimalUnit = (un: unknown): boolean => DECIMAL_UNITS.has(String(un ?? '').trim().toUpperCase());
+// (lote V) a lista mora em utils/quantidade.ts — este era o original, agora é o consumidor.
+import { isDecimalUnit } from '../utils/quantidade';
 
 export const getRequests = async (req: Request, res: Response) => {
   try {

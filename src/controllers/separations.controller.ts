@@ -6,6 +6,7 @@ import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { emitStockChanged } from '../config/socket';
 import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
+import { assertQuantidadesValidas } from '../utils/quantidade';
 
 // Guard de status da separação. Erro TIPADO para o catch mapear HTTP sem cair no 500 genérico:
 // inexistente → 404; transição terminal sem sentido (entregue/cancelada) → 400.
@@ -143,6 +144,11 @@ export const createSeparation = async (req: Request, res: Response) => {
       // Quando não cabe tudo, o item entra com o pedido INTEIRO e a reserva parcial; a diferença
       // é o "Faltam N" da tela. NÃO se rebaixa `qty_requested` — a intenção do cliente é registro,
       // não consequência do saldo do momento.
+      // ── GUARDA DE UNIDADE (lote V) ──────────────────────────────────────────────────────
+      // Unidade de CONTAGEM não aceita fração; unidade de MEDIDA aceita. Régua única em
+      // utils/quantidade.ts. RECUSA — não arredonda. Vale só para o que está entrando agora.
+      await assertQuantidadesValidas(client, items as any[]);
+
       for (const item of items) {
         const pedido = Number(item.quantity);
         const itemRes = await client.query(
@@ -374,6 +380,11 @@ export const updateSeparation = async (req: Request, res: Response) => {
           await client.query('DELETE FROM separation_items WHERE id = $1', [old.id]);
         }
       }
+
+      // ── GUARDA DE UNIDADE (lote V) ──────────────────────────────────────────────────────
+      // Unidade de CONTAGEM não aceita fração; unidade de MEDIDA aceita. Régua única em
+      // utils/quantidade.ts. RECUSA — não arredonda. Vale só para o que está entrando agora.
+      await assertQuantidadesValidas(client, items as any[]);
 
       // ── Adiciona novos itens (JÁ RESERVADOS) ou ajusta o pedido dos existentes ───────────────
       for (const item of items) {

@@ -6,6 +6,7 @@ import { validatePositiveItems } from '../middlewares/validators';
 import { StockService, StockError } from '../services/stock.service';
 import { resolveWarehouseId, getAlmoxId, POOLED_OP_ID } from '../services/warehouse';
 import { emitStockChanged } from '../config/socket';
+import { assertQuantidadesValidas, assertFracaoPermitida } from '../utils/quantidade';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
@@ -63,6 +64,9 @@ export const createReplenishment = async (req: Request, res: Response) => {
   try {
     validatePositiveItems(items);
     await client.query('BEGIN');
+    // GUARDA DE UNIDADE (lote V): regua unica em utils/quantidade.ts. Aqui o campo e'
+    // `qty_requested` (o pedido), nao `quantity` (que nasce 0 e so ganha lastro na reserva).
+    await assertQuantidadesValidas(client, items as any[], { campo: 'qty_requested' });
     const repRes = await client.query(`INSERT INTO replenishments (order_number, client_name, city_state, status, total_value) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [order_number, client_name, city_state, status || 'pendente', total_value || 0]);
     for (const item of items) {
       await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [repRes.rows[0].id, item.product_id, item.qty_requested]);
@@ -86,6 +90,9 @@ export const updateReplenishment = async (req: Request, res: Response) => {
   try {
     validatePositiveItems(items);
     await client.query('BEGIN');
+    // GUARDA DE UNIDADE (lote V): regua unica em utils/quantidade.ts. Aqui o campo e'
+    // `qty_requested` (o pedido), nao `quantity` (que nasce 0 e so ganha lastro na reserva).
+    await assertQuantidadesValidas(client, items as any[], { campo: 'qty_requested' });
     await client.query(`UPDATE replenishments SET order_number = COALESCE($1, order_number), client_name = COALESCE($2, client_name), city_state = COALESCE($3, city_state), total_value = COALESCE($4, total_value) WHERE id = $5`, [order_number, client_name, city_state, total_value, id]);
 
     const existingItemsRes = await client.query('SELECT id, product_id FROM replenishment_items WHERE replenishment_id = $1', [id]);
@@ -143,6 +150,9 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
         const newQty = item.quantity !== undefined ? parseFloat(item.quantity) : oldQty;
         if (isNaN(newQty) || newQty < 0) throw new Error('Quantidade inválida.');
         const productId = oldItem.rows[0].product_id;
+        // GUARDA DE UNIDADE (lote V): zerar a linha e' operacao valida, entao NAO se exige > 0
+        // aqui — so que unidade de contagem nao receba fracao.
+        await assertFracaoPermitida(client, productId, newQty);
         const diff = newQty - oldQty;
 
         // op_key CONTENT-ADDRESSED por replenishment + item + AÇÃO + qty (igual updateStock embute o valor):
