@@ -6,17 +6,17 @@
 //   2) OP com consumido no meio (recebido 10, consumido 6 -> saldo 4): devolver 5 -> 400; 4 -> ok.
 
 import { registerPendingReturns, listReturnableItems, ReturnError } from '../services/returns.service';
-import { runSmoke, pickPooledProduct, seedReturnable, anyUserId, assert, num } from './_smoke';
+import { runSmoke, pickPooledProduct, seedReturnable, sectorUser, assert, num } from './_smoke';
 
 runSmoke('fonte do devolvível = saldo WIP per-OP (legada vazia + consumido não devolve)', async (client) => {
   const prod = await pickPooledProduct(client);
-  const userId = await anyUserId(client);
+  const { userId, warehouseId: whSetor } = await sectorUser(client);
 
   // ───────── CASO 1: OP legada, sem eventos per-OP (recebido 0) ─────────
   // Tem saída de separação (withdrawn 10), mas ZERO recebido -> saldo WIP 0 -> nada devolvível.
-  const legada = await seedReturnable(client, prod.productId, { withdrawn: 10, recebido: 0 }, 'legada', userId);
+  const legada = await seedReturnable(client, prod.productId, { withdrawn: 10, recebido: 0 }, 'legada', userId, whSetor);
 
-  const listaLegada = await listReturnableItems(client, legada.opCode);
+  const listaLegada = await listReturnableItems(client, legada.opCode, legada.warehouseId);
   assert(listaLegada.length === 0, `OP sem rastro per-OP deveria dar lista VAZIA, veio ${listaLegada.length} item(ns)`);
   console.log('  caso 1: OP legada (sem recebido) -> lista de devolvíveis VAZIA ✔');
 
@@ -32,10 +32,10 @@ runSmoke('fonte do devolvível = saldo WIP per-OP (legada vazia + consumido não
 
   // ───────── CASO 2: consumido no meio ─────────
   // recebido 10, consumido 6 -> saldo WIP 4. Não dá pra devolver 5 (o consumido já saiu do saldo).
-  const op = await seedReturnable(client, prod.productId, { withdrawn: 10, recebido: 10, consumido: 6 }, 'consumido', userId);
+  const op = await seedReturnable(client, prod.productId, { withdrawn: 10, recebido: 10, consumido: 6 }, 'consumido', userId, whSetor);
   assert(op.saldo === 4, `saldo semeado deveria ser 4 (10−6), veio ${op.saldo}`);
 
-  const row = (await listReturnableItems(client, op.opCode)).find((r) => r.product_id === prod.productId);
+  const row = (await listReturnableItems(client, op.opCode, op.warehouseId)).find((r) => r.product_id === prod.productId);
   assert(row, 'produto com saldo 4 deveria aparecer devolvível');
   assert(num(row!.saldo) === 4, `saldo na lista deveria ser 4, veio ${row!.saldo}`);
   assert(num(row!.available_to_return) === 4, `disponível deveria ser 4, veio ${row!.available_to_return}`);

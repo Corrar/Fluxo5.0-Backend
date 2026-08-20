@@ -18,6 +18,10 @@ import { machinePorId } from './assembly.controller';
 // setor tem custódia. canonSetor normaliza a grafia suja de separations.destination/profiles.sector
 // antes de comparar (ver src/services/setor.ts — 25+29 valores medidos, zero desconhecido).
 import { canonSetor, resolveDestinationWarehouse } from '../services/setor';
+// AW1 (20/08/2026): o SETOR é o DONO, a OP é a ETIQUETA. `lockKeyOpMat` é a definição ÚNICA da
+// chave do advisory lock — ver o cabeçalho de opMaterialScope.ts para por que ela não é montada
+// à mão em cada chamador.
+import { lockKeyOpMat, escopoDoPerfil, warehouseDoSetor } from '../services/opMaterialScope';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -74,13 +78,54 @@ const SALDO_SQL = `
   - COALESCE(SUM(qty) FILTER (WHERE event_type IN ('consumido','devolvido','transferido_out')), 0)
 `;
 
-// Saldo de UM produto numa OP. Só chame com a OP já travada (ver consumeOpMaterial).
-async function saldoDe(client: PoolClient, clientServiceId: string, productId: string): Promise<number> {
+// Saldo de UM produto numa OP, DENTRO DE UM ARMAZÉM DE SETOR (lote AW1).
+//
+// ⚠ O `warehouse_id` no WHERE não é refinamento — é o que faz o lock continuar valendo. A chave
+// do advisory lock passou a ser (armazém, OP, produto); um guard que lesse o saldo GLOBAL sob um
+// lock por armazém não estaria protegido por lock nenhum: dois setores tomariam chaves distintas
+// e leriam a mesma projeção. Chave do lock e escopo do guard são o mesmo par.
+//
+// E é também o modelo: se a Elétrica e a Usinagem receberam o mesmo produto para a mesma OP,
+// cada uma tem o SEU saldo. Medido em produção (20/08/2026): 19 de 701 pares (OP, produto) já
+// foram entregues a mais de um setor.
+//
+// Só chame com o par (armazém, OP, produto) já travado — ver consumeOpMaterial.
+async function saldoDe(
+  client: PoolClient,
+  warehouseId: string,
+  clientServiceId: string,
+  productId: string,
+): Promise<number> {
   const { rows } = await client.query(
-    `SELECT ${SALDO_SQL} AS saldo FROM op_material_events WHERE client_service_id = $1 AND product_id = $2`,
-    [clientServiceId, productId],
+    `SELECT ${SALDO_SQL} AS saldo FROM op_material_events
+      WHERE warehouse_id = $1 AND client_service_id = $2 AND product_id = $3`,
+    [warehouseId, clientServiceId, productId],
   );
   return num(rows[0]?.saldo);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// O ARMAZÉM DE QUEM OPERA — usado por consume e transfer (decisões A2/A3 do lote AW1).
+//
+// Por que a pergunta é "qual armazém você detém" e não "de qual armazém você quer tirar": o
+// segundo seria parâmetro do corpo, e o corpo não escolhe de quem é o material — a mesma
+// disciplina que o receive já aplica à OP ("a OP vem da ORIGEM, nunca do body").
+//
+// ⚠ CONSEQUÊNCIA DECLARADA: quem não tem armazém de setor NÃO APONTA E NÃO TRANSFERE, e isso
+// inclui admin (`sector='Geral'`) e almoxarife (`sector='Almoxarifado'`) — os dois setores estão
+// no de-para como "sem custódia". Não é restrição de permissão: é o recurso não existir. Quem
+// não detém WIP não tem de onde tirar. Medido: 0 apontamentos e 0 transferências em toda a base
+// até 20/08/2026, então nenhum fluxo vivo é interrompido por isto.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+async function armazemDeQuemOpera(client: PoolClient, userId: string | null): Promise<string> {
+  const escopo = await escopoDoPerfil(client, userId);
+  if (escopo.warehouseId === null) {
+    throw new OpMatError(
+      'OPERADOR_SEM_CUSTODIA',
+      `Seu setor (${escopo.sectorCru ?? 'não informado'}) não tem armazém — não há material seu em custódia para apontar ou transferir.`,
+    );
+  }
+  return escopo.warehouseId;
 }
 
 // ==========================================================================
@@ -158,6 +203,18 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
       if (destino.code === null) {
         throw new OpMatError('SETOR_SEM_CUSTODIA', 'Este setor não tem armazém — o material foi consumido na entrega, não há recebimento a confirmar aqui.');
       }
+      // ── O CARIMBO DE SETOR (A5) ───────────────────────────────────────────────────────────
+      // Vem da ORIGEM, NUNCA do req.user — a mesma disciplina do comentário lá em cima sobre a
+      // OP ("a OP vem da ORIGEM, nunca do body"). É o que impede que um master confirmando um
+      // recebimento em nome de outro setor carimbe o armazém DELE no material do setor alheio.
+      // O guard D1 acima já resolveu o `code`; aqui só se pega o id (cacheado em warehouse.ts).
+      const warehouseId = await warehouseDoSetor(client, origemSetor);
+      if (warehouseId === null) {
+        // Inalcançável pelo guard acima (code != null implica armazém), a não ser que o mapa
+        // aponte para um armazém que não existe em `warehouses` — que é bug de configuração e
+        // o resolveDestinationWarehouseId já logou. Falhar alto é melhor que carimbar NULL.
+        throw new OpMatError('ARMAZEM_DO_SETOR_AUSENTE', `O armazém do setor "${origemSetor}" não existe no cadastro — avise o administrador.`);
+      }
       // D2/D3: admin e almoxarife são chave-mestra (recebem de qualquer setor); operador comum só
       // confirma o que foi destinado ao PRÓPRIO setor — cross-setor é bloqueio (403), não aviso.
       const perfil = await client.query(`SELECT role, sector FROM profiles WHERE id = $1`, [userId]);
@@ -227,13 +284,13 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
           `INSERT INTO op_material_events
              (event_type, client_service_id, product_id, qty,
               ref_separation_id, ref_separation_item_id, ref_request_id, ref_request_item_id,
-              user_id, op_key)
-           VALUES ('recebido', $1, $2, $3, $4, $5, $6, $7, $8, $9)
-           RETURNING id, event_type, client_service_id, product_id, qty, created_at`,
+              user_id, op_key, warehouse_id)
+           VALUES ('recebido', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING id, event_type, client_service_id, product_id, qty, warehouse_id, created_at`,
           [clientServiceId, productId, qty,
            origemSolicitacao ? null : separationId, origemSolicitacao ? null : itemId,
            origemSolicitacao ? requestId : null, origemSolicitacao ? itemId : null,
-           userId, opKey],
+           userId, opKey, warehouseId],
         );
         criados.push(ins.rows[0]);
       }
@@ -314,21 +371,29 @@ export const consumeOpMaterial = async (req: Request, res: Response) => {
       //    ⚠ INVARIANTE: devolver e transferir_out (peça 4) TÊM que pegar ESTE MESMO lock, com a
       //    mesma string, senão a exclusão mútua não existe. receive NÃO precisa — só soma, e o
       //    teto dele já é serializado pelo FOR UPDATE da separation.
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`opmat:${clientServiceId}:${productId}`]);
+      //    ⚠⚠ AW1: a string ganhou o ARMAZÉM e passou a sair de `lockKeyOpMat` — definição única,
+      //    quatro chamadores (aqui, o transfer abaixo, e o register/confer do returns.service).
+      //    Ver o cabeçalho de opMaterialScope.ts: enquanto a string era montada à mão, "a mesma
+      //    string" era promessa de revisão; agora é construção.
+      //
+      // 3b. QUAL ARMAZÉM (A2/A3): o de quem opera. O apontador consome o WIP do PRÓPRIO setor —
+      //     quem não tem armazém não tem o que apontar (erro tipado, ver armazemDeQuemOpera).
+      const warehouseId = await armazemDeQuemOpera(client, userId);
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKeyOpMat(warehouseId, clientServiceId, productId)]);
 
       // 4. Guard de saldo: projeção calculada NA MESMA TX, DEPOIS do lock. A ordem é o contrato —
-      //    ler antes do lock não vale nada.
-      const saldo = await saldoDe(client, clientServiceId, productId);
+      //    ler antes do lock não vale nada. E o saldo é o DO ARMAZÉM (mesmo grão do lock).
+      const saldo = await saldoDe(client, warehouseId, clientServiceId, productId);
       if (quantidade > saldo) {
         throw new OpMatError('SALDO_INSUFICIENTE_NA_OP',
-          `Saldo insuficiente na OP: tem ${saldo} deste material no armazém da OP e tentou apontar ${quantidade}.`);
+          `Saldo insuficiente na OP: o armazém do seu setor tem ${saldo} deste material nesta OP e tentou apontar ${quantidade}.`);
       }
 
       const ins = await client.query(
-        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key, machine_id)
-         VALUES ('consumido', $1, $2, $3, $4, $5, $6)
-         RETURNING id, event_type, client_service_id, product_id, qty, machine_id, created_at`,
-        [clientServiceId, productId, quantidade, userId, opKey, maquinaId],
+        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key, machine_id, warehouse_id)
+         VALUES ('consumido', $1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, event_type, client_service_id, product_id, qty, machine_id, warehouse_id, created_at`,
+        [clientServiceId, productId, quantidade, userId, opKey, maquinaId, warehouseId],
       );
       return { evento: ins.rows[0], saldoRestante: saldo - quantidade, idempotent: false };
     });
@@ -387,30 +452,47 @@ export const transferOpMaterial = async (req: Request, res: Response) => {
       if (!achadas.has(String(fromClientServiceId))) throw new OpMatError('OP_ORIGEM_NAO_ENCONTRADA', 'OP de origem não encontrada.');
       if (!achadas.has(String(toClientServiceId))) throw new OpMatError('OP_DESTINO_NAO_ENCONTRADA', 'OP de destino não encontrada.');
 
-      // 3. ADVISORY LOCK da ORIGEM — a MESMA string do consume (invariante D4: consume, devolver e
-      //    transferir_out disputam o MESMO saldo e TÊM que se excluir mutuamente). O destino não
-      //    trava: só recebe crédito, não há guard de saldo a proteger lá.
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`opmat:${fromClientServiceId}:${productId}`]);
+      // ── 3. O SETOR DAS DUAS PERNAS (decisão A2 do lote AW1) ───────────────────────────────
+      //
+      // ⚠ AS DUAS PERNAS CARIMBAM O MESMO ARMAZÉM. Não é simplificação — "cada perna o seu" NÃO
+      // É CONSTRUÍVEL: o eixo desta operação é OP -> OP, e o destino é uma OP, não um setor. Não
+      // existe, em lugar nenhum do corpo ou do banco, um "setor de destino" a carimbar no IN.
+      //
+      // E se existisse não deveria ser usado: a transferência é CONTÁBIL (o comentário do topo
+      // deste handler crava — "NÃO toca o físico central... aqui ele só muda de OP"), e o
+      // stock_ledger confirma que ela não gera lançamento nenhum. Carimbar armazéns diferentes
+      // faria o material TELETRANSPORTAR entre setores sem movimento físico, deixando um setor
+      // com saldo negativo e outro com saldo positivo do nada.
+      //
+      // O armazém é o de QUEM DETÉM, e o guard de saldo abaixo é o que torna isso verdade e não
+      // declaração: só se transfere o que o armazém do próprio setor tem. Se o seu setor não
+      // detém aquele material naquela OP, o saldo é 0 e a operação morre no guard.
+      const warehouseId = await armazemDeQuemOpera(client, userId);
 
-      // 4. Guard de saldo na origem, DEPOIS do lock (a ordem é o contrato).
-      const saldo = await saldoDe(client, fromClientServiceId, productId);
+      // 3b. ADVISORY LOCK da ORIGEM — a MESMA string do consume, pela MESMA função (invariante
+      //     D4: consume, devolver e transferir_out disputam o MESMO saldo e TÊM que se excluir
+      //     mutuamente). O destino não trava: só recebe crédito, não há guard de saldo lá.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKeyOpMat(warehouseId, fromClientServiceId, productId)]);
+
+      // 4. Guard de saldo na origem, DEPOIS do lock (a ordem é o contrato) e DENTRO do armazém.
+      const saldo = await saldoDe(client, warehouseId, fromClientServiceId, productId);
       if (quantidade > saldo) {
         throw new OpMatError('SALDO_INSUFICIENTE_NA_OP',
-          `Saldo insuficiente na OP de origem: tem ${saldo} deste material no armazém da OP e tentou transferir ${quantidade}.`);
+          `Saldo insuficiente na OP de origem: o armazém do seu setor tem ${saldo} deste material nesta OP e tentou transferir ${quantidade}.`);
       }
 
-      // 5. O par. IN aponta pro OUT via ref_event_id.
+      // 5. O par. IN aponta pro OUT via ref_event_id. MESMO warehouse_id nos dois (A2).
       const out = await client.query(
-        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key)
-         VALUES ('transferido_out', $1, $2, $3, $4, $5)
-         RETURNING id, event_type, client_service_id, product_id, qty, created_at`,
-        [fromClientServiceId, productId, quantidade, userId, outKey],
+        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key, warehouse_id)
+         VALUES ('transferido_out', $1, $2, $3, $4, $5, $6)
+         RETURNING id, event_type, client_service_id, product_id, qty, warehouse_id, created_at`,
+        [fromClientServiceId, productId, quantidade, userId, outKey, warehouseId],
       );
       const inn = await client.query(
-        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, ref_event_id, user_id, op_key)
-         VALUES ('transferido_in', $1, $2, $3, $4, $5, $6)
-         RETURNING id, event_type, client_service_id, product_id, qty, ref_event_id, created_at`,
-        [toClientServiceId, productId, quantidade, out.rows[0].id, userId, inKey],
+        `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, ref_event_id, user_id, op_key, warehouse_id)
+         VALUES ('transferido_in', $1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, event_type, client_service_id, product_id, qty, ref_event_id, warehouse_id, created_at`,
+        [toClientServiceId, productId, quantidade, out.rows[0].id, userId, inKey, warehouseId],
       );
       return { out: out.rows[0], in: inn.rows[0], saldoRestanteOrigem: saldo - quantidade, idempotent: false };
     });
@@ -612,8 +694,17 @@ export const getPendingReceipts = async (req: Request, res: Response) => {
 // ==========================================================================
 const EVENT_TYPES = ['recebido', 'consumido', 'devolvido', 'transferido_out', 'transferido_in'];
 
+// ⚠ O ESCOPO DE SETOR ENTROU AQUI TAMBÉM (lote AW1), e não por simetria: sem ele a tela MENTE, e
+// a mentira já era reproduzível com o dado de hoje. Este extrato é aberto de dentro do card do
+// Armazém ("Ver extrato"). Medido em produção (20/08/2026): a OP DESP0826 tem DOIS eventos, um
+// da ESTEIRA (chapéu de palha) e um do PROTOTIPO (papel higiênico). Um operador do Protótipo
+// veria o card com UM material e, ao abrir o extrato, DOIS — incluindo material da Esteira.
+// Card filtrado com extrato completo embaixo é a tela se contradizendo na mesma tela.
+// Mesma forma dos demais: escopo pelo TOKEN, `?scope=all` só para master, fail-closed.
 export const getOpEvents = async (req: Request, res: Response) => {
   const { clientServiceId } = req.params;
+  const userId = (req as any).user?.id ?? null;
+  const scopeAll = typeof req.query.scope === 'string' && req.query.scope.trim().toLowerCase() === 'all';
   const raw = typeof req.query.event_type === 'string' ? req.query.event_type.trim() : '';
   // Tipo inválido -> 400 em vez de devolver lista vazia (vazio mentiria "a OP não tem nada").
   if (raw && !EVENT_TYPES.includes(raw)) {
@@ -621,25 +712,37 @@ export const getOpEvents = async (req: Request, res: Response) => {
   }
   const tipo = raw || null;
   try {
+    const escopo = await escopoDoPerfil(pool as any, userId);
+    const verTudo = escopo.isMaster && scopeAll;   // fail-closed, igual aos demais
+    // Mesmos TRÊS estados do /warehouse (ver o comentário lá): sem custódia e sem escopo global
+    // devolve VAZIO, nunca "filtro nulo" — que na cláusula `($3 IS NULL OR ...)` liberaria tudo.
+    const semCustodia = !verTudo && escopo.warehouseId === null;
+    const filtroWh = verTudo ? null : escopo.warehouseId;
+    if (semCustodia) return res.json([]);
     const { rows } = await pool.query(
       `SELECT e.id, e.event_type, e.qty, e.created_at,
               e.product_id, p.sku, p.name, p.unit,
               e.ref_separation_id, e.ref_separation_item_id, e.ref_event_id,
-              e.user_id, pr.name AS user_name
+              e.user_id, pr.name AS user_name,
+              e.warehouse_id, w.code AS warehouse_code
          FROM op_material_events e
-         JOIN products p       ON p.id = e.product_id
-         LEFT JOIN profiles pr ON pr.id = e.user_id
+         JOIN products p        ON p.id = e.product_id
+         LEFT JOIN profiles pr  ON pr.id = e.user_id
+         LEFT JOIN warehouses w ON w.id = e.warehouse_id
         WHERE e.client_service_id = $1
           AND ($2::text IS NULL OR e.event_type = $2)
+          AND ($3::uuid IS NULL OR e.warehouse_id = $3)
         ORDER BY e.created_at DESC
         LIMIT 50`,
-      [clientServiceId, tipo],
+      [clientServiceId, tipo, filtroWh],
     );
     return res.json(rows.map((r) => ({
       id: r.id, event_type: r.event_type, qty: num(r.qty), created_at: r.created_at,
       product_id: r.product_id, sku: r.sku, name: r.name, unit: r.unit,
       ref_separation_id: r.ref_separation_id, ref_separation_item_id: r.ref_separation_item_id,
       ref_event_id: r.ref_event_id, user_id: r.user_id, user_name: r.user_name,
+      // ADITIVO: as chaves de antes seguem todas. Estas contam de quem é a linha.
+      warehouse_id: r.warehouse_id, warehouse_code: r.warehouse_code,
     })));
   } catch (error: any) {
     console.error(JSON.stringify({ event: 'opmat_events_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
@@ -686,35 +789,100 @@ export const getOpEvents = async (req: Request, res: Response) => {
 //   este endpoint chegaria ao tamanho da maior resposta da casa. Se a projeção de 100 OPs virar
 //   realidade, o próximo passo é PAGINAR POR OP, não aumentar o teto.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// O FILTRO DE SETOR (lote AW1) — O SETOR É O DONO, A OP É A ETIQUETA.
+//
+// A tela mostrava TUDO: o operador da Esteira via Despesas, Protótipo e Floterio juntos. Agora
+// ela mostra o material que O SETOR DELE recebeu, com a OP como etiqueta de cada item.
+//
+// A FORMA É A MESMA DO RECEBIMENTO (getPendingReceipts, mais acima), e de propósito: o backend
+// resolve pelo TOKEN, não por parâmetro. `?scope=all` só tem efeito para admin/almoxarife —
+// fail-closed do lado de cá, o front não decide. E o filtro roda em JS, não em SQL, pela mesma
+// razão de lá: comparar armazém é comparar uuid, e a lista inteira já veio numa resposta só.
+//
+// ⚠ O QUE **NÃO** SE COPIOU DO RECEBIMENTO, E É DECISÃO: lá existe o D1, que descarta linha cujo
+// setor não tem armazém. AQUI ELE NÃO ENTRA. Um evento de setor sem custódia NÃO NASCE — o
+// próprio D1 do POST /receive o barra com SETOR_SEM_CUSTODIA, e a 027 acabou de provar que os 4
+// eventos da base têm armazém. Um filtro que nunca exclui nada não é proteção: é dano à espera
+// de gatilho, porque no dia em que a premissa mudar ele passa a esconder linha sem avisar.
+//
+// ⚠ EVENTO SEM CARIMBO (warehouse_id NULL) NÃO SOME EM SILÊNCIO. A coluna é nullable por decisão
+// (ver a 027), então a resposta declara `sem_setor` — quantas linhas ficaram de fora por não
+// terem armazém. Zero hoje; se um dia não for, a tela tem como dizer em vez de omitir.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
 const MAX_OPS_ARMAZEM = 200;
 
 export const getWarehouseByOp = async (req: Request, res: Response) => {
   const bruto = Number(req.query.limit);
   const limite = Number.isFinite(bruto) && bruto > 0 ? Math.min(Math.trunc(bruto), MAX_OPS_ARMAZEM) : MAX_OPS_ARMAZEM;
+  const userId = (req as any).user?.id ?? null;
+  const scopeAll = typeof req.query.scope === 'string' && req.query.scope.trim().toLowerCase() === 'all';
   try {
-    // Quantas OPs abertas TÊM material — a constante contra a qual o truncamento se declara.
-    // Consulta separada e barata (só conta), para que `total_ops` não dependa da janela.
+    const escopo = await escopoDoPerfil(pool as any, userId);
+    const verTudo = escopo.isMaster && scopeAll;   // fail-closed: scope=all sem o papel é ignorado
+    // ⚠ ONDE ESTE FILTRO RODA — E POR QUE **NÃO** É EM JS COMO O DO RECEBIMENTO.
+    // Lá o filtro é em JS por um motivo declarado: comparar SETOR é comparar TEXTO SUJO, e
+    // enumerar em SQL todas as grafias que canonizam para um setor prenderia a query a uma lista
+    // que envelhece. Aqui a comparação é de `warehouse_id` — uuid contra uuid. É exatamente o que
+    // a decisão A1 comprou ao carimbar a FK em vez do canônico, e desperdiçá-la teria custo:
+    // filtrar depois do LIMIT faria `total_ops` contar OPs que o operador não pode ver, e a
+    // tarja "mostrando N de M" mentiria. O `canonSetor` continua no caminho — dentro do
+    // escopoDoPerfil, que é quem traduz profiles.sector -> code -> uuid.
+    //
+    // ⚠ TRÊS ESTADOS, NÃO DOIS — e o terceiro é onde mora o fail-open.
+    //   verTudo                         -> sem filtro (o master pediu E tem o papel)
+    //   tem armazém                     -> filtra por ele
+    //   NÃO tem armazém e não é verTudo -> NÃO VÊ NADA
+    //
+    // O último caso não pode virar "filtro nulo": a cláusula do SQL é
+    // `($2::uuid IS NULL OR e.warehouse_id = $2)`, então passar NULL ali LIBERA TUDO. Um admin de
+    // setor 'Geral' (sem armazém) sem `?scope=all` veria a fábrica inteira sem ter pedido — o
+    // oposto exato do fail-closed que o resto deste módulo pratica. Quem não tem custódia e não
+    // pediu escopo global vê VAZIO, que é o correto: ele não detém material nenhum.
+    const semCustodia = !verTudo && escopo.warehouseId === null;
+    const filtroWh = verTudo ? null : escopo.warehouseId;
+
+    // Quantas OPs abertas TÊM material NO ESCOPO — a constante contra a qual o truncamento se
+    // declara. Consulta separada e barata (só conta), para que `total_ops` não dependa da janela.
     const totalRes = await pool.query(
       `SELECT COUNT(DISTINCT e.client_service_id)::int AS n
          FROM op_material_events e
          JOIN client_services cs ON cs.id = e.client_service_id
-        WHERE cs.status <> 'concluido'`,
+        WHERE cs.status <> 'concluido'
+          AND ($1::uuid IS NULL OR e.warehouse_id = $1)`,
+      [filtroWh],
     );
-    const totalOps = totalRes.rows[0]?.n ?? 0;
+    const totalOps = semCustodia ? 0 : (totalRes.rows[0]?.n ?? 0);
+
+    // Linhas que ficariam de fora por NÃO TEREM CARIMBO. A coluna é nullable por decisão (027),
+    // então a ausência é possível — e tem de ser DITA, nunca omitida. Vale para os dois escopos:
+    // nem o master com scope=all vê o que não tem armazém, porque o filtro dele é "sem filtro"
+    // mas a linha continua sem setor a que pertencer.
+    const semSetorRes = await pool.query(
+      `SELECT COUNT(*)::int AS n
+         FROM op_material_events e
+         JOIN client_services cs ON cs.id = e.client_service_id
+        WHERE cs.status <> 'concluido' AND e.warehouse_id IS NULL`,
+    );
+    const semSetor = semSetorRes.rows[0]?.n ?? 0;
 
     // `status <> 'concluido'` e não `= 'em_andamento'`: OP_STATUS_VALIDOS tem os dois valores
     // hoje (clients.controller.ts:106), e se um terceiro estado nascer amanhã, "não concluída"
     // continua sendo a leitura certa de "ainda está com material na mão".
-    const { rows } = await pool.query(
+    // Sem custódia e sem escopo global: nem se consulta. Devolver a lista vazia AQUI é o que
+    // impede o `$2 IS NULL` de virar "tudo" lá embaixo.
+    const { rows } = semCustodia ? { rows: [] as any[] } : await pool.query(
       `WITH ops AS (
          SELECT DISTINCT cs.id, cs.op_code
            FROM op_material_events e
            JOIN client_services cs ON cs.id = e.client_service_id
           WHERE cs.status <> 'concluido'
+            AND ($2::uuid IS NULL OR e.warehouse_id = $2)
           ORDER BY cs.op_code ASC
           LIMIT $1
        )
-       SELECT ops.id AS client_service_id, ops.op_code, cl.name AS client_name,
+       SELECT e.warehouse_id, w.code AS warehouse_code, w.name AS warehouse_name,
+              ops.id AS client_service_id, ops.op_code, cl.name AS client_name,
               e.product_id, p.sku, p.name, p.unit,
               COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'recebido'), 0)        AS recebido,
               COALESCE(SUM(e.qty) FILTER (WHERE e.event_type = 'consumido'), 0)       AS consumido,
@@ -726,27 +894,44 @@ export const getWarehouseByOp = async (req: Request, res: Response) => {
          JOIN op_material_events e ON e.client_service_id = ops.id
          JOIN products p           ON p.id = e.product_id
          JOIN client_services cs   ON cs.id = ops.id
+         JOIN warehouses w         ON w.id = e.warehouse_id
          LEFT JOIN clients cl      ON cl.id = cs.client_id
-        GROUP BY ops.id, ops.op_code, cl.name, e.product_id, p.sku, p.name, p.unit
-        ORDER BY ops.op_code ASC, p.name ASC`,
-      [limite],
+        WHERE ($2::uuid IS NULL OR e.warehouse_id = $2)
+        -- ⚠ O GRÃO MUDOU: era (OP, produto), agora é (ARMAZÉM, OP, produto). Sem o armazém no
+        -- GROUP BY, a mesma OP com o mesmo produto recebido por DOIS setores viraria um card só,
+        -- somando material de gente diferente. Medido em produção (20/08/2026): 19 de 701 pares
+        -- (OP, produto) já foram entregues a mais de um setor, e 13 das 29 OPs têm separação para
+        -- mais de um setor. A colisão é real, não hipótese.
+        -- O JOIN warehouses (INNER, nao LEFT) e o que deixa a linha sem carimbo fora — e ela e
+        -- contada e declarada em sem_setor, nunca omitida em silencio.
+        GROUP BY e.warehouse_id, w.code, w.name, ops.id, ops.op_code, cl.name,
+                 e.product_id, p.sku, p.name, p.unit
+        ORDER BY w.name ASC, ops.op_code ASC, p.name ASC`,
+      [limite, filtroWh],
     );
 
     // Monta o agrupamento em JS e não em json_agg: a ORDEM importa para a grade, e json_agg sem
     // ORDER BY herda a ordem do executor (régua do Lote 0). O ORDER BY do SELECT acima já entrega
     // as linhas na ordem certa; aqui só se preserva.
-    const porOp = new Map<string, any>();
+    //
+    // ⚠ A CHAVE DO GRUPO GANHOU O ARMAZÉM. Era `client_service_id`; se continuasse assim, as duas
+    // metades de uma OP multi-setor cairiam no mesmo grupo e a segunda sobrescreveria o setor da
+    // primeira — o bug silencioso desta mudança.
+    const porGrupo = new Map<string, any>();
     for (const r of rows) {
-      const k = String(r.client_service_id);
-      if (!porOp.has(k)) {
-        porOp.set(k, {
+      const k = `${r.warehouse_id}|${r.client_service_id}`;
+      if (!porGrupo.has(k)) {
+        porGrupo.set(k, {
+          warehouse_id: r.warehouse_id,
+          warehouse_code: r.warehouse_code,
+          warehouse_name: r.warehouse_name,
           client_service_id: r.client_service_id,
           op_code: r.op_code,
           client_name: r.client_name || '',
           materiais: [],
         });
       }
-      porOp.get(k).materiais.push({
+      porGrupo.get(k).materiais.push({
         product_id: r.product_id, sku: r.sku, name: r.name, unit: r.unit,
         recebido: num(r.recebido), consumido: num(r.consumido), devolvido: num(r.devolvido),
         transferido_in: num(r.transferido_in), transferido_out: num(r.transferido_out),
@@ -755,13 +940,24 @@ export const getWarehouseByOp = async (req: Request, res: Response) => {
         saldo: num(r.saldo),
       });
     }
-    const ops = Array.from(porOp.values());
+    const ops = Array.from(porGrupo.values());
+    // `total_ops` conta OPs distintas (é o eixo do teto e da tarja); `ops` agora são GRUPOS
+    // (armazém, OP) e podem ser mais numerosos. Comparar os dois diretamente faria `truncado`
+    // acender sozinho numa OP multi-setor — daí a contagem de OPs distintas aqui.
+    const opsDistintas = new Set(ops.map((g) => String(g.client_service_id))).size;
 
     return res.json({
       ops,
       total_ops: totalOps,
-      truncado: totalOps > ops.length,
+      truncado: totalOps > opsDistintas,
       limite,
+      // CONTRATO ADITIVO (ver PW7): as chaves de antes seguem todas, com o mesmo significado.
+      escopo: verTudo ? 'todos' : 'setor',
+      // O armazém do próprio operador, para a tela poder dizer de quem é o que está mostrando.
+      warehouse_id: escopo.warehouseId,
+      warehouse_code: escopo.warehouseId ? (ops.find((g) => g.warehouse_id === escopo.warehouseId)?.warehouse_code ?? null) : null,
+      pode_ver_tudo: escopo.isMaster,
+      sem_setor: semSetor,
     });
   } catch (error: any) {
     console.error(JSON.stringify({ event: 'opmat_warehouse_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
@@ -769,6 +965,17 @@ export const getWarehouseByOp = async (req: Request, res: Response) => {
   }
 };
 
+// ⚠ ESTE ENDPOINT SEGUE GLOBAL — DECISÃO DO LOTE AW1, NÃO ESQUECIMENTO.
+//
+// Ele alimenta os KPIs do PAINEL DA PRODUÇÃO, que é outra tela e outra pergunta: "quanto WIP a
+// fábrica tem", não "quanto material eu tenho". Filtrá-lo por setor tornaria o Painel incapaz de
+// responder o que ele existe para responder, e um gerente veria o WIP do próprio setor achando
+// que vê o da fábrica — trocaria uma divergência visível por uma invisível, que é pior.
+//
+// A divergência é REAL e foi medida (20/08/2026): `wip_unidades` global = 5; o Armazém filtrado
+// mostra 2 para a Esteira e 3 para o Protótipo. O conserto do lote é do lado da TELA — o KPI do
+// Armazém passa a dizer de quem é o número ("Meu setor" / "Todos os setores"), que é mudança de
+// RÓTULO e não de dado. Ver PGArmazem no front.
 export const getOpSummary = async (_req: Request, res: Response) => {
   try {
     const [wip, apont, pend] = await Promise.all([

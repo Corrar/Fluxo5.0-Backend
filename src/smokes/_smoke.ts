@@ -11,6 +11,8 @@
 import type { PoolClient } from 'pg';
 import { pool } from '../db';
 import { getAlmoxId } from '../services/warehouse';
+// AW1: o de-para setor->armazem, para a fixture saber quem TEM custodia.
+import { escopoDoPerfil } from '../services/opMaterialScope';
 
 export function assert(cond: any, msg: string): void {
   if (!cond) throw new Error('ASSERT FALHOU: ' + msg);
@@ -109,33 +111,63 @@ export async function seedOp(
 // Cenário devolvível: seedOp + eventos per-OP (recebido/consumido) que formam o SALDO WIP.
 //   saldo WIP = recebido − consumido  (é a fonte do disponível a devolver — reversão da decisão (a)).
 //   recebido = 0  -> OP "sem rastro per-OP" (legada): saldo 0, nada devolvível.
+// ⚠ AW1: o razão per-OP passou a ser POR SETOR (op_material_events.warehouse_id, migration 027).
+// Um evento sem carimbo não aparece em saldo nenhum, então o fixture PRECISA carimbar — senão a
+// asserção passaria a vazio, que pela régua do PG1 não conta como verde.
+// Devolve o `warehouseId` usado, para quem chama poder passá-lo ao guard/lista.
 export async function seedReturnable(
   client: PoolClient,
   productId: string,
   opts: { withdrawn: number; recebido: number; consumido?: number },
   tag: string,
   userId: string | null,
-): Promise<{ clientId: string; opId: string; opCode: string; separationId: string; separationItemId: string; saldo: number }> {
+  warehouseId?: string,
+): Promise<{ clientId: string; opId: string; opCode: string; separationId: string; separationItemId: string; saldo: number; warehouseId: string }> {
   const base = await seedOp(client, productId, opts.withdrawn, tag);
+  const wh = warehouseId ?? await anySectorWarehouseId(client);
   const stamp = `${tag}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
   if (opts.recebido > 0) {
     // 'recebido' exige ref_separation_id + ref_separation_item_id (CHECK ck_opmat_recebido_tem_origem).
     await client.query(
       `INSERT INTO op_material_events
-         (event_type, client_service_id, product_id, qty, ref_separation_id, ref_separation_item_id, user_id, op_key)
-       VALUES ('recebido', $1, $2, $3, $4, $5, $6, $7)`,
-      [base.opId, productId, opts.recebido, base.separationId, base.separationItemId, userId, `smk:recv:${stamp}`],
+         (event_type, client_service_id, product_id, qty, ref_separation_id, ref_separation_item_id, user_id, op_key, warehouse_id)
+       VALUES ('recebido', $1, $2, $3, $4, $5, $6, $7, $8)`,
+      [base.opId, productId, opts.recebido, base.separationId, base.separationItemId, userId, `smk:recv:${stamp}`, wh],
     );
   }
   const consumido = opts.consumido ?? 0;
   if (consumido > 0) {
     await client.query(
-      `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key)
-       VALUES ('consumido', $1, $2, $3, $4, $5)`,
-      [base.opId, productId, consumido, userId, `smk:cons:${stamp}`],
+      `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key, warehouse_id)
+       VALUES ('consumido', $1, $2, $3, $4, $5, $6)`,
+      [base.opId, productId, consumido, userId, `smk:cons:${stamp}`, wh],
     );
   }
-  return { ...base, saldo: opts.recebido - consumido };
+  return { ...base, saldo: opts.recebido - consumido, warehouseId: wh };
+}
+
+/** Um armazém de SETOR qualquer (nunca o ALMOX — o razão per-OP é WIP de setor). */
+export async function anySectorWarehouseId(client: PoolClient): Promise<string> {
+  const { rows } = await client.query(`SELECT id FROM warehouses WHERE code <> 'ALMOX' ORDER BY code LIMIT 1`);
+  if (!rows.length) throw new Error('nenhum armazém de setor — a migration 024 precisa estar aplicada.');
+  return rows[0].id;
+}
+
+/**
+ * Um usuário QUE TEM CUSTÓDIA — perfil cujo `sector` resolve para um armazém no de-para.
+ *
+ * ⚠ Existe porque `anyUserId` devolve o primeiro perfil que aparecer, e depois do AW1 isso não
+ * serve mais para os fluxos de devolução/apontamento: em produção 16 dos 29 perfis estão em
+ * setor SEM armazém (Escritório, Chefia, Almoxarifado, Geral…). Um smoke que sorteasse um deles
+ * bateria em SETOR_SEM_CUSTODIA e pareceria regressão do lote, quando é a fixture errada.
+ */
+export async function sectorUser(client: PoolClient): Promise<{ userId: string; warehouseId: string; sector: string }> {
+  const { rows } = await client.query(`SELECT id, sector FROM profiles WHERE sector IS NOT NULL ORDER BY name`);
+  for (const r of rows) {
+    const escopo = await escopoDoPerfil(client, r.id);
+    if (escopo.warehouseId) return { userId: r.id, warehouseId: escopo.warehouseId, sector: r.sector };
+  }
+  throw new Error('nenhum perfil com setor que tenha armazém — verifique o seed e a migration 024.');
 }
 
 // Um profile qualquer só pra satisfazer FKs de user_id (read-only). null se o branch não tiver.

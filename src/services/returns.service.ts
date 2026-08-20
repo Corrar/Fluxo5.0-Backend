@@ -21,6 +21,10 @@
 import type { PoolClient } from 'pg';
 import { StockService } from './stock.service';
 import { resolveWarehouseId, POOLED_OP_ID } from './warehouse';
+// AW1: a chave do advisory lock e o de-para setor->armazém vêm de UM lugar só. Ver o cabeçalho
+// de opMaterialScope.ts — a invariante "o MESMO lock, com a MESMA string" deixou de ser promessa
+// de revisão de código e virou uma função com quatro chamadores.
+import { lockKeyOpMat, escopoDoPerfil } from './opMaterialScope';
 
 // Erro de regra de negócio -> 400/404 no controller (espelha OpMatError/StockError: msg pronta pro operador).
 export class ReturnError extends Error {
@@ -49,20 +53,25 @@ const num = (v: any): number => {
 // ==========================================================================
 async function availableToReturn(
   client: PoolClient,
+  warehouseId: string,
   clientServiceId: string,
   productId: string,
 ): Promise<{ saldo: number; emDevolucao: number; available: number }> {
+  // ⚠ AW1: o `warehouse_id` entrou aqui pelo MESMO motivo que entrou no lock — e no MESMO lote,
+  // porque separá-los seria o defeito. O advisory lock passou a ter grão (armazém, OP, produto);
+  // se este guard continuasse lendo o saldo GLOBAL, dois setores tomariam locks diferentes e
+  // leriam a mesma projeção — o lock deixaria de proteger o guard que ele existe para proteger.
   const { rows } = await client.query(
     `SELECT
         COALESCE((SELECT COALESCE(SUM(qty) FILTER (WHERE event_type IN ('recebido','transferido_in')), 0)
                        - COALESCE(SUM(qty) FILTER (WHERE event_type IN ('consumido','devolvido','transferido_out')), 0)
                     FROM op_material_events
-                   WHERE client_service_id = $1 AND product_id = $2), 0) AS saldo,
+                   WHERE warehouse_id = $3 AND client_service_id = $1 AND product_id = $2), 0) AS saldo,
         COALESCE((SELECT SUM(q.quantity)
                     FROM op_returns_pending q
                    WHERE q.client_service_id = $1 AND q.product_id = $2
                      AND q.status = 'pendente'), 0)                       AS em_devolucao`,
-    [clientServiceId, productId],
+    [clientServiceId, productId, warehouseId],
   );
   const saldo = num(rows[0]?.saldo);
   const emDevolucao = num(rows[0]?.em_devolucao);
@@ -75,18 +84,23 @@ async function availableToReturn(
 // em_devolucao. OP legada (sem eventos per-OP) tem saldo 0 -> lista VAZIA -> a tela mostra a
 // orientação de usar a Entrada de Reaproveitamento (limitação aceita e documentada na 009).
 // ==========================================================================
-export async function listReturnableItems(client: PoolClient, opCode: string): Promise<any[]> {
+// ⚠ AW1: ganhou `warehouseId` porque o cabeçalho acima é uma OBRIGAÇÃO, não uma observação —
+// "fonte única pro guard e pra lista, não podem divergir". O `availableToReturn` passou a
+// filtrar por armazém; se a lista continuasse global, a tela ofereceria material de OUTRO setor
+// e o registro o recusaria no submit. Divergir aqui é a tela mentir.
+export async function listReturnableItems(client: PoolClient, opCode: string, warehouseId: string): Promise<any[]> {
   const { rows } = await client.query(
     `WITH OPData AS (
         SELECT id FROM client_services WHERE op_code = $1
      ),
      Bal AS (
-        -- saldo WIP por produto (a MESMA projeção do SALDO_SQL / getOpBalance)
+        -- saldo WIP por produto (a MESMA projeção do SALDO_SQL / getOpBalance), NO ARMAZÉM
         SELECT e.product_id,
                COALESCE(SUM(e.qty) FILTER (WHERE e.event_type IN ('recebido','transferido_in')), 0)
              - COALESCE(SUM(e.qty) FILTER (WHERE e.event_type IN ('consumido','devolvido','transferido_out')), 0) AS saldo
           FROM op_material_events e
          WHERE e.client_service_id = (SELECT id FROM OPData)
+           AND e.warehouse_id = $2
          GROUP BY e.product_id
      ),
      Pend AS (
@@ -104,7 +118,7 @@ export async function listReturnableItems(client: PoolClient, opCode: string): P
        LEFT JOIN Pend pd ON pd.product_id = b.product_id
       WHERE (b.saldo - COALESCE(pd.em_devolucao, 0)) > 0
       ORDER BY p.name ASC`,
-    [opCode],
+    [opCode, warehouseId],
   );
   return rows.map((r) => ({
     product_id: r.product_id,
@@ -137,6 +151,17 @@ export async function registerPendingReturns(
     throw new ReturnError('SEM_RASTRO_PER_OP', 'OPs anteriores ao controle por OP: use a Entrada de Reaproveitamento.');
   }
 
+  // ── O ARMAZÉM DE QUEM DECLARA A DEVOLUÇÃO (AW1) ──────────────────────────────────────────
+  // Aqui `userId` é o OPERADOR do chão de fábrica (é ele quem registra), então o armazém sai do
+  // setor dele. É o mesmo saldo que o apontamento dele disputaria — por isso o mesmo lock.
+  // Quem não tem armazém não tem WIP para devolver: erro tipado, não "disponível 0".
+  const escopoQuemPede = await escopoDoPerfil(client, userId);
+  if (escopoQuemPede.warehouseId === null) {
+    throw new ReturnError('SETOR_SEM_CUSTODIA',
+      `Seu setor (${escopoQuemPede.sectorCru ?? 'não informado'}) não tem armazém — não há material seu em custódia para devolver.`);
+  }
+  const warehouseIdSetor = escopoQuemPede.warehouseId;
+
   // AGREGA por produto ANTES de qualquer coisa: dois itens do mesmo produto no mesmo pedido viram
   // UMA linha pendente (o grão da janela é (OP, produto)); e a ordenação por product_id abaixo
   // deixa a aquisição de locks DETERMINÍSTICA (deadlock-safe entre pedidos concorrentes).
@@ -158,10 +183,13 @@ export async function registerPendingReturns(
     // O disponível é o saldo WIP per-OP (PROJEÇÃO, sem linha pra FOR UPDATE): registro, apontamento e
     // conferência TÊM de se serializar sobre ESSE saldo, senão dois passam no guard e a projeção
     // per-OP vai a negativo. Por isso o lock é o 'opmat:' (o mesmo namespace da 008), não um próprio.
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`opmat:${clientServiceId}:${productId}`]);
+    // ⚠ AW1: a string agora sai de lockKeyOpMat e leva o ARMAZÉM. Aqui o `userId` É o operador
+    // que pede a devolução (o chão de fábrica declara), então o armazém é o do setor DELE — é o
+    // mesmo saldo WIP que ele apontaria. Resolvido uma vez, fora do laço (`warehouseIdSetor`).
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKeyOpMat(warehouseIdSetor, clientServiceId, productId)]);
 
-    // Guard DEPOIS do lock (a ordem é o contrato — ler antes do lock não vale).
-    const { saldo, available } = await availableToReturn(client, clientServiceId, productId);
+    // Guard DEPOIS do lock (a ordem é o contrato — ler antes do lock não vale), no MESMO grão.
+    const { saldo, available } = await availableToReturn(client, warehouseIdSetor, clientServiceId, productId);
     if (quantity > available) {
       throw new ReturnError('DEVOLUCAO_ACIMA_DO_DISPONIVEL',
         `Devolução acima do disponível na OP: o armazém da OP tem ${saldo} deste material` +
@@ -195,7 +223,8 @@ export async function conferReturn(
   // 1. TRAVA o pedido. É a linha materializada do fluxo -> serializa duas conferências da MESMA
   //    devolução e é o guard de idempotência de negócio (status muda 1x só, sob trava).
   const reqRes = await client.query(
-    `SELECT id, client_service_id, product_id, quantity, status FROM op_returns_pending WHERE id = $1 FOR UPDATE`,
+    // `requested_by` entra no SELECT por causa do A4: é ele, não o conferente, que diz o setor.
+    `SELECT id, client_service_id, product_id, quantity, status, requested_by FROM op_returns_pending WHERE id = $1 FOR UPDATE`,
     [requestId],
   );
   if (reqRes.rows.length === 0) throw new ReturnError('DEVOLUCAO_NAO_ENCONTRADA', 'Pedido de devolução não encontrado.');
@@ -217,8 +246,35 @@ export async function conferReturn(
 
   // 2. ADVISORY LOCK per-OP do razão WIP — a 008 é explícita: 'devolvido' TEM de pegar o MESMO lock
   //    do consume ('opmat:${op}:${produto}'), senão a exclusão mútua com o apontamento não existe.
-  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`opmat:${clientServiceId}:${productId}`]);
+  // ═══ O SETOR DO 'devolvido' (decisão A4 do lote AW1) ══════════════════════════════════════
+  //
+  // ⚠ NÃO VEM DO `userId`, E ISSO É O PONTO. Aqui `userId` é o ALMOXARIFE que CONFERE — o setor
+  // dele é "Almoxarifado", que no de-para é `null` (sem custódia). Carimbar dele gravaria o
+  // setor errado num evento que está tirando material do WIP de OUTRO setor: o saldo do setor
+  // que devolveu não baixaria, e o do almoxarifado iria a negativo a partir do nada.
+  //
+  // ⚠ E TAMBÉM NÃO VEM DO SALDO, ao contrário do consume e do transfer. O 'devolvido' é o único
+  // dos cinco que NÃO tem guard de saldo per-OP, e de propósito (ver a nota logo abaixo: o
+  // histórico per-OP é 100% NULL para material anterior ao go-live, e um guard aqui recusaria
+  // devolução de QUALQUER OP legada). Sem guard de saldo não há saldo de onde derivar.
+  //
+  // A fonte é `op_returns_pending.requested_by`: quem PEDIU a devolução é quem detinha o
+  // material. A linha está travada com FOR UPDATE desde o passo 1, então o valor é estável.
+  const escopoQuemPediu = await escopoDoPerfil(client, pedido.requested_by ?? null);
+  if (escopoQuemPediu.warehouseId === null) {
+    throw new ReturnError('DEVOLUCAO_SEM_SETOR_DE_ORIGEM',
+      `Quem registrou esta devolução está num setor sem armazém (${escopoQuemPediu.sectorCru ?? 'não informado'}) — não há custódia de onde baixar o material.`);
+  }
+  const warehouseIdSetor = escopoQuemPediu.warehouseId;
 
+  // Lock com a MESMA string do consume/transfer/register — pela MESMA função (A3).
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKeyOpMat(warehouseIdSetor, clientServiceId, productId)]);
+
+  // ⚠ DOIS ARMAZÉNS DIFERENTES NESTA FUNÇÃO, E ELES NÃO SE MISTURAM:
+  //   `warehouseIdSetor` -> de ONDE o material sai (o WIP do setor que devolveu)  -> livro (a)
+  //   `warehouseId`      -> para ONDE ele volta (o ALMOX central, pooled)          -> livro (b)
+  // Trocar um pelo outro creditaria o físico no armazém do setor, que é exatamente o erro que a
+  // doutrina do módulo evita.
   const warehouseId = await resolveWarehouseId(client, userId);
   const baseKey = `opret:confer:${requestId}`;
 
@@ -229,10 +285,12 @@ export async function conferReturn(
   // JANELA DE TRÂNSITO no registro (já barrou lá atrás; e conferredQty <= pedida). Aqui só
   // REGISTRAMOS a saída de WIP; o lock acima serializa contra o consume concorrente.
   const opEvent = await client.query(
-    `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key)
-     VALUES ('devolvido', $1, $2, $3, $4, $5)
-     RETURNING id, event_type, client_service_id, product_id, qty, created_at`,
-    [clientServiceId, productId, conferredQty, userId, `${baseKey}:devolvido`],
+    // `user_id` segue sendo o CONFERENTE (quem praticou o ato) e `warehouse_id` é o setor de
+    // QUEM PEDIU (de onde o material saiu). São perguntas diferentes e por isso duas colunas.
+    `INSERT INTO op_material_events (event_type, client_service_id, product_id, qty, user_id, op_key, warehouse_id)
+     VALUES ('devolvido', $1, $2, $3, $4, $5, $6)
+     RETURNING id, event_type, client_service_id, product_id, qty, warehouse_id, created_at`,
+    [clientServiceId, productId, conferredQty, userId, `${baseKey}:devolvido`, warehouseIdSetor],
   );
 
   // ── (b) FÍSICO CENTRAL: receive POOLED (op_id = NULL) ───────────────────────────────────────

@@ -21,6 +21,8 @@ import {
   listReturnableItems,
   ReturnError,
 } from '../services/returns.service';
+// AW1: o escopo de custódia (setor -> armazém) da tela de Devolução por OP.
+import { escopoDoPerfil } from '../services/opMaterialScope';
 import { assertQuantidadesValidas, isDecimalUnit, QuantidadeInvalidaError } from '../utils/quantidade';
 
 export const getStock = async (req: Request, res: Response) => {
@@ -535,6 +537,7 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
 // (O 400 tipado SEM_RASTRO_PER_OP vive no REGISTER como defesa; ver registerPendingReturns.)
 export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
   const { opCode } = req.params;
+  const userId = (req as any).user?.id ?? null;
   try {
     const result = await withTransaction(async (client) => {
       const op = await client.query('SELECT id FROM client_services WHERE op_code = $1', [opCode]);
@@ -542,12 +545,20 @@ export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
       // Rastro per-OP existe? OP sem NENHUM evento é legada (pré-controle por OP).
       const ev = await client.query('SELECT 1 FROM op_material_events WHERE client_service_id = $1 LIMIT 1', [op.rows[0].id]);
       const hasPerop = ev.rows.length > 0;
+      // ⚠ AW1: a lista é do armazém de QUEM ESTÁ OLHANDO, porque o registro (que é o passo
+      // seguinte desta mesma tela) passou a guardar por armazém. Lista global + registro por
+      // setor faria a tela oferecer material alheio e recusá-lo no submit.
+      // Setor sem armazém devolve lista vazia com a MESMA flag de sempre — não é 403: quem não
+      // tem custódia simplesmente não tem o que devolver, e a tela já sabe mostrar isso.
+      const escopo = await escopoDoPerfil(client, userId);
       // OP legada: nem roda o listReturnableItems (saldo seria 0) — devolve vazio + a flag.
-      const items = hasPerop ? await listReturnableItems(client, opCode) : [];
-      return { hasPerop, items };
+      const items = hasPerop && escopo.warehouseId
+        ? await listReturnableItems(client, opCode, escopo.warehouseId)
+        : [];
+      return { hasPerop, items, semCustodia: escopo.warehouseId === null };
     });
     if ('notFound' in result) return res.status(404).json({ error: 'OP não encontrada no sistema.' });
-    res.json({ has_perop_history: result.hasPerop, items: result.items });
+    res.json({ has_perop_history: result.hasPerop, items: result.items, sector_without_custody: result.semCustodia });
   } catch (error: any) {
     res.status(500).json({ error: 'Erro interno ao processar a busca da OP.' });
   }

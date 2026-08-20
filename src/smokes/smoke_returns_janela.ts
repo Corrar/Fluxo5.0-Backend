@@ -6,15 +6,15 @@
 // Quando tudo entra em trânsito, o item some da lista de devolvíveis.
 
 import { registerPendingReturns, listReturnableItems, ReturnError } from '../services/returns.service';
-import { runSmoke, pickPooledProduct, seedReturnable, anyUserId, assert, num } from './_smoke';
+import { runSmoke, pickPooledProduct, seedReturnable, sectorUser, assert, num } from './_smoke';
 
 runSmoke('janela de trânsito (pendente desconta o disponível per-OP + guard)', async (client) => {
   const prod = await pickPooledProduct(client);
-  const userId = await anyUserId(client);
-  const { opId, opCode } = await seedReturnable(client, prod.productId, { withdrawn: 10, recebido: 10 }, 'janela', userId);
+  const { userId, warehouseId: whSetor } = await sectorUser(client);
+  const { opId, opCode, warehouseId } = await seedReturnable(client, prod.productId, { withdrawn: 10, recebido: 10 }, 'janela', userId, whSetor);
 
   const rowOf = async () => {
-    const rows = await listReturnableItems(client, opCode);
+    const rows = await listReturnableItems(client, opCode, warehouseId);
     return rows.find((r) => r.product_id === prod.productId);
   };
 
