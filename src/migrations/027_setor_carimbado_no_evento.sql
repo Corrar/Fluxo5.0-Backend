@@ -49,9 +49,22 @@
 --   Contra elas, só o `user_id` de quem clicou em confirmar. O Bruno escolheu ESTEIRA.
 --   Registrado aqui porque uma escolha documental que vira dado precisa dizer que é escolha.
 --
--- POR QUE O BACKFILL É UMA REGRA SÓ PARA OS QUATRO
---   Com A6, o destino da separação passa a valer para os quatro eventos — inclusive os dois
---   cruzados. Então não há dois ramos: todos derivam de `separations.destination`.
+-- O BACKFILL TEM DOIS RAMOS PORQUE O RAZÃO TEM DUAS ORIGENS
+--   Ramo 1 — SEPARAÇÃO: `separations.destination`. Com A6, ele vale para os quatro eventos de
+--   origem-separação, inclusive os dois cruzados — não há sub-ramo.
+--
+--   Ramo 2 — SOLICITAÇÃO: `requests.warehouse_id`, DIRETO. Não se re-deriva de `requests.sector`:
+--   a coluna já é o CARIMBO que o lote D1 grava com o mesmo `resolveDestinationWarehouseId`, é FK
+--   real para `warehouses`, e usar texto quando existe uuid seria trocar o exato pelo traduzido.
+--   Conferido no evento que existe (20/08/2026): sector='Protótipo' e warehouse_id=PROTOTIPO —
+--   as duas fontes concordam, e a de uuid é a que não precisa de vocabulário.
+--
+--   ⚠ O RAMO 2 NASCEU DE MEDIÇÃO, NÃO DE PREVISÃO. Quando este lote foi provado a tabela tinha
+--   QUATRO eventos, todos de separação. Na hora de aplicar em produção ela tinha CINCO: o lote
+--   RS1 subiu no mesmo dia e alguém confirmou o primeiro recebimento por solicitação (PROT0826,
+--   100 un de 3.09.0278, 20/08 14:20Z). Sem este ramo aquele material ficaria SEM CARIMBO e
+--   sumiria do Armazém do Protótipo — a migration teria passado, porque a coluna é nullable.
+--   RÉGUA: PREMISSA DE ESTADO SE REMEDE NO MOMENTO DE APLICAR, NÃO NO DA PROVA.
 --
 -- ⚠ O `CASE` ABAIXO NÃO É UM SEGUNDO DE-PARA. A FONTE DO DE-PARA É `src/services/setor.ts`.
 --   Este CASE cobre EXATAMENTE os valores que existem nos eventos desta base e ABORTA em
@@ -99,7 +112,7 @@ COMMENT ON COLUMN op_material_events.warehouse_id IS
 CREATE INDEX IF NOT EXISTS idx_opmat_warehouse_op_product
   ON op_material_events (warehouse_id, client_service_id, product_id);
 
--- ── 3. BACKFILL a partir do destino da separação ────────────────────────────────────
+-- ── 3a. BACKFILL — RAMO SEPARAÇÃO (destino da separação) ────────────────────────────
 -- `WHERE e.warehouse_id IS NULL` é o que torna a re-execução no-op.
 UPDATE op_material_events e
    SET warehouse_id = w.id
@@ -116,6 +129,18 @@ UPDATE op_material_events e
  WHERE s.id = e.ref_separation_id
    AND e.warehouse_id IS NULL;
 
+-- ── 3b. BACKFILL — RAMO SOLICITAÇÃO (o carimbo que a solicitação já tem) ─────────────
+-- Sem CASE e sem vocabulário: `requests.warehouse_id` é FK para `warehouses`, gravada pelo
+-- mesmo resolver que este lote usa. Ele pode ser NULL em solicitações antigas (anteriores ao
+-- carimbo do lote D1); nesse caso o evento fica sem carimbo e a guarda abaixo DECLARA, em vez
+-- de inventar um armazém.
+UPDATE op_material_events e
+   SET warehouse_id = r.warehouse_id
+  FROM requests r
+ WHERE r.id = e.ref_request_id
+   AND r.warehouse_id IS NOT NULL
+   AND e.warehouse_id IS NULL;
+
 -- ── 4. GUARDA DE ESTADO: aborta se o resultado não for o esperado ───────────────────
 DO $$
 DECLARE
@@ -124,6 +149,7 @@ DECLARE
   n_total      INT;
   n_carimbado  INT;
   n_nao_trata  INT;
+  n_req_sem    INT;
   n_almox      INT;
 BEGIN
   SELECT count(*) INTO n_col FROM information_schema.columns
@@ -152,7 +178,16 @@ BEGIN
            'áàãâéêíóôõúüçÁÀÃÂÉÊÍÓÔÕÚÜÇ', 'aaaaeeiooouucAAAAEEIOOOUUC'))
          IN ('ESTEIRA', 'PROTOTIPO');
   IF n_nao_trata > 0 THEN
-    RAISE EXCEPTION '027: % evento(s) de origem tratada ficaram sem carimbo — backfill incompleto.', n_nao_trata;
+    RAISE EXCEPTION '027: % evento(s) de origem-SEPARACAO tratada ficaram sem carimbo — backfill incompleto.', n_nao_trata;
+  END IF;
+
+  -- A MESMA guarda para o ramo 2: solicitação COM carimbo não pode deixar evento sem carimbo.
+  SELECT count(*) INTO n_req_sem
+    FROM op_material_events e
+    JOIN requests r ON r.id = e.ref_request_id
+   WHERE e.warehouse_id IS NULL AND r.warehouse_id IS NOT NULL;
+  IF n_req_sem > 0 THEN
+    RAISE EXCEPTION '027: % evento(s) de origem-SOLICITACAO com carimbo na origem ficaram sem carimbo — backfill incompleto.', n_req_sem;
   END IF;
 
   -- Nenhum evento pode apontar para o ALMOX: o razão per-OP é WIP de SETOR. Material no ALMOX
@@ -165,7 +200,7 @@ BEGIN
   END IF;
 
   -- Sobrar NULL é ADMISSÍVEL (a coluna é nullable de propósito) mas nunca SILENCIOSO.
-  RAISE NOTICE '027 OK: eventos=%, carimbados=%, sem carimbo=% (nullable por decisao A1), almox=0',
+  RAISE NOTICE '027 OK: eventos=%, carimbados=%, sem carimbo=% (nullable por decisao A1), almox=0, ramos=separacao+solicitacao',
     n_total, n_carimbado, n_total - n_carimbado;
 END $$;
 
