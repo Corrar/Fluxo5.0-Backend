@@ -66,10 +66,23 @@
 --   sumiria do Armazém do Protótipo — a migration teria passado, porque a coluna é nullable.
 --   RÉGUA: PREMISSA DE ESTADO SE REMEDE NO MOMENTO DE APLICAR, NÃO NO DA PROVA.
 --
--- ⚠ O `CASE` ABAIXO NÃO É UM SEGUNDO DE-PARA. A FONTE DO DE-PARA É `src/services/setor.ts`.
---   Este CASE cobre EXATAMENTE os valores que existem nos eventos desta base e ABORTA em
---   qualquer outro (guarda no fim). É backfill de uma vez, não tradutor residente. Setor novo
---   entra como chave em SETOR_ARMAZEM — nunca aqui, e nunca em `warehouses.sector`.
+-- ⚠ O `CASE` DO RAMO 1 É UM RETRATO DA METADE POSITIVA DE `SETOR_ARMAZEM`, NÃO UM SEGUNDO
+--   DE-PARA. A FONTE CONTINUA SENDO `src/services/setor.ts`: setor novo entra como CHAVE LÁ,
+--   nunca aqui e nunca em `warehouses.sector`. Aqui é backfill de uma vez, com a guarda do fim
+--   como estopim se algum evento tratável escapar.
+--
+--   ⚠ ELE NASCEU ESTREITO E ISSO FOI DEFEITO, DUAS VEZES. A primeira versão cobria só ESTEIRA e
+--   PROTOTIPO — os únicos destinos que existiam nos eventos quando o lote foi provado. Aplicando
+--   em produção, o retrato envelheceu DUAS VEZES em menos de quatro horas:
+--     · apareceu o 1º recebimento por SOLICITAÇÃO (daí o ramo 2);
+--     · e um recebimento de separação com destination='Lavadora', confirmado pelo admin com a
+--       chave-mestra (D2/D3) três minutos depois da leitura de linha de base.
+--   'Lavadora' cairia no ELSE NULL e o material sumiria do armazém da Lavadora, com a migration
+--   commitando verde — porque a guarda também só olhava ESTEIRA e PROTOTIPO.
+--
+--   RÉGUA: ALLOWLIST RECORTADA PELO DADO DE HOJE É DÍVIDA COM DATA MARCADA. O recorte certo é o
+--   CONCEITO ("os setores que têm armazém"), não a AMOSTRA ("os setores que apareceram"). Agora
+--   o CASE e a guarda cobrem as ONZE chaves com armazém, e as duas listas são a mesma lista.
 --
 -- IDEMPOTENTE: re-executar é no-op (o UPDATE só toca `warehouse_id IS NULL`).
 -- =====================================================================================
@@ -122,8 +135,17 @@ UPDATE op_material_events e
          upper(translate(
            regexp_replace(btrim(s.destination), '^[Ss][Ee][Tt][Oo][Rr][[:space:]]*:[[:space:]]*', ''),
            'áàãâéêíóôõúüçÁÀÃÂÉÊÍÓÔÕÚÜÇ', 'aaaaeeiooouucAAAAEEIOOOUUC'))
-         WHEN 'ESTEIRA'   THEN 'ESTEIRA'
-         WHEN 'PROTOTIPO' THEN 'PROTOTIPO'
+         WHEN 'USINAGEM'        THEN 'USINAGEM'
+         WHEN 'ELETRICA'        THEN 'ELET'
+         WHEN '3D'              THEN 'P3D'
+         WHEN 'PRODUCAO 3D'     THEN 'P3D'
+         WHEN 'ESTEIRA'         THEN 'ESTEIRA'
+         WHEN 'LAVADORA'        THEN 'LAVADORA'
+         WHEN 'FLOW'            THEN 'FLOW'
+         WHEN 'CLASSIFICADORA'  THEN 'CLASSIF'
+         WHEN 'EMBALADORA'      THEN 'EMBALAD'
+         WHEN 'PROTOTIPO'       THEN 'PROTOTIPO'
+         WHEN 'DESENVOLVIMENTO' THEN 'DESENV'
          ELSE NULL
        END
  WHERE s.id = e.ref_separation_id
@@ -176,7 +198,8 @@ BEGIN
      AND upper(translate(
            regexp_replace(btrim(s.destination), '^[Ss][Ee][Tt][Oo][Rr][[:space:]]*:[[:space:]]*', ''),
            'áàãâéêíóôõúüçÁÀÃÂÉÊÍÓÔÕÚÜÇ', 'aaaaeeiooouucAAAAEEIOOOUUC'))
-         IN ('ESTEIRA', 'PROTOTIPO');
+         IN ('USINAGEM','ELETRICA','3D','PRODUCAO 3D','ESTEIRA','LAVADORA','FLOW',
+             'CLASSIFICADORA','EMBALADORA','PROTOTIPO','DESENVOLVIMENTO');
   IF n_nao_trata > 0 THEN
     RAISE EXCEPTION '027: % evento(s) de origem-SEPARACAO tratada ficaram sem carimbo — backfill incompleto.', n_nao_trata;
   END IF;
