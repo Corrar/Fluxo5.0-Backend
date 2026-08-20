@@ -2652,3 +2652,111 @@ O método de descobrir a URL viva **não muda e continua sendo o certo**: baixar
 extrair o `src` de `/assets/index-*.js` e `grep onrender.com`. Documentação envelhece — e esta
 envelheceu em oito dias. O bundle publicado é o que o front realmente chama. Medido agora, o
 bundle vivo já aponta para `fluxoroyale5-0-backend`.
+
+---
+
+# AW0 — REGULARIZAÇÃO DO RAZÃO DA OP (20/08/2026)
+
+**31 eventos · 3.604 unidades**, criados em transação única em produção. O furo A era: material
+entrou nos armazéns de setor por `transfer_in` (origem solicitação), **zero saiu**, e o razão
+per-OP reconhecia 109 de 3.820 unidades. Dois livros contando a mesma coisa diferente.
+
+O recorte, decidido pelo Bruno:
+
+| | |
+|---|---|
+| **R1** | só os transfers que a fila do Recebimento **NUNCA** alcança (`requests.delivered_at IS NULL`, anteriores ao RS1). **Critério: o script faz só o que o humano não pode fazer.** Os 7 que estão na fila ficam para os operadores confirmarem pela tela. |
+| **R2** | OP de **Despesas FORA** — "Despesas consome direto, sem armazém"; regularizar criaria WIP numa OP que não tem apontamento. |
+| **R3** | `op_key` = `aw0:regularizacao:req:<request_id>:item:<request_item_id>` — **ancorada no ITEM**. |
+| **R4** | `warehouse_id` do `stock_ledger.warehouse_id` (a fonte direta), não re-derivado do setor. |
+| **R5** | `event_type='recebido'` com `ref_request_id` + `ref_request_item_id`; par de separação NULL. |
+
+Resultado medido: a divergência `(armazém, produto)` caiu de **42 de 43 chaves / 3.725 un** para
+**14 de 43 / 125 un** — **29 chaves passaram a bater exatamente**, queda de 96,6%. `stock`
+intocado (39 linhas / 3.820 un, zero lançamentos novos no ledger). Fila do Recebimento intocada
+(101 separação + 7 solicitação).
+
+Registrado em `audit_logs` com `action='REGULARIZACAO_RAZAO_OP'`, contendo o recorte, os números
+e o **plano B literal**:
+
+```sql
+DELETE FROM op_material_events WHERE op_key LIKE 'aw0:regularizacao:%'
+```
+
+Cirúrgico: alcança só o sintético e nunca um ato humano. Sem FK bloqueando — medido antes de
+escrever: a única FK que aponta para `op_material_events` é a auto-referência `ref_event_id`, e
+**zero eventos são referenciados**.
+
+### ⚠ RÉGUA — "O BANCO NÃO PROTEGE CONTRA DUPLICAÇÃO; A ESCOLHA DA CHAVE PROTEGE"
+
+Não é teoria — foi medido em produção, num `SAVEPOINT` revertido:
+
+```
+mesma linha, chave ancorada no PAR  (aw0:PAR:<warehouse>:<product>)  -> ACEITA
+                                     saldo daquele item foi de 10 para 20
+mesma linha, chave ancorada no ITEM (a que o lote usa)               -> RECUSADA pelo UNIQUE
+```
+
+O `UNIQUE (op_key)` só recusa o que a **chave** já disse ser o mesmo fato. Se a chave descreve o
+fato errado, o banco carimba a duplicação sem reclamar. **A idempotência mora no desenho da
+chave, não na constraint.**
+
+**O caso vivo que decidiu a âncora**: `PROTOTIPO / PROT0826 / 3.09.0192` chegou em **TRÊS
+solicitações separadas** (30 + 30 + 7), com três `request_item_id` distintos. Ancorar no par
+`(armazém, produto)` colapsaria as três numa chave só e **duas virariam no-op** — o defeito exato
+do S2, que ancorou na separação e perdeu o 2º item. Agora com contra-prova, não só com memória.
+
+A cardinalidade foi **medida antes de escolher**, não assumida: 41 transfers → 41
+`request_item_id` distintos, relação 1:1. É essa medição que autoriza a âncora no item.
+
+### ⚠ RÉGUA — "QUANDO A FOTO ANTES SE PERDE, TROCAR POR PROVA EQUIVALENTE **E DECLARAR A TROCA**"
+
+O script de execução capturou as fotos ANTES dentro da transação, escreveu, commitou — e **morreu
+logo depois num `id` ambíguo na primeira consulta do laudo**. A escrita estava íntegra; o que se
+perdeu foram as fotos em memória, antes de serem comparadas.
+
+A comparação campo a campo das 39 linhas de `stock` ficou sem baseline. **O que NÃO se faz é
+baixar a asserção para o que ainda dá para provar e chamar de verde.** A troca foi por uma prova
+**mais forte**, e declarada como troca no cabeçalho do laudo:
+
+> toda mutação de `stock` passa pelo `StockService` e **escreve uma linha em `stock_ledger`**
+> (doutrina do módulo). Medido: **zero linhas de `stock_ledger` e zero de `stock` criadas depois
+> do corte** ⇒ não houve mutação nenhuma.
+
+Comparar 39 linhas provaria que aquelas 39 não mudaram. Provar que nenhum lançamento existiu
+prova que **nada** mudou, inclusive o que a foto não cobria. Foi ganho, não remendo — mas só
+porque foi dito.
+
+### O RESÍDUO CONHECIDO — 125 unidades, TRÊS causas, nenhuma sem nome
+
+| un | causa | destino |
+|---|---|---|
+| **112** | as **7 entregas de hoje**, que estão na fila do Recebimento | **some sozinho** quando os operadores confirmarem pela tela — é o R1 funcionando, não dívida |
+| **4** | **OP Despesas**, excluída **por decisão** (R2): saco de lixo na ESTEIRA (3) e copos no PROTOTIPO (1) | fica como resíduo do período pré-regra |
+| **9** | **o FURO SIMÉTRICO** | lote próprio |
+
+**⚠ A TORNEIRA DA DESPESAS SEGUE ABERTA.** As 4 unidades não são um resíduo estático: **broca e
+lima de Despesas chegaram ao armazém de setor HOJE**, pelo mesmo caminho (solicitação com OP de
+Despesas → entrega → `transfer_in`). A regra "Despesas consome direto, sem armazém" **não está
+implementada em lugar nenhum** — é decisão de produto que o código não conhece. Enquanto não for,
+o resíduo cresce a cada entrega. **Fechar isso é lote próprio e vale fazer logo.**
+
+**⚠ O FURO SIMÉTRICO — o inverso do furo A.** A **saída manual** (`separations.type='manual'`)
+roda `StockService.consume` no **ALMOX pooled** e para aí: **nunca credita o armazém do setor**.
+Quando o setor confirma o recebimento, nasce o evento no razão — mas o `stock` do armazém de
+setor nunca recebeu nada. Resultado: **o razão sabe e o `stock` não**, exatamente ao contrário do
+furo A. São 5 chaves / 9 unidades hoje (`3.03.0039`, `9.99.1150`, `2.02.0034`, `2.07.0028` e
+`5.03.0005`, esta com +2 sobre o stock). Lote próprio.
+
+**112 + 4 + 9 = 125.** Se algum dia o resto divergir sem entrar numa dessas três, é fato novo.
+
+### O KPI SALTOU, E NÃO É ANOMALIA
+
+`wip_unidades` do Painel da Produção foi de **109 para 3.713** (medido), e `wip_linhas` de **6
+para 34**. Não explodiu nada: **é o razão passando a enxergar o que já estava nos armazéns**. O
+Armazém da ESTEIRA saiu de 2 unidades para 3.310 (3.308 delas da OP `901001` — MANTIQUEIRA CÉU
+AZUL), e o da ELET aparece pela primeira vez.
+
+O efeito que o lote existia para produzir: **o teto do apontamento passou a ser confiável.** Até
+aqui `saldoDe` devolvia ~0 para quase tudo, e qualquer apontamento morreria em
+`SALDO_INSUFICIENTE_NA_OP` com o material fisicamente na bancada do operador.
