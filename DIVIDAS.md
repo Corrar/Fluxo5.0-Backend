@@ -2382,3 +2382,145 @@ O custo de errar é assimétrico e por isso a escolha não é gosto:
 - allowlist errada = alguém não vê uma linha que queria, reclama, e se conserta;
 - denylist errada = alguém vê uma linha que não devia, **não percebe**, e o quadro de trabalho
   volta a ser um histórico sem ninguém notar.
+
+## LOTE RS1 — entrega de solicitação gera pendência de recebimento
+
+### (a) Colunas novas, porque reusar era IMPOSSÍVEL
+
+`op_material_events` ganhou `ref_request_id` e `ref_request_item_id`, com FK real. A alternativa
+de reusar `ref_separation_id`/`ref_separation_item_id` com semântica dupla foi **medida** e não é
+apenas feia — é **impossível**: as duas têm FOREIGN KEY para `separations`/`separation_items`, e o
+banco REJEITARIA um `request_id`. Reusá-las exigiria **derrubar as duas FKs**, trocando
+integridade referencial por duas colunas de economia.
+
+Custo real do ALTER: a tabela tinha **4 linhas**. Instantâneo, sem reescrita, sem lock relevante.
+
+O CHECK passou a exigir **exatamente UMA** origem completa — as quatro colunas juntas não passam,
+e nenhuma delas também não. Os quatro casos estão provados, cada um falando sozinho.
+
+### ⚠ A PENDÊNCIA NÃO É UMA LINHA — e não podia ser
+
+O briefing pedia criar a pendência com `op_key: request:<id>:item:<id>:pending`. Medindo, isso
+não tinha onde existir:
+
+- `op_material_events.event_type` tem CHECK com **5 valores**, e `'pendente'` não é um deles;
+- **e, sobretudo, gravar no razão NA ENTREGA creditaria a OP ANTES da confirmação** — o oposto
+  exato da decisão do lote ("o setor confirma, e SÓ ENTÃO o material consta na OP").
+
+A pendência é **derivada**, como a da separação: `request_items − Σ recebido`. O que nasce na
+entrega é o **carimbo**. Idempotência sai de graça: itens não se duplicam.
+
+### `requests.delivered_at` — acréscimo ao escopo, com razão
+
+`requests` não tinha **nenhum** carimbo de entrega (nem `updated_at`). A fila ordena por `sent_at`
+e filtra pelo CUTOFF com ele; sem equivalente do lado da solicitação não haveria eixo para ordenar
+nem para conter. `created_at` não serve: é quando o setor PEDIU, não quando o almoxarifado
+ENTREGOU — a diferença medida chega a meses.
+
+**Sem backfill, de propósito.** As 2.496 entregas históricas ficam com `delivered_at` NULL e por
+isso fora da fila — que é a decisão (não há pendência retroativa). Preencher com `created_at`
+seria inventar uma data que ninguém registrou, e jogaria **1.916 itens** na fila de uma vez.
+
+### ⚠ RÉGUA CARA: `try/catch` NÃO SALVA TRANSAÇÃO ABORTADA NO POSTGRES
+
+A garantia "a entrega nunca falha por causa da pendência" estava **FALSA** na primeira versão.
+O bloco era um `try { await client.query(UPDATE) } catch {}` nu — e no Postgres, statement que
+falha dentro de transação **aborta a transação inteira**: todo comando seguinte devolve
+`current transaction is aborted` até o ROLLBACK. Capturar o erro em JS não desaborta nada; o
+COMMIT vira ROLLBACK e a entrega inteira se perde.
+
+**Não é teoria — foi medido.** A prova PR5 força a falha com um trigger e mediu, na 1ª rodada:
+**HTTP 500 e ZERO lançamentos no razão** — o material não se moveu. Exatamente o que a garantia
+prometia impedir.
+
+Corrigido com **SAVEPOINT**: `SAVEPOINT` antes, `RELEASE` no sucesso, `ROLLBACK TO SAVEPOINT` na
+falha. Depois disso, PR5 mede HTTP 200 com `transfer_in`/`transfer_out` gravados e o carimbo
+ausente. **Toda operação "best-effort" dentro de uma transação precisa de SAVEPOINT, não de
+try/catch.**
+
+### (c) A contenção, e por que NÃO é janela por data
+
+A fila tinha 102 linhas e ganha ~568 itens/mês. A contenção é **teto de linhas** (`LIMIT 500`)
+com ordenação pela **mais antiga primeiro**, não janela por data.
+
+**Regra dura: pendência aberta entra sempre, sem idade.** Toda linha da fila é, por construção,
+pendência aberta. Uma janela por data excluiria material a confirmar por ter envelhecido — e quem
+for cortado pelo teto é o material recém-entregue, que reaparece amanhã, nunca o antigo.
+
+**E isso também foi medido, não deduzido.** A primeira versão repetia o `CUTOFF_DATE` no ramo da
+solicitação; PR9 envelheceu um carimbo para 730 dias e a pendência **sumiu da fila**. O cutoff
+saiu: do lado da solicitação não existe histórico pré-virada (não há backfill), então ele era um
+segundo filtro redundante capaz de produzir exatamente o que a regra proíbe.
+
+### (b) e (d) A decisão D2, com os números
+
+**Solicitação sem OP (`client_service_id` NULL) NÃO gera pendência.** É o que o `NOT NULL` de
+`op_material_events.client_service_id` impõe — mas fica registrado como **decisão ACEITA, não
+herdada**: esse material segue indo direto ao armazém do setor sem nunca constar em OP.
+
+O tamanho do buraco, medido em produção (19/08/2026):
+
+```
+solicitações entregues ................. 2.496
+  com client_service_id ................ 1.409  (56,5%)
+  SEM  client_service_id ............... 1.087  (43,5%)   <- nunca constam em OP
+com armazém de setor E com OP .......... 1.313 solicitações · 1.916 itens
+```
+
+**E a tendência importa mais que o acumulado** — o vínculo com OP é recente:
+
+```
+até mar/2026 ....... 0 de 488 com OP
+abr/2026 ........... 39 de 259
+mai/2026 em diante . ~80% com OP
+ago/2026 ........... 226 de 286
+```
+
+O buraco é **pré-existente e está encolhendo**; este lote não o cria — ele o torna **visível**,
+porque agora há uma fila onde a ausência aparece. Fechá-lo é decidir se solicitação sem OP deve
+ser possível, e isso é lote próprio.
+
+### Onde a régua de custódia ficou
+
+**Um só guard, duas origens.** `origemSetor` é `separations.destination` ou `requests.sector`;
+`canonSetor` normaliza os dois igual — medido: 26 grafias de `destination` → 17 canônicos, 17 de
+`requests.sector` → 16, incluindo as **210 linhas com prefixo "Setor: "** que o canon já remove.
+D1 (setor sem armazém fora da fila) vale igual para as duas.
+
+### RÉGUA — "FILTRO REDUNDANTE SÓ PRODUZ DANO"
+
+Um filtro que, no caminho feliz, nunca exclui nada, não é inofensivo: é uma bomba de efeito
+retardado. Ele não tem como ajudar — o que ele filtraria já foi filtrado por outra cláusula — e
+tem como atrapalhar, no dia em que a premissa que o tornava vazio deixar de valer.
+
+O caso: o ramo da solicitação nasceu com `delivered_at >= CUTOFF_DATE`, copiado do ramo da
+separação. Do lado da separação o cutoff faz trabalho real (mantém fora o histórico pré-virada,
+que nunca foi confirmado). Do lado da solicitação **esse histórico não existe** — a 026 não faz
+backfill, então só entra o que for entregue depois do lote, e a ausência do carimbo já é o filtro.
+
+O cutoff era, portanto, sempre verdadeiro. Até PR9 envelhecer um carimbo para 730 dias: aí ele
+**apagou a pendência da fila**, produzindo exatamente o que a regra dura do lote proíbe (pendência
+aberta sumindo por idade). Um filtro que nunca ajudava, e que na única vez em que agiu, errou.
+
+**Antes de copiar uma cláusula de um ramo para outro, perguntar o que ela filtra NESTE ramo. Se a
+resposta for "nada", ela não é defesa — é dano à espera de gatilho.**
+
+### RÉGUA — "SAVEPOINT, NÃO try/catch, PARA BEST-EFFORT EM TRANSAÇÃO"
+
+Já descrita acima com o caso; fica nomeada aqui para ser encontrável.
+
+No Postgres, statement que falha dentro de transação **aborta a transação inteira**: todo comando
+seguinte devolve `current transaction is aborted` até o ROLLBACK. `try { await query() } catch {}`
+captura o erro em JS e **não desaborta nada** — o COMMIT no fim vira ROLLBACK e tudo o que a
+transação já tinha feito se perde.
+
+Medido nos dois lados, com a falha forçada por trigger:
+
+```
+com try/catch nu ... HTTP 500 · ledger=[]                              <- material NÃO se moveu
+com SAVEPOINT ...... HTTP 200 · ledger=[transfer_in=1, transfer_out=1] <- material moveu, carimbo NULL
+```
+
+**Toda operação que se quer "best-effort" dentro de uma transação precisa de SAVEPOINT antes,
+RELEASE no sucesso e ROLLBACK TO SAVEPOINT na falha.** Sem isso, o "best-effort" derruba a
+transação inteira — o contrário exato do que a expressão promete.

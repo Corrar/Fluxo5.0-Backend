@@ -433,10 +433,14 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     const { changedProducts } = await withTransaction(async (client) => {
       const warehouseId = await resolveWarehouseId(client, userId);
 
-      const currentRes = await client.query('SELECT status, sector FROM requests WHERE id = $1 FOR UPDATE', [id]);
+      // client_service_id vem NO MESMO SELECT travado (lote RS1): a pendência de recebimento
+      // depende dele, e lê-lo aqui garante que é a verdade da linha JÁ travada, não uma
+      // segunda leitura que poderia ver outro estado.
+      const currentRes = await client.query('SELECT status, sector, client_service_id FROM requests WHERE id = $1 FOR UPDATE', [id]);
       if (!currentRes.rows[0]?.status) throw new Error("Solicitação não encontrada");
       const currentStatus = currentRes.rows[0].status;
       const requestSector = currentRes.rows[0].sector;
+      const clientServiceIdDaRequest = currentRes.rows[0].client_service_id ?? null;
 
       // Validação de TRANSIÇÃO: bloqueia pulos de estado (ex.: aberto→entregue). Roda APÓS o FOR UPDATE
       // (verdade travada) e ANTES de qualquer toque em estoque (adjusted_items/consume/release/receive).
@@ -624,6 +628,62 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
               });
             }
             await abaterQtyReservada(client, item.id, finalQty);
+          }
+        }
+
+        // ── PENDÊNCIA DE RECEBIMENTO (lote RS1) ────────────────────────────────────────────
+        // A pendência é DERIVADA, não materializada: a fila do Recebimento a calcula como
+        // `request_items − Σ recebido`, exatamente como já faz para separação. Não existe linha
+        // de "pendente" — e não pode existir:
+        //   · `op_material_events.event_type` tem CHECK com 5 valores e 'pendente' não é um;
+        //   · gravar no razão AQUI creditaria a OP ANTES da confirmação, que é o oposto da
+        //     decisão do lote (o setor confirma, e SÓ ENTÃO o material consta na OP).
+        //
+        // O que nasce aqui é o CARIMBO DE ENTREGA. Ele é o gatilho: com `delivered_at` a linha
+        // entra na fila; sem ele, não. `requests` não tinha nenhum carimbo de entrega (nem
+        // updated_at) — a fila precisa dele para ORDENAR, para o CUTOFF e para a janela.
+        //
+        // ⚠ NUNCA FALHA A ENTREGA. Material físico já foi transferido acima; deixar a entrega
+        // estourar por causa de um carimbo prenderia o material num limbo contábil. O escudo é o
+        // SAVEPOINT logo abaixo — e ele precisa ser SAVEPOINT, não try/catch (ver o porquê lá).
+        // A consequência de falhar é conhecida e suportável: a linha não aparece na fila, e o
+        // material continua onde o transfer o pôs.
+        //
+        // NADA ACONTECE quando:
+        //   · não há armazém de destino (setor sem custódia — mesma D1 do guard da fila:
+        //     o material foi CONSUMIDO na entrega, não há custódia a confirmar);
+        //   · a solicitação não tem OP (client_service_id NULL) — `op_material_events`
+        //     .client_service_id é NOT NULL, então não haveria a que creditar. Decisão D2,
+        //     aceita e registrada no DIVIDAS.
+        if (destinoWarehouseId && clientServiceIdDaRequest) {
+          // ⚠ SAVEPOINT, NÃO try/catch NU. Um `try { await client.query(...) } catch {}` NÃO
+          // salva nada aqui: no Postgres, statement que falha dentro de transação ABORTA A
+          // TRANSAÇÃO INTEIRA — todo comando seguinte devolve
+          // "current transaction is aborted" até o ROLLBACK. Capturar o erro em JS não
+          // desaborta nada; o COMMIT no fim vira ROLLBACK e a entrega inteira se perde.
+          //
+          // Isto NÃO é teoria: a primeira versão deste bloco usava try/catch nu, e a prova PR5
+          // (que força a falha com um trigger) mediu HTTP 500 e ZERO lançamentos no razão — o
+          // material não se moveu. O SAVEPOINT delimita o estrago: rollback até ele devolve a
+          // transação ao estado válido de antes do UPDATE, e a entrega segue.
+          try {
+            await client.query('SAVEPOINT rs1_carimbo');
+            // IDEMPOTENTE por construção: só carimba se ainda não houver carimbo. Re-entrega
+            // (mesmo id, mesma transição) não move a data nem duplica pendência — a pendência
+            // é derivada dos itens, que não se duplicam.
+            await client.query(
+              `UPDATE requests SET delivered_at = COALESCE(delivered_at, now()) WHERE id = $1`,
+              [id],
+            );
+            await client.query('RELEASE SAVEPOINT rs1_carimbo');
+          } catch (e: any) {
+            await client.query('ROLLBACK TO SAVEPOINT rs1_carimbo');
+            console.error(JSON.stringify({
+              event: 'rs1_carimbo_entrega_falhou', request_id: id,
+              err_msg: String(e?.message ?? '').slice(0, 300),
+            }));
+            // segue: o material físico já foi movido acima, e é isso que não pode ficar preso.
+            // A consequência conhecida é a linha não aparecer na fila de recebimento.
           }
         }
       }

@@ -62,6 +62,11 @@ const STATUS_ENTREGUES = ['entregue', 'concluida'];
 const CUTOFF_DEFAULT = '2026-07-17';
 const CUTOFF_DATE = (process.env.PEROP_CUTOFF_DATE || '').trim() || CUTOFF_DEFAULT;
 
+// TETO DE LINHAS DA FILA (lote RS1, decisão D3). Medido: a fila tinha 102 linhas e ganha ~568
+// itens/mês com a origem-solicitação. O teto não é janela por DATA de propósito — ver o
+// comentário dentro da query: pendência aberta entra sempre, sem idade.
+const MAX_LINHAS_FILA = 500;
+
 // Fórmula da projeção em UM lugar só. Todo saldo per-OP passa por aqui — se um event_type novo
 // entrar no CHECK da 008, é ESTE trecho que decide o sinal dele (e só ele).
 const SALDO_SQL = `
@@ -81,32 +86,63 @@ async function saldoDe(client: PoolClient, clientServiceId: string, productId: s
 // ==========================================================================
 // a) POST /op-materials/receive — o setor confirma o que recebeu da separação entregue.
 // ==========================================================================
+// ── AS DUAS ORIGENS DO RECEBIMENTO (lote RS1) ────────────────────────────────────────────────
+// O handler nasceu só para separação. Agora aceita `requestId` no lugar de `separationId`, e a
+// diferença entre os dois caminhos é ESTREITA de propósito: o que muda é DE ONDE saem a OP, o
+// setor e a linha entregue. Teto, idempotência, guard de custódia e o INSERT no razão são os
+// MESMOS — duplicá-los faria as duas origens divergirem no dia que uma regra mudasse.
 export const receiveOpMaterial = async (req: Request, res: Response) => {
-  const { separationId, items } = req.body ?? {};
+  const { separationId, requestId, items } = req.body ?? {};
   const userId = (req as any).user?.id ?? null;
   const idemKey = idemFrom(req);
+  const origemSolicitacao = !separationId && !!requestId;
 
   try {
-    if (!separationId) throw new OpMatError('SEPARACAO_OBRIGATORIA', 'Informe a separação de origem.');
+    if (separationId && requestId) {
+      throw new OpMatError('ORIGEM_AMBIGUA', 'Informe a separação OU a solicitação de origem, nunca as duas.');
+    }
+    if (!separationId && !requestId) throw new OpMatError('SEPARACAO_OBRIGATORIA', 'Informe a separação ou a solicitação de origem.');
     if (!Array.isArray(items) || items.length === 0) throw new OpMatError('ITENS_OBRIGATORIOS', 'Informe ao menos um item recebido.');
     if (!idemKey) throw new OpMatError('IDEMPOTENCY_KEY_OBRIGATORIA', 'Header X-Idempotency-Key é obrigatório neste endpoint.');
 
     const result = await withTransaction(async (client) => {
-      // 1. Trava a separação: serializa recebimentos concorrentes DA MESMA separação, que é onde
-      //    o teto por item pode ser furado por corrida.
-      const sep = await client.query(
-        `SELECT id, status, client_service_id, destination FROM separations WHERE id = $1 FOR UPDATE`,
-        [separationId],
-      );
-      if (sep.rows.length === 0) throw new OpMatError('SEPARACAO_NAO_ENCONTRADA', 'Separação não encontrada.');
-      // Mesma lista do pending-receipts (D2): 'entregue' (Quadro Gestão) e 'concluida' (saída
-      // manual). Aceitar aqui só 'entregue' listaria saída manual na fila e recusaria no submit.
-      if (!STATUS_ENTREGUES.includes(sep.rows[0].status)) {
-        throw new OpMatError('SEPARACAO_NAO_ENTREGUE', `Só dá pra receber separação já entregue (esta está "${sep.rows[0].status}").`);
+      // 1. Trava a ORIGEM: serializa recebimentos concorrentes da MESMA origem, que é onde o
+      //    teto por item pode ser furado por corrida. Mesma disciplina nas duas.
+      let origemSetor: string | null;
+      let clientServiceId: string | null;
+      if (origemSolicitacao) {
+        const rq = await client.query(
+          `SELECT id, status, client_service_id, sector, delivered_at FROM requests WHERE id = $1 FOR UPDATE`,
+          [requestId],
+        );
+        if (rq.rows.length === 0) throw new OpMatError('SOLICITACAO_NAO_ENCONTRADA', 'Solicitação não encontrada.');
+        if (rq.rows[0].status !== 'entregue') {
+          throw new OpMatError('SOLICITACAO_NAO_ENTREGUE', `Só dá pra receber solicitação já entregue (esta está "${rq.rows[0].status}").`);
+        }
+        // O CARIMBO é o que faz a pendência existir. Sem ele a linha nem aparece na fila —
+        // recusar aqui evita que um POST forjado confirme o que a fila não ofereceu.
+        if (!rq.rows[0].delivered_at) {
+          throw new OpMatError('SOLICITACAO_SEM_ENTREGA_REGISTRADA', 'Esta solicitação não tem entrega registrada — não há recebimento a confirmar.');
+        }
+        clientServiceId = rq.rows[0].client_service_id;
+        origemSetor = rq.rows[0].sector;
+        if (!clientServiceId) throw new OpMatError('SOLICITACAO_SEM_OP', 'Solicitação não tem OP vinculada — não alimenta o armazém da OP.');
+      } else {
+        const sep = await client.query(
+          `SELECT id, status, client_service_id, destination FROM separations WHERE id = $1 FOR UPDATE`,
+          [separationId],
+        );
+        if (sep.rows.length === 0) throw new OpMatError('SEPARACAO_NAO_ENCONTRADA', 'Separação não encontrada.');
+        // Mesma lista do pending-receipts (D2): 'entregue' (Quadro Gestão) e 'concluida' (saída
+        // manual). Aceitar aqui só 'entregue' listaria saída manual na fila e recusaria no submit.
+        if (!STATUS_ENTREGUES.includes(sep.rows[0].status)) {
+          throw new OpMatError('SEPARACAO_NAO_ENTREGUE', `Só dá pra receber separação já entregue (esta está "${sep.rows[0].status}").`);
+        }
+        // 2. A OP vem da ORIGEM, nunca do body — o body não escolhe pra qual OP o material vai.
+        clientServiceId = sep.rows[0].client_service_id;
+        origemSetor = sep.rows[0].destination;
+        if (!clientServiceId) throw new OpMatError('SEPARACAO_SEM_OP', 'Separação não tem OP vinculada — não alimenta o armazém da OP.');
       }
-      // 2. A OP vem da SEPARAÇÃO, nunca do body — o body não escolhe pra qual OP o material vai.
-      const clientServiceId = sep.rows[0].client_service_id;
-      if (!clientServiceId) throw new OpMatError('SEPARACAO_SEM_OP', 'Separação não tem OP vinculada — não alimenta o armazém da OP.');
 
       // 2b. GUARD DE CUSTÓDIA POR SETOR (decisões D1/D2/D3 do lote GUARD-RECEBIMENTO, 18/08/2026).
       //
@@ -114,7 +150,11 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
       // armazém no de-para (canonSetor(destination) -> null em SETOR_ARMAZEM), o material foi
       // consumido na entrega, não fica em custódia de setor nenhum — não há "o quê" receber aqui.
       // Nem o master recebe o que não tem custódia; isto não é permissão, é o recurso não existir.
-      const destino = resolveDestinationWarehouse(sep.rows[0].destination);
+      // GUARD DE CUSTÓDIA: UM só, para as DUAS origens. `origemSetor` é
+      // separations.destination ou requests.sector — canonSetor normaliza os dois igual
+      // (medido: 26 grafias de destination -> 17 canônicos; 17 de requests.sector -> 16,
+      // incluindo as 210 com prefixo "Setor: " que o canon já remove).
+      const destino = resolveDestinationWarehouse(origemSetor);
       if (destino.code === null) {
         throw new OpMatError('SETOR_SEM_CUSTODIA', 'Este setor não tem armazém — o material foi consumido na entrega, não há recebimento a confirmar aqui.');
       }
@@ -124,7 +164,7 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
       const isMaster = perfil.rows[0]?.role === 'admin' || perfil.rows[0]?.role === 'almoxarife';
       if (!isMaster) {
         const operadorCanon = canonSetor(perfil.rows[0]?.sector ?? null);
-        if (canonSetor(sep.rows[0].destination) !== operadorCanon) {
+        if (canonSetor(origemSetor) !== operadorCanon) {
           throw new OpMatError('SETOR_ALHEIO', 'Só o setor de destino pode confirmar este recebimento.');
         }
       }
@@ -136,17 +176,29 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
         const qty = num(it?.qty);
         if (!(qty > 0)) throw new OpMatError('QTD_INVALIDA', 'Quantidade recebida precisa ser maior que zero.');
 
-        // 3. Resolve a linha entregue: por itemId (preciso) ou por productId (conveniência da tela).
-        const li = it?.itemId
-          ? await client.query(`SELECT id, product_id, quantity FROM separation_items WHERE id = $1 AND separation_id = $2`, [it.itemId, separationId])
-          : await client.query(`SELECT id, product_id, quantity FROM separation_items WHERE separation_id = $1 AND product_id = $2`, [separationId, it?.productId]);
-        if (li.rows.length === 0) throw new OpMatError('ITEM_NAO_ENCONTRADO', 'Item não pertence a esta separação.');
-        if (li.rows.length > 1) throw new OpMatError('ITEM_AMBIGUO', 'Produto repetido nesta separação — mande itemId em vez de productId.');
+        // 3. Resolve a linha entregue: por itemId (preciso) ou por productId (conveniência da
+        //    tela). A quantidade "entregue" da solicitação usa COALESCE(quantity_delivered,
+        //    quantity_requested) — a MESMA fórmula do ramo 'entregue' de requests.controller e
+        //    da fila. Divergir aqui faria o teto não bater com o que saiu do almoxarifado.
+        const li = origemSolicitacao
+          ? (it?.itemId
+              ? await client.query(`SELECT id, product_id, COALESCE(quantity_delivered, quantity_requested) AS quantity FROM request_items WHERE id = $1 AND request_id = $2`, [it.itemId, requestId])
+              : await client.query(`SELECT id, product_id, COALESCE(quantity_delivered, quantity_requested) AS quantity FROM request_items WHERE request_id = $1 AND product_id = $2`, [requestId, it?.productId]))
+          : (it?.itemId
+              ? await client.query(`SELECT id, product_id, quantity FROM separation_items WHERE id = $1 AND separation_id = $2`, [it.itemId, separationId])
+              : await client.query(`SELECT id, product_id, quantity FROM separation_items WHERE separation_id = $1 AND product_id = $2`, [separationId, it?.productId]));
+        const ondeF = origemSolicitacao ? 'solicitação' : 'separação';
+        if (li.rows.length === 0) throw new OpMatError('ITEM_NAO_ENCONTRADO', `Item não pertence a esta ${ondeF}.`);
+        if (li.rows.length > 1) throw new OpMatError('ITEM_AMBIGUO', `Produto repetido nesta ${ondeF} — mande itemId em vez de productId.`);
         const itemId = li.rows[0].id;
         const productId = li.rows[0].product_id;
         const entregue = num(li.rows[0].quantity);
 
-        const opKey = `opmat:recv:${idemKey}:sep:${separationId}:item:${itemId}`;
+        // op_key com o PREFIXO DA ORIGEM: `:sep:` e `:req:` nunca colidem, então a mesma
+        // X-Idempotency-Key reusada em origens diferentes não se auto-deduplica.
+        const opKey = origemSolicitacao
+          ? `opmat:recv:${idemKey}:req:${requestId}:item:${itemId}`
+          : `opmat:recv:${idemKey}:sep:${separationId}:item:${itemId}`;
 
         // 4. PRÉ-CHECK no razão próprio, ANTES do teto: se esta op_key já existe, é replay do mesmo
         //    POST. Tem que sair fora sem contar contra o teto — senão o retry se auto-rejeita
@@ -155,9 +207,10 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
         if (ja.rows.length > 0) { replays.push(itemId); continue; }
 
         // 5. TETO: recebimento PARCIAL é ok; ultrapassar o entregue não.
+        const colunaOrigemItem = origemSolicitacao ? 'ref_request_item_id' : 'ref_separation_item_id';
         const rec = await client.query(
           `SELECT COALESCE(SUM(qty), 0) AS total FROM op_material_events
-            WHERE ref_separation_item_id = $1 AND event_type = 'recebido'`,
+            WHERE ${colunaOrigemItem} = $1 AND event_type = 'recebido'`,
           [itemId],
         );
         const jaRecebido = num(rec.rows[0].total);
@@ -167,12 +220,20 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
             `Recebimento acima do entregue: a separação entregou ${entregue} e já recebeu ${jaRecebido} (resta ${teto}).`);
         }
 
+        // As QUATRO colunas de origem vão no INSERT, com exatamente um par preenchido — é o
+        // que o ck_opmat_recebido_tem_origem da 026 exige. O outro par vai NULL explícito: se
+        // um dia este código mandar os dois, o banco recusa em vez de gravar ambiguidade.
         const ins = await client.query(
           `INSERT INTO op_material_events
-             (event_type, client_service_id, product_id, qty, ref_separation_id, ref_separation_item_id, user_id, op_key)
-           VALUES ('recebido', $1, $2, $3, $4, $5, $6, $7)
+             (event_type, client_service_id, product_id, qty,
+              ref_separation_id, ref_separation_item_id, ref_request_id, ref_request_item_id,
+              user_id, op_key)
+           VALUES ('recebido', $1, $2, $3, $4, $5, $6, $7, $8, $9)
            RETURNING id, event_type, client_service_id, product_id, qty, created_at`,
-          [clientServiceId, productId, qty, separationId, itemId, userId, opKey],
+          [clientServiceId, productId, qty,
+           origemSolicitacao ? null : separationId, origemSolicitacao ? null : itemId,
+           origemSolicitacao ? requestId : null, origemSolicitacao ? itemId : null,
+           userId, opKey],
         );
         criados.push(ins.rows[0]);
       }
@@ -425,37 +486,99 @@ export const getPendingReceipts = async (req: Request, res: Response) => {
     const verTudo = isMaster && scopeAll; // scope=all só tem efeito para quem TEM o papel — fail-closed
 
     const { rows } = await pool.query(
-      `SELECT s.id                AS separation_id,
-              s.destination       AS sector,
-              s.status,
-              -- saída manual não preenche sent_at (só o authorize 'entregar' preenche) -> cai no created_at
-              COALESCE(s.sent_at, s.created_at) AS sent_at,
-              cs.id               AS client_service_id,
-              cs.op_code,
-              si.id               AS item_id,
-              si.product_id,
-              p.sku, p.name, p.unit,
-              si.quantity                          AS entregue,
-              COALESCE(r.total, 0)                 AS recebido,
-              si.quantity - COALESCE(r.total, 0)   AS pendente
-         FROM separations s
-         JOIN separation_items si ON si.separation_id = s.id
-         JOIN products p          ON p.id = si.product_id
-         JOIN client_services cs  ON cs.id = s.client_service_id
-         LEFT JOIN LATERAL (
-              SELECT SUM(e.qty) AS total FROM op_material_events e
-               WHERE e.ref_separation_item_id = si.id AND e.event_type = 'recebido'
-         ) r ON TRUE
-        WHERE s.status = ANY($1)
-          -- OP real obrigatória: NULL = pooled = sem armazém de OP pra alimentar.
-          AND s.client_service_id IS NOT NULL
-          -- Cutoff de go-live: só entrega a partir da virada. Ver CUTOFF_DATE.
-          AND COALESCE(s.sent_at, s.created_at) >= $2::timestamp
-          -- só o que ainda falta receber. Item autorizado com quantity=0 (35 dos 318 entregues hoje)
-          -- nunca saiu do almox -> teto 0 -> não entra na fila.
-          AND si.quantity > COALESCE(r.total, 0)
-        ORDER BY COALESCE(s.sent_at, s.created_at) DESC NULLS LAST, p.name ASC`,
-      [STATUS_ENTREGUES, CUTOFF_DATE],
+      `WITH pendencias AS (
+         -- ══ ORIGEM 1: SEPARAÇÃO (o caminho de sempre, INTOCADO na sua lógica) ══════════════
+         SELECT 'separacao'::text        AS origem,
+                s.id                     AS separation_id,
+                si.id                    AS item_id,
+                NULL::uuid               AS request_id,
+                NULL::uuid               AS request_item_id,
+                s.destination            AS sector,
+                s.status                 AS status,
+                COALESCE(s.sent_at, s.created_at) AS sent_at,
+                cs.id                    AS client_service_id,
+                cs.op_code               AS op_code,
+                si.product_id            AS product_id,
+                si.quantity              AS entregue,
+                COALESCE(r.total, 0)     AS recebido
+           FROM separations s
+           JOIN separation_items si ON si.separation_id = s.id
+           JOIN client_services cs  ON cs.id = s.client_service_id
+           LEFT JOIN LATERAL (
+                SELECT SUM(e.qty) AS total FROM op_material_events e
+                 WHERE e.ref_separation_item_id = si.id AND e.event_type = 'recebido'
+           ) r ON TRUE
+          WHERE s.status = ANY($1)
+            AND s.client_service_id IS NOT NULL
+            AND COALESCE(s.sent_at, s.created_at) >= $2::timestamp
+            AND si.quantity > COALESCE(r.total, 0)
+
+         UNION ALL
+
+         -- ══ ORIGEM 2: SOLICITAÇÃO (lote RS1) ══════════════════════════════════════════════
+         -- Mesma forma, mesma aritmética: entregue − Σ recebido. A pendência é DERIVADA; não
+         -- há linha de "pendente" em lugar nenhum (ver 026 e o ramo 'entregue').
+         --
+         -- 'delivered_at IS NOT NULL' é o GATILHO: sem carimbo, a solicitação não entra. É o que
+         -- mantém as 2.496 entregas históricas fora da fila sem precisar de cláusula de idade —
+         -- elas simplesmente não têm o carimbo, porque ninguém o registrou na época.
+         --
+         -- 'quantity_delivered' com fallback em 'quantity_requested': é a MESMA fórmula que a
+         -- entrega usa para decidir quanto sai do almoxarifado (requests.controller.ts, ramo
+         -- 'entregue'). Divergir aqui faria o teto do recebimento não bater com o que saiu.
+         SELECT 'solicitacao'::text      AS origem,
+                NULL::uuid               AS separation_id,
+                NULL::uuid               AS item_id,
+                rq.id                    AS request_id,
+                ri.id                    AS request_item_id,
+                rq.sector                AS sector,
+                rq.status                AS status,
+                rq.delivered_at          AS sent_at,
+                cs.id                    AS client_service_id,
+                cs.op_code               AS op_code,
+                ri.product_id            AS product_id,
+                COALESCE(ri.quantity_delivered, ri.quantity_requested) AS entregue,
+                COALESCE(r2.total, 0)    AS recebido
+           FROM requests rq
+           JOIN request_items ri    ON ri.request_id = rq.id
+           JOIN client_services cs  ON cs.id = rq.client_service_id
+           LEFT JOIN LATERAL (
+                SELECT SUM(e.qty) AS total FROM op_material_events e
+                 WHERE e.ref_request_item_id = ri.id AND e.event_type = 'recebido'
+           ) r2 ON TRUE
+          WHERE rq.status = 'entregue'
+            AND rq.delivered_at IS NOT NULL
+            AND rq.client_service_id IS NOT NULL
+            AND ri.product_id IS NOT NULL
+            -- ⚠ SEM CUTOFF DE DATA AQUI, e de propósito. Do lado da SEPARAÇÃO o cutoff de
+            -- go-live existe para manter fora o histórico pré-virada, que nunca foi confirmado.
+            -- Do lado da SOLICITAÇÃO esse histórico NÃO EXISTE: a 026 não faz backfill, então
+            -- só entra o que foi entregue DEPOIS do lote. A ausência do carimbo já é o filtro,
+            -- e é o mais honesto (o que não foi medido fica NULL).
+            -- Repetir o cutoff aqui seria um SEGUNDO filtro redundante capaz de produzir
+            -- exatamente o que a regra dura do lote proíbe: pendência aberta sumindo por idade.
+            -- Medido: com delivered_at de 730 dias, a versão com cutoff devolvia 0 linhas.
+            AND COALESCE(ri.quantity_delivered, ri.quantity_requested) > COALESCE(r2.total, 0)
+       )
+       SELECT pe.*, p.sku, p.name, p.unit,
+              pe.entregue - pe.recebido AS pendente
+         FROM pendencias pe
+         JOIN products p ON p.id = pe.product_id
+        -- == CONTENÇÃO (D3) ==================================================================
+        -- A fila multiplica por ~6 com a origem-solicitação (~568 itens/mês medidos). O
+        -- /separations provou o custo de subir sem janela: 716 KB antes de alguém notar.
+        --
+        -- ⚠ REGRA DURA: PENDÊNCIA ABERTA ENTRA SEMPRE, SEM IDADE. Toda linha aqui é, por
+        -- construção, pendência aberta (as cláusulas 'entregue > recebido' já eliminam o que
+        -- foi confirmado). Por isso a contenção NÃO pode ser janela por data — seria excluir
+        -- material a confirmar por ter envelhecido, e ninguém pode perder material assim.
+        --
+        -- A contenção é TETO DE LINHAS com aviso, não janela: ordena pela mais ANTIGA primeiro
+        -- (a que espera há mais tempo é a mais urgente) e corta no fim. Quem for cortado é o
+        -- material recém-entregue, que ainda vai aparecer amanhã — nunca o antigo.
+        ORDER BY pe.sent_at ASC NULLS FIRST, p.name ASC
+        LIMIT $3`,
+      [STATUS_ENTREGUES, CUTOFF_DATE, MAX_LINHAS_FILA],
     );
     const visiveis = rows.filter((r) => {
       // D1 vale para TODO MUNDO, inclusive o "ver tudo" do master: setor sem armazém não é
@@ -464,10 +587,16 @@ export const getPendingReceipts = async (req: Request, res: Response) => {
       if (verTudo) return true;
       return canonSetor(r.sector) === operadorCanon;
     });
+    // CONTRATO: as chaves de antes seguem TODAS presentes, com o mesmo significado. O que entra
+    // é ADITIVO — `origem`, `request_id`, `request_item_id`. Uma linha de separação continua
+    // trazendo separation_id/item_id preenchidos e os de request nulos, e vice-versa: a tela
+    // antiga, que só lê as chaves de separação, não quebraria (embora a nova as use).
     return res.json(visiveis.map((r) => ({
+      origem: r.origem,
       separation_id: r.separation_id, sector: r.sector, status: r.status, sent_at: r.sent_at,
       client_service_id: r.client_service_id, op_code: r.op_code,
       item_id: r.item_id, product_id: r.product_id, sku: r.sku, name: r.name, unit: r.unit,
+      request_id: r.request_id, request_item_id: r.request_item_id,
       entregue: num(r.entregue), recebido: num(r.recebido), pendente: num(r.pendente),
     })));
   } catch (error: any) {
