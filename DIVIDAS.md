@@ -574,7 +574,7 @@ repositório vai falhar em validação até isso ser resolvido no console do Neo
 é estado de infraestrutura, registrado aqui para não custar meia hora de diagnóstico ao próximo.
 
 **AÇÃO PENDENTE — antes do próximo lote que ESCREVA (verificação de infra, não de código):**
-conferir no Render (serviço `fluxo5-0-backend-r49g`) se a `DATABASE_URL` de **PRODUÇÃO** usa
+conferir no Render (serviço `fluxoroyale5-0-backend`) se a `DATABASE_URL` de **PRODUÇÃO** usa
 endpoint **pooler** ou **direto**, e medir `SHOW default_transaction_read_only` nele.
 
 Por que isso importa: os dois endpoints da **mesma branch** divergiram em capacidade de escrita
@@ -2582,3 +2582,73 @@ SAVEPOINT`.
 Vale registrar porque mostra o alcance da régua: ela não vale só para escrita "best-effort" de
 produção. Vale para **qualquer** statement que se espera que falhe dentro de uma transação —
 inclusive o controle negativo de uma prova.
+
+### ⚠ RÉGUA — "ALLOWLIST RECORTADA PELO DADO DE HOJE É DÍVIDA COM DATA MARCADA"
+
+O recorte certo é o **CONCEITO** (os setores que têm armazém), não a **AMOSTRA** (os que
+apareceram). Irmã da régua do SEP1 pelo outro lado: allowlist é a forma certa, mas do tamanho da
+amostra vira **denylist implícito de tudo que ainda não aconteceu**.
+
+Medido no AW1, e custou **duas** correções em menos de quatro horas. O `CASE` do backfill da 027
+nasceu cobrindo `ESTEIRA` e `PROTOTIPO` — os únicos destinos que existiam nos eventos quando o
+lote foi provado. Entre a prova e a aplicação, a produção:
+
+  · ganhou o 1º recebimento por **SOLICITAÇÃO** (o RS1 subiu no mesmo dia), que o backfill nem
+    olhava porque só lia `separations.destination`;
+  · e um recebimento de separação com `destination='Lavadora'`, confirmado pelo admin com a
+    chave-mestra **três minutos** depois da leitura de linha de base.
+
+Nos dois casos o evento cairia no `ELSE NULL` e **a migration commitaria VERDE**: a coluna é
+nullable por decisão, e a guarda de estado olhava a MESMA lista curta. Material invisível no
+armazém do setor, com laudo limpo.
+
+**A guarda tem de cobrir exatamente o que o backfill cobre.** Se as duas listas divergem, a
+guarda deixa de ser estopim e vira decoração — ela confirma o recorte errado em vez de acusá-lo.
+
+Hoje o `CASE` e a guarda cobrem as **onze chaves de `SETOR_ARMAZEM` que têm armazém**, e são a
+mesma lista. A metade negativa (os 18 setores sem custódia) continua fora, e continua certa:
+evento de setor sem armazém não nasce — o D1 do `POST /receive` o barra com `SETOR_SEM_CUSTODIA`.
+
+O `CASE` segue sendo **RETRATO, não fonte**: a fonte é `src/services/setor.ts`, e setor novo entra
+como CHAVE LÁ — nunca no SQL da migration, nunca em `warehouses.sector`.
+
+### ⚠ CONSEQUÊNCIA DE MÉTODO — A LINHA DE BASE SE LÊ DENTRO DA TRANSAÇÃO QUE APLICA
+
+O protocolo mandava: (B) gravar o estado ANTES em arquivo, (C) aplicar, (D) comparar contra o
+arquivo. Medido no AW1: **entre (B) e (C) a produção mudou duas vezes.** Um arquivo lido 20
+minutos antes descreve um banco que já não existe, e a fase (D) compara com ficção.
+
+O conserto não é ler mais rápido — é ler **no mesmo snapshot**: `BEGIN`, ler a linha de base,
+aplicar a migration, `COMMIT`. O `BEGIN` da própria migration vira no-op (o Postgres avisa e
+segue) e o `COMMIT` dela fecha tudo junto. Nada escorrega no meio, por construção.
+
+O arquivo continua sendo escrito — como **REGISTRO do observado**, não como premissa.
+
+E o aplicador ganhou um portão: **se aparecer evento cujo valor esperado não foi conferido à
+mão, ele aborta antes de escrever qualquer coisa.** Foi o que garantiu que os dois eventos novos
+fossem vistos em vez de carimbados no escuro.
+
+### A URL DE PRODUÇÃO MUDOU — o `r49g` MORREU (20/08/2026)
+
+O Render travou no `hibernate-wake-error` e o serviço foi substituído.
+
+| URL | estado (medido 20/08/2026 17:40Z) |
+|---|---|
+| `https://fluxoroyale5-0-backend.onrender.com` | **VIVA** — `{"ok":true,"sha":"…"}` HTTP 200 |
+| `https://fluxo5-0-backend-`&#8288;`r49g.onrender.com` | **MORTA** — "Service Suspended", HTTP 503 |
+| `https://fluxo5-0-backend.onrender.com` | morta (a carcaça antiga, também suspensa) |
+
+<!-- ⚠ As duas URLs mortas acima estão escritas com um separador invisível de propósito. Um
+     `sed` de troca de URL em massa — como o que atualizou os procedimentos neste mesmo commit —
+     passou por cima desta tabela e a fez dizer que a URL VIVA estava MORTA. Uma tabela cujo
+     assunto É a substituição de uma string não pode conter essa string em forma substituível. -->
+
+
+⚠ **Confirmar deploy contra o r49g agora dá 503, e um "deploy confirmado" ali seria falso.** Todo
+procedimento deste repositório que citava o r49g foi atualizado no mesmo commit
+(`README.md`, `DEPLOY_GOLIVE.md`, `RENDER_DEPLOY.md` e a ação pendente de infra acima).
+
+O método de descobrir a URL viva **não muda e continua sendo o certo**: baixar o front publicado,
+extrair o `src` de `/assets/index-*.js` e `grep onrender.com`. Documentação envelhece — e esta
+envelheceu em oito dias. O bundle publicado é o que o front realmente chama. Medido agora, o
+bundle vivo já aponta para `fluxoroyale5-0-backend`.

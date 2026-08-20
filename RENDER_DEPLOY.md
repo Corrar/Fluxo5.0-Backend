@@ -71,7 +71,7 @@ openssl rand -hex 48
 
 ## 3) [BRUNO] Pegar a URL do Render
 
-> ### ⚠ URL VIVA HOJE: `https://fluxo5-0-backend-r49g.onrender.com`
+> ### ⚠ URL VIVA HOJE: `https://fluxoroyale5-0-backend.onrender.com`
 >
 > Medida em **12/08/2026** — `GET /health` → `{"ok":true,"sha":"68a4a49"}`.
 >
@@ -104,7 +104,7 @@ Teste rápido no navegador/curl: `GET https://…onrender.com/health` deve respo
 
    | Nome | Valor |
    |---|---|
-   | `VITE_API_URL` | a URL do Render do passo 3 — **hoje `https://fluxo5-0-backend-r49g.onrender.com`** |
+   | `VITE_API_URL` | a URL do Render do passo 3 — **hoje `https://fluxoroyale5-0-backend.onrender.com`** |
 
    > **É esta a env que o front usa** pra achar a API — no REST (`lib/api.js` → `import.meta.env.VITE_API_URL`)
    > **e** no realtime (`lib/socket.js`, que faz `.replace('/api','')` na mesma URL). Sem ela, o front cai em

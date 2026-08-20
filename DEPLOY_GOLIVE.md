@@ -14,7 +14,7 @@
 
 ## ⚠ Portão de deploy — bater na URL CERTA
 
-**URL viva: `https://fluxo5-0-backend-r49g.onrender.com`** (medida 12/08/2026).
+**URL viva: `https://fluxoroyale5-0-backend.onrender.com`** (medida 12/08/2026).
 O portão é `GET /health`, que devolve `{"ok":true,"sha":"<commit>"}` — comparar o `sha`
 com o commit que se quer no ar.
 
@@ -131,7 +131,7 @@ credencial recebia `new_request_notification`, `new_request` e `new_audit_log` �
 em tempo real, com IP de admin. Conferir o SHA no ar antes de liberar — **na URL viva**:
 
 ```bash
-curl -s https://fluxo5-0-backend-r49g.onrender.com/health   # -> {"ok":true,"sha":"<commit>"}
+curl -s https://fluxoroyale5-0-backend.onrender.com/health   # -> {"ok":true,"sha":"<commit>"}
 ```
 
 ---

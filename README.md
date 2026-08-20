@@ -62,14 +62,20 @@ HTTP em **`3000`** — configurável via a variável `PORT`.
 
 | | |
 |---|---|
-| **API** | `https://fluxo5-0-backend-r49g.onrender.com` |
+| **API** | `https://fluxoroyale5-0-backend.onrender.com` |
 | **Front** | `https://fluxo-royale50.vercel.app` |
 | **Portão de deploy** | `GET /health` → `{"ok":true,"sha":"<commit>"}` |
 
-> ⚠️ **`https://fluxo5-0-backend.onrender.com` (sem o sufixo `-r49g`) é CARCAÇA.** O serviço
-> antigo foi suspenso e substituído por um novo em 12/08/2026; o host velho continua de pé
-> respondendo HTML `Service Suspended`. Isso **não** é sinal de deploy quebrado — é o host
-> errado. URL antiga em doc, memória ou curl decorado engana exatamente assim.
+> ⚠️ **JÁ HÁ DUAS CARCAÇAS.** O serviço foi substituído DUAS vezes, e os hosts velhos continuam
+> de pé respondendo HTML `Service Suspended` (HTTP 503):
+>
+> | host | morreu em | por quê |
+> |---|---|---|
+> | `fluxo5-0-backend` | 12/08/2026 | substituído pelo de sufixo `r49g` |
+> | `fluxo5-0-backend-` + `r49g` | **20/08/2026** | Render travou em `hibernate-wake-error` |
+>
+> `Service Suspended` **não** é sinal de deploy quebrado — é o host errado. URL antiga em doc,
+> memória ou curl decorado engana exatamente assim, e já enganou duas vezes.
 >
 > **Se a URL mudar de novo:** a fonte da verdade é a URL cozida no bundle servido do front —
 > baixar `https://fluxo-royale50.vercel.app`, extrair o `src` de `/assets/index-*.js`, baixar
