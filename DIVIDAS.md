@@ -2524,3 +2524,61 @@ com SAVEPOINT ...... HTTP 200 · ledger=[transfer_in=1, transfer_out=1] <- mater
 **Toda operação que se quer "best-effort" dentro de uma transação precisa de SAVEPOINT antes,
 RELEASE no sucesso e ROLLBACK TO SAVEPOINT na falha.** Sem isso, o "best-effort" derruba a
 transação inteira — o contrário exato do que a expressão promete.
+
+## LOTE RS1 — dois achados da APLICAÇÃO da 026 em produção (20/08/2026)
+
+A 026 foi aplicada em `ep-steep-breeze` em 20/08/2026 10:22 UTC. Guard 15 ok · estado depois
+30 ok · idempotência 14 ok, todos com 0 falhas. Os dois achados abaixo não são do código do
+lote — são do PROCEDIMENTO, e valem para a próxima migration.
+
+### ⚠ RÉGUA — "ALLOWLIST POR SUBSTRING NÃO BASTA: A ORDEM DAS CLÁUSULAS É PARTE DA PROTEÇÃO"
+
+O guard de host recusa por allowlist (`host contém 'ep-steep-breeze'`), que é a régua do SEP1.
+Medido na prova: o host **pooled** `ep-steep-breeze-aehqqvcd-pooler` **PASSA nessa allowlist** —
+ele contém a marca exigida. Quem o recusa é a cláusula do pooler, e ela só protege porque roda
+**ANTES**.
+
+Invertida a ordem, o guard teria aprovado o endpoint pooled e a 026 — que ESCREVE — teria ido
+contra um endpoint **read-only**. O erro não apareceria como "host errado": apareceria como
+falha de permissão no meio de um `ALTER TABLE`, com o laudo já dizendo "produção".
+
+**Uma allowlist por substring reconhece uma FAMÍLIA de hosts, não um host.** Toda variante do
+mesmo endpoint (`-pooler`, e o que a Neon inventar depois) entra nela de graça. As cláusulas que
+distinguem variantes têm de vir antes da que reconhece a família — e a prova tem de incluir a
+variante perigosa como caso próprio, senão a ordem certa é sorte, não desenho.
+
+Irmã de [[validacao-pooler-read-only]]: lá o achado foi que o pooled é read-only; aqui é que o
+guard de host, sozinho, **não o pega**.
+
+### Idempotência com DROP+ADD CONSTRAINT é no-op no RESULTADO, não em cada statement
+
+A 026 é idempotente e isso está provado em produção: 2ª execução, 6 NOTICEs de
+`already exists, skipping`, e as fotos antes/depois batem byte a byte — colunas, CHECKs, FKs,
+índices, as 4 linhas e as contagens.
+
+**Mas o no-op é no RESULTADO.** O bloco do CHECK é `DROP CONSTRAINT IF EXISTS` seguido de
+`ADD CONSTRAINT`, e isso **não** tem `IF NOT EXISTS` — a constraint é realmente derrubada e
+recriada a cada execução, dentro da transação. E `ADD CONSTRAINT` **revalida a tabela inteira**:
+o Postgres varre todas as linhas para conferir o predicado.
+
+Com as 4 linhas de hoje isso é grátis (a 026 inteira roda em ~200 ms). Numa tabela cheia é um
+scan completo com `ACCESS EXCLUSIVE` na tabela a cada reexecução — o oposto do que "idempotente"
+sugere a quem lê a palavra e assume que reexecutar é de graça.
+
+**Quem escrever a próxima migration que mexa em CHECK:** ou guarda o DROP/ADD atrás de um
+`IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = ... AND pg_get_constraintdef(oid) = ...)`,
+ou usa `ADD CONSTRAINT ... NOT VALID` seguido de `VALIDATE CONSTRAINT` (que não trava escrita),
+ou aceita o custo **sabendo** que ele existe. O que não vale é chamar de no-op e descobrir o scan
+em produção.
+
+### Nota de rodapé: a régua do SAVEPOINT mordeu a própria prova
+
+O script de leitura da janela (backend novo × front antigo) tenta um `UPDATE` de propósito, para
+provar que o `START TRANSACTION READ ONLY` está armado. Na 1ª rodada o UPDATE recusado
+(SQLSTATE 25006) **abortou a transação inteira** e todas as leituras seguintes morreram com
+`current transaction is aborted`. O conserto foi o mesmo do lote: `SAVEPOINT` / `ROLLBACK TO
+SAVEPOINT`.
+
+Vale registrar porque mostra o alcance da régua: ela não vale só para escrita "best-effort" de
+produção. Vale para **qualquer** statement que se espera que falhe dentro de uma transação —
+inclusive o controle negativo de uma prova.
