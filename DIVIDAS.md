@@ -3416,3 +3416,166 @@ migration passou. **Produção e validação NÃO foram tocadas.** Isto também 
    no ensaio **não são apagadas** — linha de stock com saldo é dado, e apagá-la seria o cleanup
    global que a régua proíbe. O saldo é restaurado por **par exato**. Uma linha ficou criada com
    `on_hand = 0`, e isso está declarado, não escondido.
+
+---
+
+# LG1 — O LOG NÃO DERRUBA MAIS A TRANSAÇÃO, E O COMMIT DEIXA DE MENTIR (21/08/2026)
+
+Dois consertos **ortogonais**, um ponto cada. O primeiro conserta `createLog`; o segundo protege
+contra o **próximo** statement engolido, seja ele qual for.
+
+## (d) O CENSO, COM O MÉTODO — 86 / 45 / 41
+
+⚠ **`git grep` de linha única não serve.** A assinatura é
+`createLog(userId, action, details, ip, dbClient?)` e o 5º argumento pode estar N linhas abaixo
+da abertura. **18 chamadas são multilinha** (4 delas em transação) — foi essa a causa da
+divergência **44 × 41** entre duas sessões que mediram o mesmo repositório.
+
+**Método usado:** balanceamento de parênteses sobre os **97 `.ts` extraídos do objeto do commit**
+(`git show 1c858c9:...`), respeitando string/template/comentário; separação de argumentos de
+topo; o 5º é o `dbClient`. Resultado, sem ambiguidade — os únicos dois valores do 5º argumento
+são `client` (45) e ausente (41):
+
+| | |
+|---|---|
+| chamadas totais | **86** |
+| com client de transação | **45** |
+| com pool (default) | **41** |
+| com sonda do TR1 | **1 de 45** |
+
+⚠ **Uma terceira categoria foi medida e é ZERO:** chamada com `pool` **lexicamente dentro** de um
+`withTransaction`. Ela usaria outra conexão — não abortaria a TX, mas o log **sobreviveria ao
+rollback**, que é o defeito inverso. Não existe nenhuma. A casa é disciplinada nisso.
+
+⚠ **Correção de um censo anterior:** `assembly` e `printers3d` **não** passam client — as 9
+chamadas deles são de pool. E são **13 controllers + 1 job**, não sete.
+
+## (b) O ACHADO QUE DOBROU O DEFEITO: o COMMIT que devolve ROLLBACK
+
+`withTransaction` (`db.ts`) fazia `await client.query('COMMIT'); return result;`. Se o COMMIT
+estourasse numa transação abortada, as 25 chamadas que usam o helper estariam salvas pelo `catch`.
+
+**Não estoura.** Medido no ensaio:
+
+```
+BEGIN                       -> ok
+INSERT com FK violada       -> 23503   (engolido por um catch, como o createLog fazia)
+SELECT 1                    -> 25P02   (transação ABORTADA)
+COMMIT                      -> NÃO ESTOURA, command tag = 'ROLLBACK'
+linhas persistidas          -> ZERO
+```
+
+O driver `pg` trata o command tag `ROLLBACK` como sucesso. O `return result` acontecia, e o
+handler respondia **200 sobre uma operação que o banco reverteu inteira**.
+
+⇒ **As 25 do `withTransaction` eram tão expostas quanto as 17 de `BEGIN`/`COMMIT` explícito.**
+
+## O CONSERTO (b): SAVEPOINT dentro do `createLog` — raio 45, zero chamadores tocados
+
+O logger passa a envolver o trabalho em `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` **quando recebe
+client de transação**. O log vira best-effort **de verdade**: falha sem abortar a TX do chamador.
+
+**Como sabe que é transação:** o default do 5º parâmetro **é o `pool` importado**, então
+`dbClient !== pool` distingue os dois casos com informação que a função já tem — **sem mudar
+nenhum dos 86 chamadores**. Confirmado por leitura no `1c858c9` antes de usar; se o default
+mudar, o critério cai junto e o PL2 quebra, que é o papel dele.
+
+**O nome do savepoint é um contador monotônico**, nunca literal fixo. Medido:
+`travels.controller` chama `createLog` **dentro de loops** (5 chamadas, algumas por item), então
+a mesma transação produz N savepoints. O uso é estritamente balanceado, então nome fixo também
+funcionaria — o contador existe para **não ser preciso raciocinar** sobre aninhamento e para
+nunca colidir com savepoint de chamador (hoje só o `rs1_carimbo` de `requests.controller.ts:670`,
+que — verificado — **não envolve nenhum `createLog`**).
+
+⚠ **O `RELEASE` vem ANTES do emit do socket**, de propósito: o emit não é banco. Se ele falhar,
+o log já está confirmado e não deve ser desfeito.
+
+⚠ **O caminho de recuperação tolera a própria falha:** se o `ROLLBACK TO` falhar, a conexão está
+perdida e não há o que salvar — e lançar dali mascararia o erro original.
+
+## O CONSERTO (d1): o COMMIT deixa de mentir — raio 1 ponto, cobertura muito maior
+
+`withTransaction` passa a conferir o **command tag**: se vier `'ROLLBACK'`, a transação abortou e
+o resultado não é válido — **lança em vez de retornar**.
+
+**Qual erro:** um `Error` comum com `code = 'TX_ABORTADA'`, não-numérico. O `mapError` dos
+controllers só converte em 4xx o que é `instanceof OpMatError`, então este cai no ramo genérico e
+vira **500** — a resposta certa: a operação não aconteceu e a causa é do servidor, não do pedido.
+E **`TX_ABORTADA` não entra em `TRANSIENT_CODES`**: retentar reexecutaria o mesmo statement
+engolido e abortaria de novo.
+
+⚠ **É MUDANÇA DE COMPORTAMENTO em 25 pontos** — mas só no caminho que hoje MENTE. Provado (PL7):
+no caminho feliz o retorno é **byte-a-byte idêntico** ao do base.
+
+>>> **É por isso que ele entra junto:** o savepoint conserta *o* `createLog`. Esta checagem pega
+**qualquer** `try { await client.query(...) } catch {}` dentro de um callback de transação — o
+`createLog` era só o caso conhecido. Cobre também toda operação futura que use o helper, logue ou
+não. **Não cobre as 17 de `BEGIN`/`COMMIT` explícito**, que seguem expostas ao mesmo mecanismo.
+
+## (a) POR QUE **NÃO** SE ESCOLHEU "O LOGGER PARA DE ENGOLIR"
+
+Era a opção mais simples de escrever e a pior de conviver. **Raio: as 86 chamadas** — inclusive as
+**41 fora de transação**, que hoje toleram falha de log em silêncio e **corretamente**.
+
+Medido: **as 41 estão TODAS dentro de `try/catch`** que converteria a exceção em resposta de erro.
+⇒ uma falha de auditoria passaria a devolver **500 numa operação que DEU CERTO** e já está
+persistida. Trocaria "sucesso falso sobre operação que não aconteceu" por "erro falso sobre
+operação que aconteceu" — o mesmo defeito virado do avesso, e num raio duas vezes maior.
+
+## (c) O DANO PASSADO NÃO É OBSERVÁVEL — e por isso não há regularização
+
+O defeito **apaga o próprio rastro**: se a transação abortou, **nem o efeito nem o log persistem**.
+Não há linha para procurar. Medido: **zero tabelas de erro** no schema (`%error%`, `%exception%`,
+`%falha%`), e o único rastro seria o `console.error` do servidor, que não está no banco.
+
+Tentei pelos dois lados e **nenhum mede o defeito**: "log sem efeito" e "efeito sem log" devolvem
+números altos por motivos banais (chave de `details` diferente por ação, objeto anterior ao log).
+⚠ Um deles chegou a devolver **711/711** e era **chave errada minha** — `CRIAR_PRODUTO` grava
+`sku`/`name`, não `id`. Não vale como sinal.
+
+**"Não é observável com o dado atual" é a resposta**, e é melhor que um zero vazio. Não há
+regularização possível porque não há o que regularizar: o que se perdeu, se perdeu inteiro.
+
+## O MODO DE FALHA REAL
+
+`audit_logs` tem **1 FK (`user_id → users(id)`, sem `ON DELETE`), 0 CHECKs, 1 NOT NULL sem
+default** (`action`). Descartados por medição: `details` gigante (maior 336 KB, teto ~1 GB),
+`action` longo (máx. 30 chars, sem ENUM), `ip_address` (máx. 15 chars).
+⇒ **a FK é a causa**, e o gatilho é `user_id` que não existe no momento do INSERT.
+`JSON.stringify` com ciclo falha **em JS**, dentro do `try`, e **não aborta a TX** — caso diferente
+e benigno.
+
+## O QUE ESTE LOTE NÃO TOCA, de propósito
+
+- **as 41 chamadas fora de transação** — ver (a);
+- **a sonda do TR1** em `clients.controller.ts` — fica. ⚠ Ela ficou **redundante** para o caso do
+  `createLog` (o savepoint resolve antes) e **inofensiva** (um `SELECT 1` a mais). E continua
+  útil como documentação do flanco no ponto onde ele foi descoberto;
+- **os 44 chamadores** — nenhum muda.
+
+## PROVAS
+
+**24 asserções verdes (PL1–PL7)**, contra o **ensaio**, com **controle negativo em corrida
+paralela**: cada asserção roda nas DUAS versões — `dist/` (com o lote) e `base/` (o `1c858c9`
+compilado à parte) — na mesma execução, contra a mesma fixture. O contraste não é hipótese.
+
+- **PL1** TX com log que falha: novo → transação **VIVA**, COMMIT = `COMMIT`, operação **persiste**;
+  base → **ABORTADA (25P02)**, COMMIT = `ROLLBACK`, operação **perdida**.
+- **PL2** sem transação: os dois engolem, idênticos. As 41 não mudaram.
+- **PL3** log bem-sucedido em TX: visível **dentro** da TX (savepoint liberado, não revertido) e
+  persiste depois do COMMIT.
+- **PL4** `withTransaction` abortado: novo **lança `TX_ABORTADA`**; base **retorna `{ok:true}`** e
+  nada persiste — o sucesso falso, capturado.
+- **PL5** transação normal: retorno correto e **5 de 5** linhas (cardinalidade contra constante).
+- **PL6** os dois juntos: via `createLog` o (b) resolve antes e a TX nem aborta; **via outro
+  statement engolido, o (d1) pega** — a razão de ele existir.
+- **PL7** contrato: retorno **idêntico** ao do base no caminho feliz.
+
+**PL8 — build e suíte, declarados:** typecheck e build **verdes**. Suíte: **21 smokes**, dos quais
+**17 exigem servidor HTTP vivo** e **5 exigem `FR_EXPECT_DB_HOST`**. Dos 4 que rodam sem servidor
+(`returns:*`, destravados no ensaio pela 027 do FS1), rodei o `returns:grao`: **falha** — e a falha
+é **PRÉ-EXISTENTE**, provada e não afirmada: rodei o **mesmo** smoke com `db.ts` e `logger.ts`
+revertidos ao `1c858c9` e obtive a **mesma falha, mesma mensagem** (`availableToReturn`: "o armazém
+da OP tem 0 deste material"). É estado de seed, não regressão.
+
+⚠ **Nada aqui usou a validação** (`ep-summer-wave`), que segue sem a 026.

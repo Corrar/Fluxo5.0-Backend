@@ -307,7 +307,48 @@ export async function withTransaction<T>(
         await client.query(`SET TRANSACTION ISOLATION LEVEL ${isolation.toUpperCase()}`);
       }
       const result = await fn(client);
-      await client.query('COMMIT');
+
+      // ═══════════════════════════════════════════════════════════════════════════════════
+      // O COMMIT DEIXA DE MENTIR — lote LG1 (21/08/2026)
+      // ═══════════════════════════════════════════════════════════════════════════════════
+      //
+      // ⚠ `COMMIT` numa transação ABORTADA **não estoura**. O Postgres o aceita, executa um
+      // ROLLBACK e devolve o command tag `'ROLLBACK'` em vez de `'COMMIT'`. O driver `pg`
+      // trata isso como sucesso — então, sem a checagem abaixo, o `return result` acontecia e
+      // o handler respondia 200 sobre uma operação que o banco reverteu INTEIRA.
+      //
+      // MEDIDO, não deduzido (experimento no ensaio, lote LG1):
+      //     BEGIN                                        -> ok
+      //     INSERT com FK violada                        -> 23503   (engolido por um catch)
+      //     SELECT 1                                     -> 25P02   (transação ABORTADA)
+      //     COMMIT                                       -> NÃO estoura, command tag ROLLBACK
+      //     linhas persistidas                           -> ZERO
+      //
+      // ─── POR QUE ISTO ENTRA JUNTO COM O SAVEPOINT DO LOGGER ─────────────────────────────
+      // O savepoint conserta O `createLog`. Esta checagem protege contra o PRÓXIMO statement
+      // engolido — qualquer `try { await client.query(...) } catch {}` dentro de um callback
+      // de transação tem exatamente o mesmo flanco, e o `createLog` era só o caso conhecido.
+      // Raio: UM ponto, cobrindo as 25 chamadas que usam este helper E toda operação futura
+      // que passe por aqui, logue ou não.
+      // ⚠ NÃO cobre as 17 que abrem transação com BEGIN/COMMIT explícito — essas seguem
+      //   expostas ao mesmo mecanismo, e estão nomeadas no DIVIDAS.
+      //
+      // ─── QUAL ERRO ──────────────────────────────────────────────────────────────────────
+      // Um `Error` comum com `code` PRÓPRIO e não-numérico. Isso o mantém distinguível de erro
+      // de negócio: o `mapError` dos controllers só converte em 4xx o que é `instanceof
+      // OpMatError`, então este cai no ramo genérico e vira **500** — que é a resposta certa,
+      // porque a operação NÃO aconteceu e a causa é do servidor, não do pedido.
+      // E `TX_ABORTADA` não está em TRANSIENT_CODES de propósito: **não se repete**. O retry
+      // reexecutaria o mesmo statement engolido e abortaria de novo; e o trabalho já se perdeu.
+      const commitRes = await client.query('COMMIT');
+      if (commitRes.command === 'ROLLBACK') {
+        const abortada: any = new Error(
+          'A transação foi abortada por um erro anterior e o COMMIT virou ROLLBACK — nada foi gravado. ' +
+          'Procure um erro de SQL engolido por try/catch dentro desta operação.',
+        );
+        abortada.code = 'TX_ABORTADA';
+        throw abortada;
+      }
       return result;
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* ignora falha de rollback */ }
