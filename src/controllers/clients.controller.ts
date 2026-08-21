@@ -2,6 +2,7 @@
 
 import { Request, Response } from 'express';
 import { pool } from '../db';
+import { totalCostSql } from '../services/opCost';
 
 export const getClients = async (req: Request, res: Response) => {
   try {
@@ -14,23 +15,17 @@ export const getClients = async (req: Request, res: Response) => {
                      'op_code', s.op_code, 
                      'description', s.description, 
                      'status', s.status,
-                     'total_cost', (
-                        -- Cálculo: (Custo Total das Saídas) - (Custo Total das Devoluções)
-                        COALESCE((
-                          SELECT SUM(si.quantity * p.unit_price)
-                          FROM separations sep
-                          JOIN separation_items si ON sep.id = si.separation_id
-                          JOIN products p ON si.product_id = p.id
-                          WHERE sep.client_service_id = s.id AND sep.status = 'concluida'
-                        ), 0)
-                        -
-                        COALESCE((
-                          SELECT SUM(r.quantity * p.unit_price)
-                          FROM op_returns r
-                          JOIN products p ON r.product_id = p.id
-                          WHERE r.client_service_id = s.id
-                        ), 0)
-                     )
+                     -- CUSTO DA OP = tudo que saiu do almoxarifado com esta OP, menos o que voltou.
+                     -- A regra (as três pernas de saída, a perna de devolução, o preço e o que fica
+                     -- DE FORA) mora em services/opCost.ts, que é o ÚNICO dono dela. Antes deste
+                     -- lote a fórmula estava escrita AQUI e copiada em mais dois lugares, e as três
+                     -- discordavam — a daqui contava só separação 'concluida' (que é a SAÍDA MANUAL)
+                     -- e ignorava as 1.435 solicitações entregues e as 12 separações reais.
+                     -- 's.id' é o client_services.id correlacionado do json_agg de fora: é
+                     -- referência de CÓDIGO, o único tipo que pode ser interpolado ali.
+                     -- (sem crase neste bloco de propósito: a string é template literal e uma
+                     --  crase dentro de um comentário SQL FECHA a string — quebrou o build uma vez.)
+                     'total_cost', ${totalCostSql('s.id')}
                    )
                  ) FILTER (WHERE s.id IS NOT NULL), '[]'::json
                ) as services

@@ -11,6 +11,7 @@
 import type { PoolClient } from 'pg';
 import { pool } from '../db';
 import { getAlmoxId } from '../services/warehouse';
+import { totalCostSql } from '../services/opCost';
 // AW1: o de-para setor->armazem, para a fixture saber quem TEM custodia.
 import { escopoDoPerfil } from '../services/opMaterialScope';
 
@@ -176,20 +177,18 @@ export async function anyUserId(client: PoolClient): Promise<string | null> {
   return rows.length ? rows[0].id : null;
 }
 
-// total_cost da OP — a MESMA fórmula do clients.controller (Σ saídas concluídas − Σ op_returns).
+// total_cost da OP — DELEGA a services/opCost.ts, o dono único da regra (lote CO1).
+//
+// ⚠ ANTES ISTO ERA UMA CÓPIA LITERAL da fórmula do clients.controller, com o comentário "a MESMA
+// fórmula" ao lado. Cópia comentada continua cópia: se o controller mudasse e esta não, o smoke
+// seguiria VERDE afirmando a fórmula velha — o pior formato de asserção que existe, a que passa
+// medindo outra coisa. Agora as duas leem do mesmo lugar por construção, não por promessa.
+//
+// `$1` é a referência da OP; é literal de código (não vem do request), que é a única coisa que
+// `totalCostSql` aceita interpolar. O valor vai parametrizado, como sempre.
 export async function totalCostOf(client: PoolClient, opId: string): Promise<number> {
   const { rows } = await client.query(
-    `SELECT
-        COALESCE((SELECT SUM(si.quantity * p.unit_price)
-                    FROM separations sep
-                    JOIN separation_items si ON sep.id = si.separation_id
-                    JOIN products p ON si.product_id = p.id
-                   WHERE sep.client_service_id = $1 AND sep.status = 'concluida'), 0)
-        -
-        COALESCE((SELECT SUM(r.quantity * p.unit_price)
-                    FROM op_returns r
-                    JOIN products p ON r.product_id = p.id
-                   WHERE r.client_service_id = $1), 0) AS total_cost`,
+    `SELECT ${totalCostSql('$1')} AS total_cost`,
     [opId],
   );
   return num(rows[0].total_cost);

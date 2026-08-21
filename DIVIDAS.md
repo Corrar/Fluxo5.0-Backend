@@ -2760,3 +2760,215 @@ AZUL), e o da ELET aparece pela primeira vez.
 O efeito que o lote existia para produzir: **o teto do apontamento passou a ser confiável.** Até
 aqui `saldoDe` devolvia ~0 para quase tudo, e qualquer apontamento morreria em
 `SALDO_INSUFICIENTE_NA_OP` com o material fisicamente na bancada do operador.
+
+---
+
+# CO1 — O CUSTO DA OP PASSA A TER UM DONO SÓ (20/08/2026)
+
+**R$ 199.381,93 → R$ 2.558.344,18.** O `total_cost` que a aba *Clientes e OPs* mostrava
+reconhecia **uma** das três pernas de saída do almoxarifado — e ainda por cima a errada. O lote
+não inventou custo: ele passou a contar o que já tinha saído pela porta.
+
+A regra, inteira, agora mora em **`src/services/opCost.ts`**, e os três lugares que a escreviam
+sozinhos passam a **projetar dela**.
+
+## O QUE ESTAVA ERRADO, MEDIDO
+
+| dono | o que fazia | o que faltava |
+|---|---|---|
+| `clients.controller.getClients.total_cost` | separação `= 'concluida'` − `op_returns` | `'concluida'` é a **SAÍDA MANUAL**; o filtro excluía justamente a **separação real** (`'entregue'`) — **12 documentos, R$ 421.765,52** — e ignorava as **1.435 solicitações entregues** inteiras |
+| `system.controller.saidas_ops_all_time` (`GET /reports/general?includeAllTimeOps=true`) | separação `('entregue','finalizada','concluida')` + solicitação `('aprovado','entregue')`, **sem** subtrair devolução | contava `'aprovado'`, que **não saiu do almoxarifado**; e `'finalizada'` **nunca existiu** em `separations.status` |
+| `smokes/_smoke.ts:totalCostOf` | **cópia literal** da fórmula do controller | ver abaixo — é a pior das três |
+
+Três definições, três verdades. Uma errava por omissão, a outra errava por excesso, e a terceira
+existia para *provar* a primeira.
+
+## ⚠ A TERCEIRA CÓPIA — E POR QUE ELA É A PIOR
+
+`_smoke.ts:179` tinha a fórmula escrita por extenso, com este comentário ao lado:
+
+```
+// total_cost da OP — a MESMA fórmula do clients.controller (Σ saídas concluídas − Σ op_returns).
+```
+
+O comentário **afirmava** a sincronia; nada a **garantia**. Mudar só o controller deixaria o
+smoke **VERDE**, afirmando a fórmula velha — a asserção que passa medindo outra coisa. Não é um
+teste fraco: é um teste que **mente com confiança**, e mente exatamente no momento em que alguém
+mais precisa dele, o da mudança.
+
+**A recon não viu esta cópia.** Ela mapeou os dois donos de produção e parou aí. Quem a pegou foi
+o M1, a varredura por `unit_price` + `client_service_id` em todo o `src`. Fica a régua (f).
+
+Hoje o smoke roda `SELECT ${totalCostSql('$1')} AS total_cost` — as duas leem do mesmo lugar **por
+construção, não por promessa**.
+
+## M2 — FONTE ÚNICA: O QUE DEU PARA UNIFICAR, E O QUE NÃO DAVA
+
+Reusar a **query literal** nos dois consumidores **não dava**, e isso é fato de grão, não
+preguiça:
+
+* `clients.controller` precisa de um **escalar por OP**, dentro de um `json_agg` correlacionado;
+* `saidas_ops_all_time` precisa de **uma linha por item**, com produto, setor e data.
+
+Query única aqui só sairia inventando um agregado que ninguém pediu. Então o que virou único foi
+o que **É** a regra:
+
+| exportado | o que fixa |
+|---|---|
+| `REQUEST_STATUS_SAIU` / `_SQL` | `('entregue','devolvido')` — os status de solicitação que representam material que saiu |
+| `SEPARATION_STATUS_SAIU` / `_SQL` | `('entregue','concluida')` — separação real **e** saída manual |
+| `qtdSolicitacaoSql(alias)` | `COALESCE(quantity_delivered, quantity_requested)` |
+| `precoSql(alias)` | o `COALESCE/NULLIF` defensivo, o mesmo idioma de `reportsBi.controller:39` |
+| `totalCostSql(refOp)` | o escalar inteiro (as duas pernas − devolução), para quem quer o custo |
+
+**Duas projeções da mesma regra, não duas regras.** Se amanhã um status entrar ou sair, ele entra
+num arquivo e as duas telas mudam juntas — que é precisamente o que não acontecia.
+
+`refOp` é **interpolado**, e a régua é dura: **só código controla esse argumento** (`s.id` na
+subconsulta correlacionada, `$1` na query parametrizada). Nenhum valor de requisição entra ali —
+mesmo idioma do `lockRow` de `services/reservations.ts:236`, onde a cláusula também não pode ser
+`$n`. O valor do usuário continua indo parametrizado, como sempre.
+
+## A ROTA DARK — TRÊS DIVERGÊNCIAS CORRIGIDAS, COM A CARDINALIDADE FECHANDO
+
+`saidas_ops_all_time` **não tem consumidor**: `grep -rn "saidas_ops_all_time|includeAllTimeOps"`
+no front devolve **zero**. Foi **corrigida, não deletada** — código morto ganha comentário, não
+`git rm`. Enquanto estiver viva e respondendo, ela e o `total_cost` têm de sair do mesmo lugar;
+era por não saírem que uma contava `'aprovado'` e a outra ignorava 1.435 entregas.
+
+| divergência | antes | agora | linhas |
+|---|---|---|---|
+| solicitação | `('aprovado','entregue')` | `('entregue','devolvido')` | **+30 / −1** |
+| separação | `('entregue','finalizada','concluida')` | `('entregue','concluida')` | **−0** |
+| `products` na perna de separação | `JOIN` | `LEFT JOIN` | **+0** |
+
+**+30 − 1 − 0 + 0 = +29**, e o total medido bateu: **2.568 → 2.597 linhas**. A cardinalidade
+fecha componente a componente — não é "deu quase o mesmo", é cada linha com nome.
+
+* **`'aprovado'` sai** porque material aprovado **não saiu**: está reservado na prateleira.
+  Contá-lo como saída era o mesmo erro do `total_cost`, ao contrário.
+* **`'finalizada'` era guard fantasma** — zero linhas em produção; os valores reais de
+  `separations.status` são `concluida / entregue / cancelada / em_separacao`. Mesmo formato dos
+  que a 021 matou em `tasks.controller`. Sai da lista sem mudar **um único** registro.
+* **`LEFT JOIN`** porque `product_id` é NULL em item custom, e o `INNER` faria a **linha sumir**.
+  Hoje são zero (controle negativo rodado: **zero `separation_items` sem produto em qualquer
+  status**) — o `LEFT` é o que garante que continue assim quando o primeiro aparecer.
+
+### `'conferido'` FICOU DE FORA, E É DECISÃO
+
+`conferido` é o estado **ANTES** da entrega: material conferido ainda está **na prateleira**. A
+entrega vem depois dele. **Quem não saiu não é custo.** A régua única é `('entregue','devolvido')`
+nas duas projeções.
+
+E `'devolvido'` **conta**: o material **saiu**; o que voltou é abatido pela perna de devolução,
+que é outro caminho. Tirá-lo daqui abateria duas vezes.
+
+### A DEVOLUÇÃO CONTINUA FORA DA ROTA DARK — TAMBÉM POR DECISÃO
+
+`op_returns` **não** virou linha negativa em `saidas_ops_all_time`, e não é esquecimento: **aquilo
+é uma lista de SAÍDAS**. Injetar devolução como linha negativa mudaria o **significado** da lista
+— quem somasse `quantidade` deixaria de ter "quanto saiu". A subtração pertence ao `total_cost`,
+que é o número de **custo**. Registrado na dívida (d) para não voltar como "achado".
+
+## OS NÚMEROS, E AS PROVAS
+
+| | |
+|---|---|
+| `total_cost` da carteira | **R$ 199.381,93 → R$ 2.558.344,18** |
+| **PC2** — as partes somam o todo | **46 de 46 OPs**: `saída manual + separação real + solicitação − devolução` = `total_cost`, ao centavo |
+| **PC2 · controle negativo** | com **1 centavo** de desvio artificial injetado: **ZERO** de 46 batem |
+
+O PC2 é a prova de que **não há dupla contagem**, e ela é estrutural, não fé: não existe coluna
+ligando separação a solicitação (`separations` tem 12 colunas, nenhuma é `request_id`);
+`manualWithdrawal` cria separação e nada mais; a entrega de solicitação **não** cria separação. Os
+conjuntos são disjuntos **por construção**. Se um dia alguém ligar os dois, é no PC2 que quebra —
+e é por isso que ele tem controle negativo: asserção que não sabe falhar não é asserção.
+
+**O apontamento não entra**, e isso também é medido: as três contas são conjuntos de tabelas
+**disjuntos** (`custo` = separations/separation_items/requests/request_items/op_returns · `saldo` =
+stock/stock_ledger · `árvore` = op_material_events/assembly_machines). O único ponto de contato é
+`client_service_id`, que é **chave, não valor**. Um lote futuro que debite o armazém do setor no
+apontamento escreve em `stock`/`stock_ledger` — nenhuma das duas é lida aqui.
+
+## ⚠ M3 — DECLARADO, NÃO CORRIGIDO (e por que isso é a escolha certa)
+
+`pages_clientes.jsx:320-321` e `:384` decidem a exibição com **`o.total_cost > 0`**:
+
+```jsx
+{o.total_cost > 0 ? frBRL(o.total_cost) : 'Sem custo'}   // :321
+{o.total_cost > 0 ? frBRL(o.total_cost) : '—'}           // :384
+```
+
+Um custo **negativo** (devolução maior que saída) sairia na tela como **"Sem custo"** — o pior
+formato de erro de exibição, o que troca um número por uma afirmação falsa.
+
+**Com a regra nova o defeito está LATENTE, não ativo**: medido, são **0 OPs negativas / 7 zeradas
+/ 39 positivas**. Foi justamente a fórmula velha que produzia negativo com facilidade — ela
+subtraía `op_returns` de uma base que ignorava duas das três pernas de saída. Corrigir o back
+tirou o gatilho; não tirou o defeito.
+
+Não entra neste lote porque **é front**, e lote de back que encosta em front por conveniência é
+como se perde o recorte. O patch é de **uma linha**, e fica escrito aqui para o próximo:
+
+```diff
+- o.total_cost > 0 ? frBRL(o.total_cost) : 'Sem custo'
++ o.total_cost !== 0 ? frBRL(o.total_cost) : 'Sem custo'
+```
+
+## ⚠ A PEDRA DO TEMPLATE LITERAL — TERCEIRA VEZ NESTA BASE
+
+**Uma crase dentro de um comentário SQL fecha a string do JS.** As queries são template literals;
+o `--` do SQL não protege nada, porque quem lê primeiro é o parser do JavaScript. Quebrou o build
+uma vez neste lote, e o aviso ficou **no código**, junto do comentário que quase o causou:
+
+```
+-- (sem crase neste bloco de propósito: a string é template literal e uma
+--  crase dentro de um comentário SQL FECHA a string — quebrou o build uma vez.)
+```
+
+Já mordeu no **SEP1** e no **RS1**. Terceira ocorrência: não é azar, é propriedade da base. Onde
+houver comentário em português dentro de template literal, **nada de crase** — nem para citar
+nome de coluna.
+
+## ⚠ RÉGUA — "CÓPIA DE FÓRMULA DENTRO DE SMOKE É A PIOR DE TODAS"
+
+Cópia em produção diverge e alguém **vê** o número errado na tela. Cópia dentro do smoke diverge e
+o smoke **passa VERDE afirmando a fórmula velha** — o defeito fica coberto pela própria prova que
+existia para descobri-lo.
+
+Operacional, para a próxima varredura: **onde houver comentário dizendo "a MESMA fórmula de X",
+procurar a cópia — ela está ali, e o comentário é a confissão.** O comentário existe porque quem
+escreveu *sabia* que estava duplicando; ele documenta a dívida em vez de pagá-la. Buscar por
+`MESMA fórmula`, `mesma lógica de`, `igual ao`, `espelha` — e conferir se é delegação ou cópia.
+
+## DÍVIDAS ABERTAS DEIXADAS PELO CO1
+
+**(a) ⚠ O PREÇO É VIVO — o custo histórico é reescrito em silêncio.** `products.unit_price` é
+lido **na hora da consulta**. Houve **600 `ATUALIZAR_PRECOS` desde abril**, e cada um reescreveu o
+custo de toda OP fechada que contém aquele produto. As colunas de congelamento **existem e estão
+MORTAS**: `separation_items.unit_price` (42 de 1.777 preenchidas), `request_items.unit_price` (670
+de 4.031) — lixo do 2.0, **nenhum INSERT do 5.0 as lista e nenhuma leitura as usa**. Congelar é
+mudar os INSERT das portas de saída **e** decidir o backfill de um preço que ninguém guardou.
+**Lote próprio, JÁ DECIDIDO pelo Bruno.**
+
+**(b) 282 SKUs a R$ 0,00 — 13.031 unidades, 8,9% do volume com OP.** Isso é **cadastro, não
+query**: nenhuma linha do `opCost.ts` esconde esse volume, ela só não sabe precificá-lo. O
+`COALESCE` existe para o histórico em que a coluna já foi texto — em produção hoje são **zero
+nulos**; o que existe é o **zero explícito**. Lista dos 282 pedida em separado.
+
+**(c) `separation_returns` não abate custo.** É a 4ª porta de devolução e **não escreve
+`op_returns`** — logo não entra na subtração. **Zero linhas em produção hoje, e o zero aqui é
+VAZIO, não verde**: o furo de código é herdado e está **intacto**; ele não aparece porque ninguém
+usou a porta ainda. Na primeira devolução por ali, o custo da OP fica alto e nada avisa.
+
+**(d) A rota dark deixou de ser segunda verdade — o que continua diferente é DE PROPÓSITO.**
+`saidas_ops_all_time` e `total_cost` agora compartilham predicados, quantidade e preço. O que
+**não** compartilham: a devolução, que é subtraída no `total_cost` e **ausente** da lista de
+saídas, porque lista de saídas com linha negativa deixa de ser lista de saídas. Está escrito aqui
+para que a próxima recon o encontre como **decisão**, não como divergência.
+
+**(e) O M3 do front**, com o patch de uma linha pronto, acima. Latente hoje (0 negativas); volta a
+ser ativo no dia em que uma devolução ultrapassar a saída de uma OP.
+
+**(f) ⚠ RÉGUA (f) — a varredura por "a MESMA fórmula de X"**, acima. Aplicável a toda a base, não
+só ao custo.

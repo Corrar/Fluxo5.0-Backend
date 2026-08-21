@@ -4,6 +4,14 @@ import { Request, Response } from 'express';
 import { pool, query as dbQuery } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
+// A REGRA DE CUSTO/SAÍDA DA OP TEM UM DONO SÓ (lote CO1). `saidas_ops_all_time`, aqui embaixo,
+// projeta dela — ver a nota grande sobre as três divergências que isso corrigiu.
+import {
+  precoSql,
+  qtdSolicitacaoSql,
+  REQUEST_STATUS_SAIU_SQL,
+  SEPARATION_STATUS_SAIU_SQL,
+} from '../services/opCost';
 
 /**
  * Busca estatísticas globais para os cards do Dashboard.
@@ -269,39 +277,65 @@ export const getGeneralReports = async (req: Request, res: Response) => {
     let saidas_ops_all_time: any[] | null = null;
     
     if (includeAllTimeOps === 'true') {
+      // ── A LISTA DETALHADA DAS SAÍDAS POR OP (lote CO1: passa a projetar de services/opCost.ts)
+      //
+      // Esta lista e o `total_cost` da aba Clientes e OPs são DUAS PROJEÇÕES DA MESMA REGRA, não
+      // duas regras: os predicados de status, a fórmula de quantidade e o preço vêm todos do
+      // módulo. O que difere é o GRÃO — aqui uma linha por item (relatório), lá um escalar por OP.
+      //
+      // ⚠ O QUE MUDOU AQUI, E POR QUÊ (as três divergências medidas na recon de 20/08):
+      //   · solicitação: era ('aprovado','entregue'). 'aprovado' NÃO SAIU do almoxarifado — é
+      //     material aprovado, ainda reservado na prateleira; contá-lo como saída era o mesmo
+      //     erro, ao contrário, do que o total_cost cometia por omissão. E 'conferido' também
+      //     não sai: a entrega vem depois dele. Agora é ('entregue','devolvido'), a régua única.
+      //   · separação: era ('entregue','finalizada','concluida'). 'finalizada' NUNCA existiu em
+      //     `separations.status` (zero linhas em produção — os valores reais são
+      //     concluida/entregue/cancelada/em_separacao); era guard fantasma, do mesmo formato dos
+      //     que a 021 matou em tasks.controller. Sai da lista sem mudar um único registro.
+      //   · preço e quantidade: eram cópias literais das expressões do outro dono. Agora importam.
+      //
+      // ⚠ A DEVOLUÇÃO CONTINUA FORA DAQUI, E É DECISÃO. Esta é uma lista de SAÍDAS; `op_returns`
+      //   não é saída, e injetá-la como linha negativa mudaria o SIGNIFICADO da lista (quem
+      //   somasse `quantidade` deixaria de ter "quanto saiu"). Quem quiser o CUSTO usa o
+      //   `total_cost` do GET /clients, que é onde a subtração pertence. Registrado no DIVIDAS.
+      //
+      // ⚠ ROTA SEM CONSUMIDOR: `grep -rn "saidas_ops_all_time\|includeAllTimeOps"` no front
+      //   devolve ZERO. Foi CORRIGIDA, não deletada — código morto ganha comentário, não `git rm`.
+      //   Enquanto ela existir viva, ela e o total_cost têm de sair do mesmo lugar; era
+      //   exatamente por não saírem que uma contava 'aprovado' e a outra ignorava 1.435 entregas.
       const opsQuery = `
-        SELECT 
-          si.id, 
-          si.quantity as quantidade, 
-          p.name as produto, 
-          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
-          cs.op_code, 
-          cs.status as op_status, 
-          s.destination as destino_setor, 
+        SELECT
+          si.id,
+          si.quantity as quantidade,
+          p.name as produto,
+          ${precoSql('p')} as preco_unitario,
+          cs.op_code,
+          cs.status as op_status,
+          s.destination as destino_setor,
           COALESCE(s.sent_at, s.created_at) as data
         FROM separation_items si
         JOIN separations s ON si.separation_id = s.id
         JOIN client_services cs ON s.client_service_id = cs.id
-        JOIN products p ON si.product_id = p.id
-        WHERE s.status IN ('entregue', 'finalizada', 'concluida')
+        LEFT JOIN products p ON si.product_id = p.id
+        WHERE s.status IN (${SEPARATION_STATUS_SAIU_SQL})
 
         UNION ALL
 
-        SELECT 
-          ri.id, 
-          COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade, 
-          COALESCE(p.name, ri.custom_product_name) as produto, 
-          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
-          cs.op_code, 
-          cs.status as op_status, 
-          COALESCE(pf.sector, r.sector) as destino_setor, 
+        SELECT
+          ri.id,
+          ${qtdSolicitacaoSql('ri')} as quantidade,
+          COALESCE(p.name, ri.custom_product_name) as produto,
+          ${precoSql('p')} as preco_unitario,
+          cs.op_code,
+          cs.status as op_status,
+          COALESCE(pf.sector, r.sector) as destino_setor,
           r.created_at as data
         FROM request_items ri
         JOIN requests r ON ri.request_id = r.id
         JOIN client_services cs ON r.client_service_id = cs.id
         LEFT JOIN products p ON ri.product_id = p.id
         LEFT JOIN profiles pf ON r.requester_id = pf.id
-        WHERE r.status IN ('aprovado', 'entregue')
+        WHERE r.status IN (${REQUEST_STATUS_SAIU_SQL})
       `;
       const resultOps = await pool.query(opsQuery);
       saidas_ops_all_time = resultOps.rows;
