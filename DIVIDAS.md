@@ -2972,3 +2972,167 @@ ser ativo no dia em que uma devolução ultrapassar a saída de uma OP.
 
 **(f) ⚠ RÉGUA (f) — a varredura por "a MESMA fórmula de X"**, acima. Aplicável a toda a base, não
 só ao custo.
+
+---
+
+# TR1 — O TRANSFER DE OP GANHA GUARD E AUDITORIA (21/08/2026)
+
+`POST /clients/services/:serviceId/transfer` move **ponteiros de documento** — `requests`,
+`separations`, `op_returns` — e **não move `op_material_events`**. Transferir uma OP que tem razão
+deixava o material na **OP antiga** enquanto o custo inteiro ia para a nova: a aba Clientes e OPs
+mostrava a origem zerada e o Armazém seguia mostrando o WIP nela. Dois livros, duas verdades.
+
+Este lote faz **duas coisas e para**: **(a)** recusa o transfer quando a OP de origem tem razão, e
+**(b)** passa a registrar o que aconteceu. **O redesenho da operação fica FORA**, e o porquê está
+mais abaixo.
+
+## (a) O GUARD — e por que só a ORIGEM
+
+Antes de qualquer `UPDATE`, dentro da transação:
+
+```sql
+SELECT count(*), COALESCE(SUM(qty),0) FROM op_material_events WHERE client_service_id = <origem>
+```
+
+Com evento, **409** e `code: 'OP_COM_RAZAO'`, com a mensagem dizendo o que fazer:
+
+> Esta OP tem material registrado no razão (N eventos, X unidades). Transferir deixaria esse
+> material na OP antiga. Use a transferência de material por OP (Produção → apontamento) ou zere
+> o razão antes.
+
+**409 e não 400:** o corpo da requisição está correto — quem recusa é o **estado** da OP. 400 diria
+ao front que ele mandou algo malformado, e mandaria o operador procurar erro onde não há.
+
+**⚠ Só a ORIGEM é verificada, e isso é decisão medida, não economia.** O evento órfão nasce de
+**esvaziar** uma OP que tem razão. Despejar documentos **numa** OP que já tem razão não órfã nada:
+os eventos do destino continuam apontando para os documentos do destino, que não se movem. Medido
+em produção (21/08): dos **39 eventos com origem, ZERO** apontam para OP diferente da do seu
+documento — e é essa invariante que o guard preserva.
+
+**O que o guard NÃO faz, de propósito:** não olha status de OP (dá para despejar em OP concluída),
+não confere cliente (o modal oferece OP de qualquer um dos 32). São defeitos reais, nomeados
+abaixo, e **fora deste lote** — guard que cresce sem medida vira política nova sem dono.
+
+## (b) A AUDITORIA — `TRANSFERIR_MOVIMENTACOES_OP`, na mesma transação
+
+O nome segue o padrão vivo de `audit_logs` (85 ações; as do domínio são verbo em PT —
+`CRIAR_SOLICITACAO`, `ENTREGAR_SOLICITACAO`, `AUTORIZAR_SEPARACAO`). Nenhuma ação existente casava
+com `%TRANSF%`: esta é nova.
+
+O `details` leva **quem, quando (o `created_at` da linha), origem (id e op_code), destino (id e
+op_code)** e as **contagens REAIS** — os `rowCount` de cada `UPDATE`, não estimativa:
+
+```json
+{"origem":  {"id":"…","op_code":"TR1-ORIG-…"},
+ "destino": {"id":"…","op_code":"TR1-DEST-…"},
+ "movidos": {"requests":1,"separations":1,"op_returns":1,"request_items_texto":0}}
+```
+
+`request_items_texto` entra na conta **de propósito**: é o `rowCount` do passo fóssil, e ele
+registra ao vivo, a cada transfer, que aquele `UPDATE` não casa nada.
+
+### ⚠ A SONDA DE UMA LINHA, e por que ela existe
+
+`createLog` tem `try/catch` interno e **engole o próprio erro**. Dentro de uma transação isso é
+armadilha: se o INSERT do log falhar, a transação fica **abortada**, o `COMMIT` seguinte vira
+**ROLLBACK silencioso** e o handler responde **sucesso** para um transfer que não aconteceu. Um
+`SELECT 1` depois do log estoura nesse caso e cai no `catch` → 500. Está provado (PT5b): com um
+`user_id` inexistente, a resposta é **500** e **nada** se moveu.
+
+Não mexi no `logger.ts`: fazer o log da casa inteira parar de engolir erro é decisão de outro lote.
+
+## AS PROVAS — branch de ensaio, fixture construída, asserção por MEMBRO
+
+Handler **compilado** rodando contra o branch de ensaio (`ep-sweet-sound`, cláusula do pooler antes
+da allowlist, mais o `FR_EXPECT_DB_HOST` do próprio `db.ts`). Fixture com a forma real: cliente +
+duas OPs + solicitação com item + separação com item + devolução, e — no caso do guard — um evento
+`recebido` com o par de origem que o `ck_opmat_recebido_tem_origem` exige. **Régua do PG1: as 6 OPs
+com razão existem em produção, mas a fixture é CONSTRUÍDA, e está declarado que é.**
+
+| prova | com o guard (TR1) | BASE `2c5d380` |
+|---|---|---|
+| **PT1/PT3** origem COM razão | **409 `OP_COM_RAZAO`** · req 1/0, sep 1/0, ret 1/0, evento 1/0 — **nada se move** | **200** · req 0/1, sep 0/1, ret 0/1 e **evento fica na origem: o órfão** |
+| **PT2** origem SEM razão | **200** · move 1 requests + 1 separations + 1 op_returns, `logs=1` | 200 · move o mesmo, `logs=0` |
+| **PT4** o log | `user_id` correto, `ip` `10.0.0.7`, origem/destino com id **e** op_code, `movidos` batendo com os deltas medidos | não existe |
+| **PT5a** falha **no COMMIT** (constraint trigger DEFERRED) | **500** · `logs=0` e **nada movido** — o log não sobrevive ao rollback | 200 (o gatilho nem dispara: não há log) |
+| **PT5b** log impossível (`user_id` fora de `users`) | **500** · nada movido | 200 · move tudo, sem log |
+| **PT6** contrato | sucesso **idêntico**: `{success:true, message:"Todas as movimentações foram transferidas com sucesso!"}`; o 409 é caminho **novo** | — |
+
+A linha **PT3** é o controle negativo: o mesmo fixture, no código base, **passa e produz o órfão**.
+Sem ela, o 409 do PT1 poderia ser qualquer coisa recusando qualquer coisa.
+
+Resíduo da fixture depois de tudo: **zero** (cleanup só por id; a trigger de prova foi criada e
+derrubada na mesma corrida).
+
+**PT7 — build verde** (`tsc --noEmit` e `npm run build`, exit 0). Suíte: **21 smokes**, **12
+passam, 9 falham, e as 9 são PRÉ-EXISTENTES** — medido com o patch fora (`git stash`), falham
+igual:
+
+* **5** morrem no boot do servidor por **`JWT_SECRET` ausente** — o worktree limpo não tem `.env`, e
+  `auth.controller.ts:11` aborta o boot de propósito. É ambiente, não código.
+* **4** (`returns:*`) morrem em `column "warehouse_id" of relation "op_material_events" does not
+  exist`: **o branch de ensaio está sem a migration 027**. Não afeta este lote — o guard conta
+  linhas, não lê `warehouse_id` — mas **fica registrado que o ensaio está atrás da produção**.
+
+## DÍVIDAS
+
+**(a) ⚠ O LOG NÃO RETROAGE.** As **144 solicitações** já movidas (PROT0826 136, `00001` 6,
+`000326` 2, entre abril e julho) seguem **irreversíveis e não atribuíveis**. Não há de onde
+reconstruir: `requests`, `separations`, `op_returns` e `client_services` **não têm nenhuma coluna
+de última alteração** (`updated_at`/`modified`/`changed` — zero no `information_schema`), e
+`audit_logs` não tem uma linha sequer sobre transfer. Sabe-se **que** houve — pela anomalia de a OP
+ter sido criada depois da solicitação — nunca **de onde veio** nem **quem fez**. Daqui para a
+frente, sim.
+
+**(b) AS QUATRO ARESTAS NÃO TOCADAS**, nomeadas de propósito:
+1. **`BEGIN` cru em vez de `withTransaction`** — sem retry de serialização/deadlock, sem o padrão
+   que outros **9 controllers** usam;
+2. **`ROLLBACK` sem `try/catch` no `catch`** — se a conexão morreu, o `ROLLBACK` lança e o cliente
+   recebe **o erro errado**, mascarando a causa real;
+3. **o passo 3 FÓSSIL** — `request_items.client_service` tem 159 textos, 54 distintos, **zero**
+   casam com `op_code` ("Embaladora", "Uso interno"). Mantido: este é lote de guard, não de
+   limpeza, e agora o log mede o fóssil a cada uso;
+4. **sem guard de status e sem escopo de cliente** — dá para despejar em OP concluída e para
+   misturar clientes (o modal lista as OPs dos 32).
+
+**(c) O REDESENHO CONTINUA PENDENTE — e o que ele exigiria.** O razão **já tem** a operação certa:
+`POST /op-materials/transfer` emite o par `transferido_out`/`transferido_in` ligado por
+`ref_event_id`, dentro de `withTransaction`, com **advisory lock**, **guard de saldo**
+(`SALDO_INSUFICIENTE_NA_OP`) e carimbo de `warehouse_id`. **Nunca foi usada: 0 `out`, 0 `in`, 0
+eventos com par.** Ela é por **(armazém, produto, quantidade)** e exige que o setor **detenha** o
+material; o transfer de documentos não tem produto, nem quantidade, nem armazém — e é `clientes:edit`
+(3 almoxarifes + admin), não `producao:apontar`. Por isso **não é acrescentar UPDATE**: mover
+`op_material_events` por `UPDATE` falsificaria um razão **append-only** e passaria por fora do lock,
+do guard e do par. Quando alguém precisar mesmo transferir OP com WIP, é **lote próprio**, com o
+ator, o grão e a permissão certos.
+
+**(d) O AW0 NÃO CRIOU O FURO — CRIOU A EXPOSIÇÃO.** Até 20/08 o razão reconhecia **109 unidades**, e
+transferir uma OP deixaria um estrago invisível. Depois da regularização são **3.813 unidades em 6
+OPs** — a 901001 sozinha levaria 221 solicitações e deixaria **11 eventos / 3.308 unidades**. Os 144
+transfers do passado não produziram órfão nenhum por **acaso cronológico** (são de abril a julho, e
+o razão só ganhou conteúdo em 20/08). O próximo transfer numa dessas 6 OPs seria o primeiro a doer —
+e é exatamente ele que o guard recusa.
+
+**(e) ⚠ CAÇAR OS OUTROS CHAMADORES DE `createLog` DENTRO DE TRANSAÇÃO — lote próprio.** A armadilha
+não é deste handler, é do utilitário: **`createLog` engole o próprio erro**, e engolir erro é seguro
+FORA de transação e **armadilha DENTRO** dela. Medido no `2c5d380`: **86 chamadas de `createLog` no
+repositório, das quais 44 passam um `client` de transação**, espalhadas por sete controllers que
+usam `withTransaction` (`assembly`, `printers3d`, `replenishments`, `requests`, `separations`,
+`stock`, `travels`). **Cada uma dessas 44 tem a mesma exposição** que este lote blindou com uma
+sonda de uma linha: se o INSERT do log falhar, a transação fica abortada e o `COMMIT` seguinte vira
+ROLLBACK silencioso — o usuário vê sucesso e o banco não mudou.
+
+Aqui a sonda foi a correção certa **porque o recorte era este handler**. A correção certa para as
+44 é outra: fazer o `logger.ts` **parar de engolir** (ou expor uma variante que propague), o que
+muda o comportamento de todo mundo que loga e por isso **não cabe num lote de guard**.
+
+É a **régua (f) do CO1** outra vez — *onde há uma, procure as outras* — e é da mesma família da
+régua do RS1: **`try/catch` em JavaScript não desaborta uma transação do Postgres**; quem quer
+best-effort dentro de transação precisa de `SAVEPOINT`, não de `catch`.
+
+**(f) ⚠ O BRANCH DE ENSAIO ESTÁ ATRÁS DA PRODUÇÃO.** `ep-sweet-sound` **não tem a migration 027**:
+quatro smokes (`returns:grao`, `returns:janela`, `returns:perop`, `returns:total-cost`) morrem em
+`column "warehouse_id" of relation "op_material_events" does not exist`. Medido com o patch fora
+(`git stash`): falham igual, são **pré-existentes** e não têm relação com este lote — o guard conta
+linhas, não lê `warehouse_id`. **Mas o próximo lote que precisar provar `returns:*` vai bater
+nisso**, e a conta a pagar é aplicar a 027 no ensaio antes de começar, não no meio da prova.

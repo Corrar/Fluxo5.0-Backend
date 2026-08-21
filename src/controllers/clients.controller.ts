@@ -3,6 +3,8 @@
 import { Request, Response } from 'express';
 import { pool } from '../db';
 import { totalCostSql } from '../services/opCost';
+import { createLog } from '../utils/logger';
+import { getClientIp } from '../utils/ip';
 
 export const getClients = async (req: Request, res: Response) => {
   try {
@@ -211,36 +213,116 @@ export const transferServiceData = async (req: Request, res: Response) => {
     const oldOpCode = oldOpRes.rows[0].op_code;
     const targetOpCode = targetOpRes.rows[0].op_code;
 
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // 🛑 GUARD (lote TR1) — OP DE ORIGEM COM RAZÃO DE MATERIAL NÃO SE TRANSFERE
+    //
+    // Este handler move PONTEIROS DE DOCUMENTO (requests, separations, op_returns). Ele NÃO
+    // move `op_material_events`, e não é esquecimento: aquele razão é APPEND-ONLY (doutrina da
+    // 008), e a casa já tem a operação certa para mover material entre OPs —
+    // `POST /op-materials/transfer`, que emite o PAR transferido_out/transferido_in com advisory
+    // lock, guard de saldo e `warehouse_id`. Ela é por (armazém, produto, quantidade) e exige que
+    // o setor DETENHA o material; este endpoint não tem nenhuma dessas três coisas.
+    //
+    // Sem este guard, transferir uma OP com razão deixa o material na OP ANTIGA enquanto o custo
+    // vai inteiro para a nova: a tela de Clientes e OPs mostra a origem zerada e o Armazém segue
+    // mostrando o WIP nela. Medido em 21/08: a 901001 levaria 221 solicitações e deixaria
+    // 11 eventos / 3.308 unidades para trás.
+    //
+    // ⚠ SÓ A ORIGEM É VERIFICADA, e isso é decisão medida — não economia. O evento órfão nasce de
+    // ESVAZIAR uma OP que tem razão. Despejar documentos NUMA OP que já tem razão não órfã nada:
+    // os eventos do destino continuam apontando para os documentos do destino, que não se movem.
+    // Medido em produção (21/08): dos 39 eventos com origem, ZERO apontam para OP diferente da do
+    // seu documento — e é exatamente essa invariante que o guard preserva.
+    //
+    // 409 e não 400: o corpo da requisição está correto: quem recusa é o ESTADO da OP.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    const razaoOrigem = await client.query(
+      `SELECT count(*)::int AS eventos, COALESCE(SUM(qty), 0)::float8 AS unidades
+         FROM op_material_events WHERE client_service_id = $1`,
+      [serviceId]
+    );
+    const { eventos, unidades } = razaoOrigem.rows[0];
+    if (eventos > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        code: 'OP_COM_RAZAO',
+        error: `Esta OP tem material registrado no razão (${eventos} ${eventos === 1 ? 'evento' : 'eventos'}, ${unidades} ${unidades === 1 ? 'unidade' : 'unidades'}). `
+             + `Transferir deixaria esse material na OP antiga. Use a transferência de material por OP (Produção → apontamento) ou zere o razão antes.`,
+        eventos,
+        unidades,
+      });
+    }
+
     // -----------------------------------------------------------
     // 🛡️ TRANSFERÊNCIA DE VÍNCULOS
     // -----------------------------------------------------------
-    
+
     // 2. Move os Pedidos/Solicitações (Busca por ID)
-    await client.query(
-      `UPDATE requests SET client_service_id = $1 WHERE client_service_id = $2`, 
+    const movRequests = await client.query(
+      `UPDATE requests SET client_service_id = $1 WHERE client_service_id = $2`,
       [targetServiceId, serviceId]
     );
 
     // 3. Atualiza os textos avulsos dentro dos itens dos pedidos (Busca por Texto)
-    await client.query(
-      `UPDATE request_items SET client_service = $1 WHERE client_service = $2`, 
+    // ⚠ FÓSSIL, mantido de propósito neste lote (que é de guard, não de limpeza): medido em
+    // produção, `request_items.client_service` tem 159 textos não vazios, 54 distintos, e ZERO
+    // casam com qualquer `op_code` — são nomes de setor e apelido de cliente ("Embaladora",
+    // "Uso interno"). Este UPDATE nunca casou uma linha. O log abaixo passa a registrar o
+    // rowCount dele, que é a evidência viva do fóssil. Ver DIVIDAS.md.
+    const movItensTexto = await client.query(
+      `UPDATE request_items SET client_service = $1 WHERE client_service = $2`,
       [targetOpCode, oldOpCode]
     );
 
     // 4. Move as Saídas Manuais e Separações (Busca por ID E por Texto)
     // Atualiza tanto as Saídas Manuais novas (ID) como as Separações antigas (Texto)
-    await client.query(
-      `UPDATE separations 
-       SET client_service_id = $1, production_order = $2 
-       WHERE client_service_id = $3 OR production_order = $4`, 
+    const movSeparations = await client.query(
+      `UPDATE separations
+       SET client_service_id = $1, production_order = $2
+       WHERE client_service_id = $3 OR production_order = $4`,
       [targetServiceId, targetOpCode, serviceId, oldOpCode]
     );
 
     // 5. Move também as Devoluções feitas! (NOVO)
-    await client.query(
-      `UPDATE op_returns SET client_service_id = $1 WHERE client_service_id = $2`, 
+    const movReturns = await client.query(
+      `UPDATE op_returns SET client_service_id = $1 WHERE client_service_id = $2`,
       [targetServiceId, serviceId]
     );
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // 📋 AUDITORIA (lote TR1) — NA MESMA TRANSAÇÃO, com as CONTAGENS REAIS
+    //
+    // Até aqui esta operação não escrevia NADA em audit_logs, e as tabelas que ela reescreve não
+    // têm coluna de última alteração: um transfer era irreversível E não atribuível. Medido:
+    // 144 solicitações já foram movidas assim, sem um único registro de quem, quando ou de onde.
+    //
+    // Os números são os `rowCount` REAIS de cada UPDATE, não estimativa — é o que permite
+    // reconstruir o movimento depois. E o log vai com o `client` da transação: se o COMMIT não
+    // acontecer, o log não sobrevive. Log de operação que não aconteceu é pior que log nenhum.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    const userId = (req as any).user?.id ?? null;
+    await createLog(
+      userId,
+      'TRANSFERIR_MOVIMENTACOES_OP',
+      {
+        origem:  { id: serviceId,       op_code: oldOpCode },
+        destino: { id: targetServiceId, op_code: targetOpCode },
+        movidos: {
+          requests:            movRequests.rowCount    ?? 0,
+          separations:         movSeparations.rowCount ?? 0,
+          op_returns:          movReturns.rowCount     ?? 0,
+          request_items_texto: movItensTexto.rowCount  ?? 0,
+        },
+      },
+      getClientIp(req),
+      client
+    );
+
+    // ⚠ SONDA: `createLog` ENGOLE o próprio erro (try/catch interno). Dentro de uma transação
+    // isso é armadilha — a transação fica ABORTADA e o COMMIT seguinte vira ROLLBACK silencioso,
+    // devolvendo "sucesso" para um transfer que não aconteceu. Este SELECT estoura se a
+    // transação estiver abortada, e o catch lá embaixo devolve 500. Uma linha, e o silêncio some.
+    await client.query('SELECT 1');
 
     await client.query('COMMIT');
     res.json({ success: true, message: "Todas as movimentações foram transferidas com sucesso!" });
