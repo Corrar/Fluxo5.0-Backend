@@ -22,6 +22,8 @@ import { canonSetor, resolveDestinationWarehouse } from '../services/setor';
 // chave do advisory lock — ver o cabeçalho de opMaterialScope.ts para por que ela não é montada
 // à mão em cada chamador.
 import { lockKeyOpMat, escopoDoPerfil, warehouseDoSetor } from '../services/opMaterialScope';
+import { StockService } from '../services/stock.service';
+import { POOLED_OP_ID } from '../services/warehouse';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -293,6 +295,61 @@ export const receiveOpMaterial = async (req: Request, res: Response) => {
            userId, opKey, warehouseId],
         );
         criados.push(ins.rows[0]);
+
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        // O CRÉDITO NO ARMAZÉM DO SETOR — lote FS1 (21/08/2026). A torneira fecha aqui.
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        //
+        // ─── O QUE ESTAVA ABERTO ──────────────────────────────────────────────────────────
+        // Este handler fazia o INSERT acima e MAIS NADA: `grep stock` no corpo inteiro devolvia
+        // ZERO. Para a origem SOLICITAÇÃO isso está certo — a ENTREGA já chamou
+        // `StockService.transfer(ALMOX -> setor, fromReserved:true)` (requests.controller) e o
+        // material está na prateleira antes de o setor confirmar. Para a origem SEPARAÇÃO não
+        // havia perna nenhuma: `manualWithdrawal` debita o ALMOX (reverseReceive) e ninguém
+        // credita o setor. Cada confirmação criava divergência — medido: 2 un em 18/08, 3 em
+        // 19/08, 4 em 20/08 e mais 1 em 21/08, DURANTE a própria medição.
+        //
+        // ─── POR QUE `receive`, E NÃO `transfer` ──────────────────────────────────────────
+        // `transfer` DEBITA a origem, e a origem JÁ FOI DEBITADA — usá-lo tiraria do ALMOX uma
+        // segunda vez. `consume` também não: ele reduz. O que falta é só a ENTRADA no destino.
+        // ⚠ E `receive` é o único que serve por um motivo estrutural, não por gosto: ele usa
+        //   `ensureAndLock` e CRIA A LINHA de stock quando ela não existe. Medido: 3 dos 6
+        //   destinos NÃO TÊM linha (ESTEIRA/9.99.1150, LAVADORA/2.02.0034, PROTOTIPO/2.07.0028).
+        //   `transfer` e `consume` usam `lockExisting` e quebrariam nesses três.
+        // `receive` também não toca `quantity_reserved` — que é o certo: este material nunca
+        // esteve reservado no armazém do setor.
+        //
+        // INVARIANTE: Σ delta_on_hand do ALMOX = 0 neste fluxo. Sai de graça, e não por
+        // disciplina — a chamada abaixo não referencia o ALMOX em lugar nenhum.
+        //
+        // POOLED_OP_ID: a OP mora no RAZÃO (client_service_id do evento acima), não na linha de
+        // stock. Medido: as 79 linhas de stock em armazém de setor têm `op_id` NULL, e o
+        // `transfer` da entrega de solicitação usa POOLED nos dois lados. Divergir aqui criaria
+        // uma segunda convenção para a mesma prateleira.
+        //
+        // ─── ⚠ A POSIÇÃO DESTA CHAMADA É A REGRA, NÃO DETALHE ─────────────────────────────
+        // Ela está DEPOIS do `continue` do replay (linha ~264) e DEPOIS do INSERT, no MESMO
+        // corpo de iteração. Se ela subisse para antes do `continue`, um replay do mesmo POST
+        // PULARIA o razão e CREDITARIA o stock — furo NOVO, e pior que o que este lote fecha,
+        // porque criaria estoque sem evento. O smoke tem controle negativo para isso: ele
+        // move a chamada para fora do ramo e PROVA que o replay credita.
+        //
+        // ─── ⚠ SÓ A ORIGEM SEPARAÇÃO ─────────────────────────────────────────────────────
+        // A solicitação JÁ tem lastro (medido: 43 de 43 pares com estoque suficiente, zero sem
+        // linha). Creditar as duas duplicaria 3.976 un contra 10 legítimas — 398:1. As duas
+        // origens são mutuamente exclusivas por CHECK do banco (ck_opmat_recebido_tem_origem,
+        // da 026), então `origemSolicitacao` é decisão total, não heurística.
+        if (!origemSolicitacao) {
+          // op_key DERIVADA da mesma âncora de ITEM do evento (régua S2/AW0: âncora no item,
+          // nunca no par), com sufixo próprio para não colidir com a chave do razão — as duas
+          // vivem em tabelas diferentes, mas usar a mesma string faria o `alreadyApplied` do
+          // motor e o pré-check do razão significarem a mesma coisa por acidente.
+          await StockService.receive(client, productId, warehouseId, POOLED_OP_ID, qty, {
+            refType: 'separation', refId: separationId, userId,
+            opKey: `${opKey}:stock`,
+            reason: 'Recebimento de saída manual no armazém do setor',
+          });
+        }
       }
 
       return { clientServiceId, criados, replays, idempotent: criados.length === 0 && replays.length > 0 };

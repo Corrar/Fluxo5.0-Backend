@@ -3294,3 +3294,125 @@ popup bloqueado vira aviso; **403 mostra o erro na janela e nenhum valor vaza**.
    `assistente_tecnico`, `chefe`, `compras`, `financeiro`) e **não é lida por linha nenhuma de
    código** — só `valores:edit` é, em `products.routes.ts:84`. Não é a chave deste lote, mas é a
    candidata natural no dia em que "ver valores" virar um eixo próprio de permissão.
+
+---
+
+# FS1 — A CONFIRMAÇÃO DE RECEBIMENTO CREDITA O ARMAZÉM DO SETOR (21/08/2026)
+
+`receiveOpMaterial` fazia `INSERT` em `op_material_events` e **mais nada** — `grep stock` no corpo
+inteiro do handler devolvia **zero**. Para a origem **solicitação** isso está certo: a ENTREGA já
+chamou `StockService.transfer(ALMOX → setor, fromReserved:true)`. Para a origem **separação** não
+havia perna nenhuma: `manualWithdrawal` debita o ALMOX e ninguém credita o setor.
+
+**Cada confirmação criava divergência.** Medido: 2 un em 18/08, 3 em 19/08, 4 em 20/08 — e mais
+1 em 21/08, **durante a própria medição** (ver "a torneira produziu enquanto se media", abaixo).
+
+## O MÉTODO: `receive`, e por um motivo ESTRUTURAL
+
+`transfer` **debita a origem** — e a origem já foi debitada; usá-lo tiraria do ALMOX duas vezes.
+`consume` reduz. O que faltava era só a **entrada no destino**.
+
+⚠ E `receive` é o **único** que serve: ele usa `ensureAndLock` e **cria a linha de stock quando
+ela não existe**. Medido: **3 dos 6 destinos NÃO TÊM linha** (ESTEIRA/9.99.1150,
+LAVADORA/2.02.0034, PROTOTIPO/2.07.0028). `transfer` e `consume` usam `lockExisting` e
+**quebrariam** nesses três. `receive` também não toca `quantity_reserved`, que é o certo — este
+material nunca esteve reservado no armazém do setor.
+
+**`POOLED_OP_ID`**: a OP mora no **razão** (`client_service_id` do evento), não na linha de stock.
+Medido: as **79** linhas de stock em armazém de setor têm `op_id` NULL, e o `transfer` da entrega
+de solicitação usa POOLED nos dois lados.
+
+**INVARIANTE Σ Δ ALMOX = 0** — e ela sai de graça, não por disciplina: a chamada nova não
+referencia o ALMOX em lugar nenhum. **Provado (PF2): 0 de delta E 0 lançamentos.**
+
+## O MOMENTO: NA CONFIRMAÇÃO (decisão do Bruno)
+
+A alternativa era creditar **na saída** (espelhando a solicitação, que credita na entrega) e
+alcançaria 3.018 un em vez das confirmadas. **Foi recusada**: creditar na saída põe no armazém
+material que **ninguém atestou ter recebido** — que é a **forma do furo A**, o que o AW0 gastou
+**31 eventos** para fechar. Na confirmação, razão e stock nascem no **mesmo ato**.
+
+A janela entre os dois momentos é curta e está medida: **0 a 1 dia** nas 6 confirmações existentes.
+
+## ⚠ A POSIÇÃO DA CHAMADA É A REGRA, NÃO DETALHE
+
+O handler sai do replay por `continue` **antes** do INSERT (pré-check por `op_key`). O crédito
+está **depois** do `continue` e **depois** do INSERT, no mesmo corpo de iteração.
+
+**Se subisse para antes do `continue`, um replay PULARIA o razão e CREDITARIA o stock** — furo
+novo, e pior que o fechado, porque criaria estoque sem evento.
+
+**PF5 prova nos dois sentidos:** o replay não move razão (2→2), não move ledger (2→2) e não move
+saldo (3→3); e o **controle negativo**, com a chave/posição erradas, **credita** (3→6, revertido
+por ROLLBACK). A posição é o que protege, e está provado que protege.
+
+`op_key` do crédito: `opmat:recv:<idem>:sep:<sepId>:item:<itemId>` **+ `:stock`** — derivada da
+mesma âncora de ITEM do evento (régua S2/AW0), com sufixo próprio para que o `alreadyApplied` do
+motor e o pré-check do razão não signifiquem a mesma coisa por acidente.
+
+## SÓ A ORIGEM SEPARAÇÃO
+
+A solicitação **já tem lastro**: 43 de 43 pares com estoque suficiente, zero sem linha. Creditar
+as duas duplicaria **3.976 un contra 10** — **398:1**. As duas origens são mutuamente exclusivas
+por CHECK do banco (`ck_opmat_recebido_tem_origem`, da 026): medido, 6 só-separação,
+46 só-solicitação, **0 com ambos, 0 com nenhum**.
+
+**PF3 prova nos dois sentidos:** a solicitação recebe o evento e o stock **não muda** (3→3), com
+zero lançamento de ledger; e o **controle negativo**, sem o `if (!origemSolicitacao)`, **credita**
+(3→8, revertido). A distinção morde.
+
+## SETOR SEM CUSTÓDIA: já barrado, em DUAS paredes
+
+A **fila** filtra em memória (`opMaterials.controller:669`) e o **submit** barra com
+`SETOR_SEM_CUSTODIA`. O crédito, ficando depois do D1, não os alcança.
+
+⚠ Além do `null` explícito do mapa, há o caso **FORA DO MAPA**: `"Outros"` não existe em
+`SETOR_ARMAZEM`. `resolveDestinationWarehouse` devolve `{code:null, conhecido:false}` com
+`console.warn` — **fail-closed**. **PF4 cobre os três**: `Escritório` (null), `Outros` (fora do
+mapa) e `Terceiros` (null) — todos 400, com razão e stock imóveis.
+
+## AS DUAS ASSINATURAS DO DÉBITO
+
+`consume` **4×** (17–19/08) e `adjust` **9×** (19–21/08) — a virada do Lote B, que trocou `consume`
+por `reverseReceive`. Hoje os dois ramos do `manualWithdrawal` usam `reverseReceive`.
+
+**O fluxo novo não lê nenhuma das duas** — ele credita o destino, e o `kind` do débito é
+irrelevante. **PF6 prova com as duas**, montando o débito histórico e o atual.
+
+## O VOLUME: 3.009 un era ENGANOSO — são 3
+
+⚠ **Correção da recon.** A recon do furo simétrico reportou "3.009 un na fila dentro do cutoff".
+Refeita pelo **de-para certo** (`services/setor.ts`, e **não** `warehouses.sector` — a régua da
+casa é explícita e a primeira medição a violou), o número real é outro:
+
+- dos 7 itens da fila no cutoff (3.008 un), o crédito alcança **2 itens = 3 un**;
+- **3.004 un vão para "Terceiros"** e 1 para "Outros" — ambos sem custódia, ambos já barrados;
+- sem cutoff: fila de 11.545 un, das quais o crédito alcançaria **2.060 un em 119 itens**.
+
+**O Bruno não vai ver 3 mil unidades aparecerem.**
+
+## O ENSAIO PRECISOU DA 027, E ELA FOI APLICADA
+
+O `INSERT` do handler **lista `op_material_events.warehouse_id`** — coluna da 027. Medido: é a
+**única** das 7 colunas do lote que faltava no `ep-sweet-sound`. Sem ela toda prova morreria de
+erro de schema e não falaria sobre o código.
+
+Aplicada com o protocolo (medir → aplicar → laudo), **arquivo da casa sem uma linha alterada**:
+4 eventos, **4 carimbados**, **0 com ALMOX**, índice instalado, auto-conferência da própria
+migration passou. **Produção e validação NÃO foram tocadas.** Isto também destrava os **4 smokes
+`returns:*`** que morriam nessa coluna.
+
+## DÍVIDAS DESTE LOTE
+
+1. **A TORNEIRA PRODUZIU ENQUANTO SE MEDIA.** A recon fechou em **5 eventos / 9 un**; a Fase 0
+   do FS1, dias depois, mediu **6 / 10** — um evento novo em **21/08**, na Esteira. Não é ruído:
+   é a prova de que o furo era **ativo**, e a razão de o lote ter vindo antes da regularização.
+2. **AS 6 ÓRFÃS NÃO GANHAM BACKFILL AQUI.** Elas ficam para **lote próprio**, com decisão do
+   Bruno **caso a caso** — porque a escolha entre creditar o stock e compensar o razão depende de
+   **onde o material está fisicamente**, e o sistema não sabe. A recon mediu: zero consumo, zero
+   devolução, zero transferência posterior; o `audit_log` registra setor e `separationId` e
+   **nunca** o destino físico. Sem testemunha, a decisão é cega.
+3. **O CLEANUP DA PROVA DEIXA A LINHA DE STOCK COM SALDO ZERO.** As linhas criadas pelo `receive`
+   no ensaio **não são apagadas** — linha de stock com saldo é dado, e apagá-la seria o cleanup
+   global que a régua proíbe. O saldo é restaurado por **par exato**. Uma linha ficou criada com
+   `on_hand = 0`, e isso está declarado, não escondido.
