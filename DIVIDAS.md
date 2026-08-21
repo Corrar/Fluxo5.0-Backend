@@ -3136,3 +3136,161 @@ quatro smokes (`returns:grao`, `returns:janela`, `returns:perop`, `returns:total
 (`git stash`): falham igual, são **pré-existentes** e não têm relação com este lote — o guard conta
 linhas, não lê `warehouse_id`. **Mas o próximo lote que precisar provar `returns:*` vai bater
 nisso**, e a conta a pagar é aplicar a 027 no ensaio antes de começar, não no meio da prova.
+
+---
+
+# PDF1 — EXPORTAR PDF DA OP (21/08/2026)
+
+A aba **Clientes e OPs** ganha um botão **Exportar PDF** por OP. O documento traz cabeçalho
+(cliente, OP, status, emissão), a lista de materiais com **valor unitário e subtotal**, e o total.
+
+**A lista não existia.** `getClients` devolvia só o escalar `total_cost` por OP, dentro do
+`json_agg`. Este lote cria `GET /clients/services/:serviceId/items`.
+
+## POR QUE ROTA DEDICADA, E NÃO CAMPO NOVO NO `getClients`
+
+Medido em produção (21/08): a lista das 46 OPs junta dá **2.613 linhas / 384 KB** de JSON. O
+`GET /clients` hoje é da ordem de **10 KB** e roda em **toda abertura** da tela, em **6 módulos**
+(Estoque, Dev, Compras, Produção, Assistência, Financeiro). Embutir a lista lá desfaria o que o
+lote BW comprou. A rota é sob demanda: um clique, uma OP.
+
+A maior (`PROT0826`) devolve **241 linhas / ~50 KB**. Seriam **448 linhas / 141 KB** se o grão
+fosse por linha de documento em vez de por produto.
+
+⚠ **`GET /op-materials/balance/:id` NÃO servia.** Ele lê `op_material_events`, que o cabeçalho do
+`opCost.ts` declara conjunto **disjunto** — medido: **41 eventos cobrindo 6 das 46 OPs**. Usá-lo
+daria outro número e 40 documentos vazios.
+
+## A QUARTA CÓPIA NÃO NASCEU
+
+A regra de custo já teve **três donos que discordavam** (ver a entrada do CO1). Um endpoint que
+reescrevesse as três pernas para listar itens seria a **quarta**. Por isso a lista mora no
+**mesmo arquivo** que o escalar: `services/opCost.ts` ganhou `itensDaOpSql()` ao lado de
+`totalCostSql()`, e as duas compartilham **literalmente os mesmos símbolos** — `precoSql`,
+`qtdSolicitacaoSql`, `REQUEST_STATUS_SAIU_SQL`, `SEPARATION_STATUS_SAIU_SQL`. Não há como mudar
+o predicado de uma sem mudar o da outra.
+
+O controller **não soma a lista** para obter o total: ele chama `totalCostSql`. Está provado que
+dão o mesmo; quando um dia não derem, quem manda é o dono.
+
+**PROVA (p1, contra produção, pelo módulo COMPILADO — não por transcrição):**
+`SUM(subtotal)` da lista `==` `totalCostSql`, **delta 0,00 em 46/46 OPs**; e
+`SUM(ROUND(subtotal,2)) == ROUND(SUM,2)` em 46/46 — o documento não se contradiz quando o leitor
+soma a coluna. Controle negativo (OP inexistente) devolve 0 linhas e R$ 0,00.
+
+## O GRÃO: AGRUPADO POR PRODUTO
+
+Uma linha por **produto**, não por linha de documento: **2.613 → 1.841** linhas no total.
+
+⚠ **`MAX(unit_price)` dentro do grupo só é honesto porque o preço é lido na hora** de `products`:
+medido, **0 de 1.841** pares (OP, produto) têm mais de um preço. **No dia em que a dívida (a) do
+CO1 congelar preço POR ITEM**, duas linhas do mesmo produto passam a poder ter preços diferentes
+e este `GROUP BY` tem de virar `(product_id, unit_price)` — senão o `MAX` escolhe um preço e
+`quantidade × unit_price` deixa de dar o `subtotal` impresso. **Fica registrado como gatilho.**
+
+Efeito colateral medido: o agrupamento zera a quantidade líquida de **45 das 1.841** linhas
+(devolveu tudo). Nenhuma fica negativa.
+
+## A DATA: "MOVIMENTO EM", E É O ÚLTIMO MOVIMENTO
+
+A coluna do protótipo chamava **"SOLICITADO EM"**. Medido: **504 de 2.613 linhas (19,3%) não têm
+solicitação nenhuma** — 495 vêm de separação (a **saída manual** sozinha atinge **25 das 46 OPs**)
+e 9 de devolução. O rótulo seria falso em uma linha a cada cinco. Passou a **"MOVIMENTO EM"**.
+
+Por perna, a data é a do material saindo, com fallback na criação do documento:
+
+| perna | expressão | por quê |
+|---|---|---|
+| separação | `COALESCE(sent_at, created_at)` | `sent_at` só existe nos **19** docs `type='op'`; os **567** `manual` e **6** `default` têm NULL |
+| solicitação | `COALESCE(delivered_at, created_at)` | `delivered_at` é **nova (026/RS1)** e está preenchida em **14 de 2.537**, sem backfill |
+| devolução | `created_at` | 100% preenchida |
+
+⚠ **Ao agrupar, a linha mostra `MAX(movido_em)` — o movimento MAIS RECENTE, não o primeiro.**
+Isso apaga informação e é decisão consciente: **437 dos 1.841** pares fundem mais de um documento
+(até **20**), e **64** fundem movimentos com **mais de 30 dias** de distância — span máximo medido,
+**77 dias**. Por isso a resposta carrega `movimentos` (a contagem), o documento imprime
+"*n* mov." na linha fundida, **e o rodapé diz a regra em uma frase**.
+
+⚠ **DEPENDÊNCIA DE SCHEMA:** a rota **exige `requests.delivered_at`**, criada pela **migration 026**.
+Qualquer ambiente em ≤025 responde **500**. Foi assim que a prova de rota descobriu que o banco de
+**validação (`ep-summer-wave`) está atrás de produção** — é a **única** das 10 colunas do lote que
+diverge (medido em `drift.js`). **A 026 continua não aplicada na validação**; ver "o que ficou
+pendente", abaixo.
+
+## O RODAPÉ — E POR QUE AS DUAS FRASES SÃO INCONDICIONAIS
+
+> Valores calculados com o preço de cadastro vigente em `<data e hora>`. Itens sem preço
+> cadastrado aparecem como R$ 0,00.
+
+A primeira existe porque **o preço é vivo** (dívida (a) do CO1): **600 `ATUALIZAR_PRECOS` desde
+abril, 62 nos últimos 30 dias**. Dois PDFs da mesma OP em dias diferentes podem divergir sem nada
+ter saído.
+
+A segunda porque **542 de 2.611 linhas (20,8%) saem a R$ 0,00**, em **34 das 46 OPs** — sem a
+frase, o documento parece errado na maioria dos casos. **Ela não é condicional a haver item a zero
+neste documento**: ensina a convenção, e uma OP sem item a zero hoje ganha um amanhã sem que
+ninguém reemita a regra.
+
+## QUEM PODE EXPORTAR: `clientes:edit`, NÃO `clientes:view`
+
+Decisão do Bruno (21/08). O documento abre o **preço unitário item a item**; a tela só expõe o
+**total** da OP. Quem só visualiza não exporta.
+
+⚠ **A MEDIÇÃO ANTERIOR DESTE LOTE ESTAVA ERRADA E FOI CORRIGIDA.** A Fase 0 mediu por
+`users.role` e concluiu "29 têm view, 1 tem edit". A coluna que **manda** é **`profiles.role`**:
+é ela que `auth.controller.ts:60` injeta no JWT e que `requirePermission` consulta.
+`users.role` tem 2 valores (28 `setor` + 1 `admin`); `profiles.role` tem **15 papéis**. Números
+corretos, sobre contas **ativas**:
+
+| chave | contas |
+|---|---|
+| `clientes:view` | **27** (e não 29 — `financeiro` e `gerente` **não têm**, nem abrem o `GET /clients`) |
+| `clientes:edit` | **4** — 3 almoxarifes + admin |
+
+⚠ **O GUARD ESTÁ NA ROTA, não no botão.** O `readOnly` do front é cosmético e não tem segunda
+parede; sem `requirePermission('clientes:edit')` as outras 23 contas puxariam os preços por
+chamada direta.
+
+⚠ **CONSEQUÊNCIA DECLARADA:** o botão vive dentro do `!readOnly`, e o módulo **Produção** monta a
+tela em `readOnly` (`pages_admin.jsx:2576`) — **quem entra pela Produção não vê o botão**. A
+exportação acontece pelo Estoque / Compras / Dev / Assistência / Financeiro.
+
+**PROVA (p2, via HTTP, router real compilado):** sem token → **401**; `clientes:view` apenas →
+**403** e **sem `items` no corpo**; sem chave `clientes` nenhuma → **403**; **com `clientes:edit`
+atravessa o guard**; uuid malformado → **400**; OP inexistente → **404**. Zero escrita no banco.
+
+## O DOCUMENTO: SEM BIBLIOTECA NOVA
+
+O projeto **não tem** biblioteca de PDF (`package.json`: axios, react, react-dom,
+socket.io-client, xlsx) e este lote **não traz a primeira**. Reusa o caminho que já roda em
+produção em dois documentos — romaneio de viagem e relatório de confronto (`pages_rest.jsx`):
+`window.open` + `document.write` + `print()`.
+
+⚠ **A JANELA ABRE ANTES DO FETCH.** Os dois documentos antigos já tinham os dados em mãos. Aqui
+os itens vêm de uma rota, e `window.open` **depois de um `await` perde o gesto do usuário** e o
+popup é bloqueado. Abre-se dentro do clique, escreve-se "Gerando…", e o conteúdo real substitui
+aquilo. **Erro também é escrito NA JANELA** — aba em branco seria falha silenciosa.
+
+**`cfEsc` foi PROMOVIDO a `window.frEscHtml`** (`pages_rest.jsx`). O nome do produto vem do banco
+e entra num `document.write`, e `pages_clientes.jsx` **não tinha escape nenhum**. Expor o que já
+existe em vez de escrever a terceira cópia — mesma régua que fez o custo ter um dono só.
+
+**PROVA (p3, harness jsdom contra o BUNDLE REAL, payload no shape CRU capturado de produção):**
+24 asserções verdes — rótulo `MOVIMENTO EM` presente e `SOLICITADO EM` **ausente**; as três frases
+do rodapé; **uma linha por linha do payload** (21/21 e 241/241); **soma dos subtotais impressos ==
+total impresso**; `<script>` no nome do produto sai **escapado**; `readOnly` esconde o botão;
+popup bloqueado vira aviso; **403 mostra o erro na janela e nenhum valor vaza**.
+
+## O QUE FICOU PENDENTE, NOMEADO
+
+1. **A migration 026 não está aplicada no banco de validação.** Descoberto por esta prova. Enquanto
+   isso, o cenário "payload 200 pela via HTTP" fica **PENDENTE-AMBIENTE** — declarado como tal, e
+   **não** contado como verde (a mesma asserção está verde contra produção no nível SQL). Aplicar a
+   026 na validação é trabalho de ambiente, fora do escopo deste lote.
+2. **A exportação NÃO é auditada.** Escopo novo, e é decisão do Bruno. Se entrar, o `createLog`
+   nesta rota é **seguro** — ela **não abre transação**, e o risco que o TR1 documentou é o
+   `createLog` **dentro** de TX, onde o erro engolido aborta o COMMIT.
+3. **`valores:view` segue dormente.** A chave existe no banco (atribuída aos papéis `almoxarife`,
+   `assistente_tecnico`, `chefe`, `compras`, `financeiro`) e **não é lida por linha nenhuma de
+   código** — só `valores:edit` é, em `products.routes.ts:84`. Não é a chave deste lote, mas é a
+   candidata natural no dia em que "ver valores" virar um eixo próprio de permissão.

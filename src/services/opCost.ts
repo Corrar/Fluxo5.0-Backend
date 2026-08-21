@@ -145,3 +145,111 @@ export const totalCostSql = (refOp: string): string => `(
      WHERE ret.client_service_id = ${refOp}
   ), 0)
 )`;
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// A LISTA — Lote PDF1 (21/08/2026)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `totalCostSql` é a MESMA conta, somada. `itensDaOpSql` é a MESMA conta, ABERTA. As duas moram
+// aqui pelo mesmo motivo: a regra teve três donos antes do CO1 e os três discordavam. Um endpoint
+// que reescrevesse as pernas para listar itens seria a QUARTA cópia, e ela nasceria já divergindo
+// no dia em que alguém mexesse só numa das duas. Elas compartilham LITERALMENTE os mesmos
+// símbolos — `precoSql`, `qtdSolicitacaoSql`, `REQUEST_STATUS_SAIU_SQL`, `SEPARATION_STATUS_SAIU_SQL`
+// — então não há como mudar o predicado de uma sem mudar o da outra.
+//
+// PROVA (medida em produção, 21/08, nas 46 OPs): `SUM(subtotal)` desta lista == `totalCostSql` da
+// mesma OP, delta 0,00 em 46/46. E no display: `SUM(ROUND(subtotal,2))` == `ROUND(SUM(subtotal),2)`
+// em 40/40 das OPs com movimento — o documento não se contradiz quando o leitor soma a coluna.
+//
+// ─── O GRÃO: AGRUPADO POR PRODUTO (decisão do Bruno, 21/08) ────────────────────────────────────
+// Uma linha por PRODUTO, não por linha de documento: 2.613 → 1.841 linhas no total; a maior OP
+// (PROT0826) cai de 448 para 238 linhas, e a resposta de 141 KB para 49,6 KB.
+//
+// ⚠ `MAX(unit_price)` dentro do grupo só é honesto porque o preço é LIDO NA HORA de `products`:
+//   medido, 0 de 1.841 pares (OP, produto) têm mais de um preço. No dia em que a dívida (a) do
+//   CO1 congelar preço POR ITEM, duas linhas do mesmo produto passam a poder ter preços
+//   diferentes e este GROUP BY tem de virar `(product_id, unit_price)` — senão o MAX escolhe um
+//   preço e o `quantidade × unit_price` da linha deixa de dar o `subtotal`. Está no DIVIDAS.
+//
+// ─── A DATA: `movido_em` = O ÚLTIMO MOVIMENTO ──────────────────────────────────────────────────
+// A coluna do documento chama "MOVIMENTO EM", e NÃO "SOLICITADO EM" como o protótipo. Medido:
+// 504 de 2.613 linhas (19,3%) não têm solicitação nenhuma — 495 vêm de separação (e a SAÍDA
+// MANUAL sozinha atinge 25 das 46 OPs) e 9 de devolução. "Solicitado em" seria falso em uma linha
+// a cada cinco.
+//
+// Por perna, a data é a do MATERIAL SAINDO, com fallback na criação do documento:
+//   · separação   COALESCE(sent_at, created_at) — `sent_at` só existe nos 19 docs `type='op'`;
+//                 os 567 `manual` e os 6 `default` têm NULL (a saída manual nasce consumida).
+//   · solicitação COALESCE(delivered_at, created_at) — ⚠ `delivered_at` é NOVA (RS1) e está
+//                 preenchida em 14 de 2.537; NÃO houve backfill, então `created_at` responde
+//                 pelo histórico inteiro. É por isso que o COALESCE aponta para ela, e não o
+//                 contrário: `delivered_at` sozinho apagaria a data de 99,4% das linhas.
+//   · devolução   created_at (100% preenchida).
+//
+// ⚠ Ao AGRUPAR, a linha mostra `MAX(movido_em)` — o movimento MAIS RECENTE, não o primeiro.
+//   Isso apaga informação e é decisão consciente: 437 dos 1.841 pares fundem mais de um
+//   documento (até 20), e 64 fundem movimentos com mais de 30 dias de distância — span máximo
+//   medido, 77 dias. `movimentos` vai junto na resposta justamente para o documento poder dizer
+//   quantos foram fundidos naquela linha, em vez de fingir que foi um só.
+//
+// ─── O QUE ESTA LISTA NÃO É ────────────────────────────────────────────────────────────────────
+// NÃO é `GET /op-materials/balance/:id`. Aquele lê `op_material_events`, que o cabeçalho deste
+// arquivo declara conjunto DISJUNTO — medido: 41 eventos cobrindo 6 das 46 OPs. Usá-lo daria
+// outro número e 40 documentos vazios.
+
+/**
+ * A lista de itens de UMA OP, agrupada por produto — as MESMAS três pernas do `totalCostSql`.
+ *
+ * `refOp` segue a régua do `totalCostSql`: é EXPRESSÃO SQL INTERPOLADA e **só código controla
+ * este argumento**. Quem filtra por dado de usuário passa `'$1'` e manda o valor parametrizado.
+ *
+ * Colunas: product_id, sku, produto, unit, quantidade, unit_price, subtotal, movido_em, movimentos.
+ * `quantidade` e `subtotal` são LÍQUIDOS (a devolução entra negativa e abate a linha do próprio
+ * produto): medido, isso zera 45 das 1.841 linhas e nunca deixa nenhuma negativa.
+ */
+export const itensDaOpSql = (refOp: string): string => `
+  WITH movimentos AS (
+    SELECT si.product_id, p.sku, p.name AS produto, p.unit,
+           si.quantity                          AS qtd,
+           ${precoSql('p')}                     AS unit_price,
+           si.quantity * ${precoSql('p')}       AS subtotal,
+           COALESCE(sep.sent_at::timestamptz, sep.created_at::timestamptz) AS movido_em
+      FROM separations sep
+      JOIN separation_items si ON si.separation_id = sep.id
+      LEFT JOIN products p     ON p.id = si.product_id
+     WHERE sep.client_service_id = ${refOp}
+       AND sep.status IN (${SEPARATION_STATUS_SAIU_SQL})
+    UNION ALL
+    SELECT ri.product_id, p.sku, COALESCE(p.name, ri.custom_product_name), p.unit,
+           ${qtdSolicitacaoSql('ri')},
+           ${precoSql('p')},
+           ${qtdSolicitacaoSql('ri')} * ${precoSql('p')},
+           COALESCE(req.delivered_at, req.created_at::timestamptz)
+      FROM requests req
+      JOIN request_items ri ON ri.request_id = req.id
+      LEFT JOIN products p  ON p.id = ri.product_id
+     WHERE req.client_service_id = ${refOp}
+       AND req.status IN (${REQUEST_STATUS_SAIU_SQL})
+    UNION ALL
+    SELECT ret.product_id, p.sku, p.name, p.unit,
+           -ret.quantity,
+           ${precoSql('p')},
+           -(ret.quantity * ${precoSql('p')}),
+           ret.created_at::timestamptz
+      FROM op_returns ret
+      LEFT JOIN products p ON p.id = ret.product_id
+     WHERE ret.client_service_id = ${refOp}
+  )
+  SELECT product_id,
+         MAX(sku)                                   AS sku,
+         COALESCE(produto, '(produto removido)')    AS produto,
+         MAX(unit)                                  AS unit,
+         SUM(qtd)                                   AS quantidade,
+         MAX(unit_price)                            AS unit_price,
+         SUM(subtotal)                              AS subtotal,
+         MAX(movido_em)                             AS movido_em,
+         COUNT(*)                                   AS movimentos
+    FROM movimentos
+   GROUP BY product_id, produto
+   ORDER BY COALESCE(produto, '(produto removido)') ASC
+`;

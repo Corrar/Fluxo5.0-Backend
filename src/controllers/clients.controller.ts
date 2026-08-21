@@ -2,7 +2,7 @@
 
 import { Request, Response } from 'express';
 import { pool } from '../db';
-import { totalCostSql } from '../services/opCost';
+import { totalCostSql, itensDaOpSql } from '../services/opCost';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 
@@ -331,5 +331,96 @@ export const transferServiceData = async (req: Request, res: Response) => {
     res.status(500).json({ error: error.message });
   } finally {
     client.release();
+  }
+};
+
+// ==========================================================================
+// GET /clients/services/:serviceId/items — a LISTA de itens da OP (lote PDF1)
+// ==========================================================================
+// Alimenta o "Exportar PDF" da aba Clientes e OPs. É a mesma conta do `total_cost` que o
+// `getClients` já devolve, só que ABERTA por produto — e as duas saem do MESMO arquivo,
+// `services/opCost.ts`. Não há fórmula nova nesta rota: ela chama `itensDaOpSql` e
+// `totalCostSql` e mais nada.
+//
+// ─── POR QUE ROTA DEDICADA, E NÃO CAMPO NOVO NO `getClients` ──────────────────────────
+// Medido em produção (21/08): a lista das 46 OPs junta dá 2.613 linhas / 384 KB de JSON.
+// O `GET /clients` hoje é da ordem de 10 KB e roda em TODA abertura da tela, em 6 módulos.
+// Embutir a lista lá desfaria o que o lote BW comprou. Aqui é sob demanda: um clique, uma OP.
+// A maior (PROT0826) devolve 238 linhas / ~50 KB — e seriam 448 linhas / 141 KB se o grão
+// fosse por linha de documento em vez de por produto.
+//
+// ─── QUEM PODE (decisão do Bruno, 21/08) ──────────────────────────────────────────────
+// `clientes:edit`, NÃO `clientes:view` — o documento abre o preço unitário de cada item, e
+// isso é mais do que a tela já mostra (ela mostra só o total da OP). Medido pela coluna
+// CERTA (`profiles.role`, que é a que vai no JWT e a que o `requirePermission` consulta):
+// 27 contas ativas têm `clientes:view` e apenas 4 têm `clientes:edit` — 3 almoxarifes + o
+// admin, os mesmos que já transferem e excluem OP.
+//
+// ⚠ O GUARD É AQUI, não no botão. A recon mediu que o `readOnly` do front é cosmético e não
+// tem segunda parede; sem `requirePermission` na rota, qualquer uma das 23 contas que só
+// visualizam puxaria os preços por chamada direta. O botão sumir é conveniência; o 403 é a
+// trava. Ver a prova por MEMBRO no laudo do lote (403 para quem só tem view, 200 para quem
+// tem edit — as duas pontas existem em produção hoje).
+//
+// ⚠ NÃO auditamos a exportação neste lote — é escopo novo e está NOMEADO no DIVIDAS. Se
+// entrar depois, o `createLog` aqui é seguro porque esta rota NÃO abre transação (o risco
+// que o TR1 documentou é o `createLog` dentro de TX, onde o erro engolido aborta o COMMIT).
+export const getServiceItems = async (req: Request, res: Response) => {
+  const { serviceId } = req.params;
+  try {
+    // Cabeçalho + total. O total sai do `totalCostSql` (o DONO), nunca de somar a lista:
+    // provado que dão o mesmo, e quando um dia não derem, quem manda é o dono.
+    const cab = await pool.query(
+      `SELECT cs.id, cs.op_code, cs.description, cs.status, cs.created_at,
+              cl.name AS client_name, cl.code AS client_code,
+              ${totalCostSql('cs.id')}::numeric AS total_cost
+         FROM client_services cs
+         LEFT JOIN clients cl ON cl.id = cs.client_id
+        WHERE cs.id = $1`,
+      [serviceId],
+    );
+    if (cab.rows.length === 0) return res.status(404).json({ error: 'OP não encontrada.' });
+
+    // `'$1'` e não o valor: a régua do opCost é que `refOp` é expressão CONTROLADA POR CÓDIGO.
+    // O uuid do usuário entra parametrizado, como em qualquer outra query da casa.
+    const itens = await pool.query(itensDaOpSql('$1'), [serviceId]);
+
+    const h = cab.rows[0];
+    return res.json({
+      op: {
+        id: h.id,
+        op_code: h.op_code,
+        description: h.description,
+        status: h.status,
+        created_at: h.created_at,
+        client_name: h.client_name,
+        client_code: h.client_code,
+        total_cost: Number(h.total_cost ?? 0),
+      },
+      // `numeric` volta do pg como STRING. Converter aqui e não no front: o front já trata
+      // `total_cost` como Number desde o CO1, e duas convenções no mesmo payload viram bug.
+      items: itens.rows.map((r: any) => ({
+        product_id: r.product_id,
+        sku: r.sku,
+        produto: r.produto,
+        unit: r.unit,
+        quantidade: Number(r.quantidade ?? 0),
+        unit_price: Number(r.unit_price ?? 0),
+        subtotal: Number(r.subtotal ?? 0),
+        movido_em: r.movido_em,
+        movimentos: Number(r.movimentos ?? 0),
+      })),
+      // Carimbo do INSTANTE da leitura do preço. O preço é lido na hora em `products` (dívida
+      // (a) do CO1: 600 `ATUALIZAR_PRECOS` desde abril, 62 nos últimos 30 dias), então dois
+      // PDFs da mesma OP em dias diferentes podem divergir sem nada ter saído. É este campo
+      // que o rodapé do documento imprime.
+      emitido_em: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    // uuid malformado no path: o pg devolve 22P02. Isso é pedido errado (400), não falha
+    // nossa (500) — e sem este ramo o handler responderia 500 para um typo na URL.
+    if (error?.code === '22P02') return res.status(400).json({ error: 'Identificador de OP inválido.' });
+    console.error(JSON.stringify({ event: 'clients_service_items_error', err_msg: String(error?.message ?? '').slice(0, 300) }));
+    return res.status(500).json({ error: 'Erro ao montar a lista de itens da OP.' });
   }
 };

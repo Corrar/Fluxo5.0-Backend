@@ -9,7 +9,8 @@ import {
     createService, 
     updateServiceStatus, 
     deleteService,
-    transferServiceData 
+    transferServiceData,
+    getServiceItems
 } from '../controllers/clients.controller';
 
 const router = Router();
@@ -40,6 +41,15 @@ router.post('/:id/services', authenticate, requirePermission('clientes:add'), cr
 
 // Atualizar o status de uma OP (Requer permissão de edição)
 router.patch('/services/:serviceId/status', authenticate, requirePermission('clientes:edit'), updateServiceStatus);
+
+// Lista de itens da OP para o "Exportar PDF" (lote PDF1).
+// ⚠ É LEITURA, mas o gate é 'clientes:edit' e NÃO 'clientes:view': o documento abre o PREÇO
+// UNITÁRIO item a item, e a tela só expõe o total da OP. Decisão do Bruno (21/08). Medido pela
+// coluna que o requirePermission de fato consulta (profiles.role, a que vai no JWT): isto leva
+// de 27 contas para 4 — 3 almoxarifes + admin, as mesmas que transferem e excluem OP.
+// Sem este guard o readOnly do front (que é cosmético) seria a única parede, e as outras 23
+// contas puxariam os preços por chamada direta.
+router.get('/services/:serviceId/items', authenticate, requirePermission('clientes:edit'), getServiceItems);
 
 // Transferir movimentações de uma OP para outra / Merge (Requer permissão de edição)
 router.post('/services/:serviceId/transfer', authenticate, requirePermission('clientes:edit'), transferServiceData); 
